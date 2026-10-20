@@ -17,7 +17,17 @@ const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 
 const app = express();
-app.use(cors());
+
+// Allow requests from all origins, specifically mobile WebViews and Capacitor
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
+}));
+
+// Handle pre-flight requests globally
+app.options('*', cors());
+
 app.use(express.json());
 
 // Immediate console log to guarantee output in Render logs
