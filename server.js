@@ -20,6 +20,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Immediate console log to guarantee output in Render logs
+console.log('=======================================================');
+console.log('[Cloud Engine] Initializing Node process on Render...');
+console.log(`[Cloud Engine] Environment Port: ${process.env.PORT || 'default 8080'}`);
+console.log('=======================================================');
+
 const State = {
   autopilotEnabled: true,
   analysisActive: true,
@@ -91,50 +97,52 @@ function connectBinanceStream() {
   const wsUrl = `wss://stream.binance.com:9443/stream?streams=${streams}`;
   console.log('[Binance Stream] Connecting to multi-stream socket...');
 
-  binanceSocket = new WebSocket(wsUrl);
+  try {
+    binanceSocket = new WebSocket(wsUrl);
 
-  binanceSocket.on('open', () => {
-    console.log('[Binance Stream] Connected. Live market feed active 24/7.');
-  });
+    binanceSocket.on('open', () => {
+      console.log('[Binance Stream] Connected. Live market feed active 24/7.');
+    });
 
-  binanceSocket.on('message', (raw) => {
-    if (!State.analysisActive) return;
-    try {
-      const payload = JSON.parse(raw);
-      const stream = payload.stream;
-      const data = payload.data;
+    binanceSocket.on('message', (raw) => {
+      if (!State.analysisActive) return;
+      try {
+        const payload = JSON.parse(raw);
+        const stream = payload.stream;
+        const data = payload.data;
 
-      if (!data) return;
+        if (!data) return;
 
-      if (data.e === 'aggTrade') {
-        const symbol = data.s;
-        const usdtPrice = parseFloat(data.p);
-        const inrPrice = usdtPrice * State.usdtToInrRate;
-        const isBuyerMaker = data.m;
-        const qty = parseFloat(data.q);
+        if (data.e === 'aggTrade') {
+          const symbol = data.s;
+          const usdtPrice = parseFloat(data.p);
+          const inrPrice = usdtPrice * State.usdtToInrRate;
+          const isBuyerMaker = data.m;
+          const qty = parseFloat(data.q);
 
-        if (State.universe[symbol]) {
-          State.universe[symbol].priceINR = inrPrice;
-          const delta = isBuyerMaker ? -qty : qty;
-          State.universe[symbol].cvd += (delta * 0.1);
+          if (State.universe[symbol]) {
+            State.universe[symbol].priceINR = inrPrice;
+            const delta = isBuyerMaker ? -qty : qty;
+            State.universe[symbol].cvd += (delta * 0.1);
+          }
+
+          checkPositionExits(symbol, inrPrice);
         }
+      } catch (e) {}
+    });
 
-        // Check SL/TP exit triggers for any active position
-        checkPositionExits(symbol, inrPrice);
-      }
-    } catch (e) {
-      // ignore frame errors
-    }
-  });
+    binanceSocket.on('error', (err) => {
+      console.error('[Binance Stream] Socket error:', err.message);
+    });
 
-  binanceSocket.on('error', (err) => {
-    console.error('[Binance Stream] Socket error:', err.message);
-  });
-
-  binanceSocket.on('close', () => {
-    console.warn('[Binance Stream] Connection lost. Reconnecting in 3s...');
-    setTimeout(connectBinanceStream, 3000);
-  });
+    binanceSocket.on('close', () => {
+      console.warn('[Binance Stream] Connection lost. Reconnecting in 5s...');
+      setTimeout(connectBinanceStream, 5000);
+    });
+  } catch (err) {
+    console.error('[Binance Stream] Failed to initialize socket:', err.message);
+    setTimeout(connectBinanceStream, 5000);
+  }
 }
 
 function checkPositionExits(symbol, currentPrice) {
@@ -183,14 +191,12 @@ function settlePosition(type, exitPrice, reason) {
 setInterval(() => {
   if (!State.analysisActive) return;
 
-  // Compute momentum and score shifts
   Object.keys(State.universe).forEach(sym => {
     const item = State.universe[sym];
     const scoreDrift = (Math.random() - 0.49) * 2;
     item.score = Math.min(98, Math.max(50, Math.round(item.score + scoreDrift)));
   });
 
-  // Evaluate auto-entry if enabled and no position is open
   if (State.autopilotEnabled && !State.activePosition && State.portfolio.cashINR >= 15000) {
     const sorted = Object.keys(State.universe).sort((a, b) => State.universe[b].score - State.universe[a].score);
     const topKey = sorted[0];
@@ -231,6 +237,11 @@ setInterval(() => {
 
   persistState();
 }, 5000);
+
+// Root test endpoint
+app.get('/', (req, res) => {
+  res.send({ status: 'online', service: "Sisir's Cloud Quant Engine", version: '1.0' });
+});
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'healthy', uptime: process.uptime(), time: new Date() });
@@ -350,7 +361,7 @@ function broadcastState() {
 }
 
 wss.on('connection', (ws) => {
-  // Send instant current state on connect
+  console.log('[WebSocket Client] Mobile app connected to cloud feed.');
   ws.send(JSON.stringify({
     type: 'INIT',
     portfolio: State.portfolio,
@@ -363,9 +374,9 @@ wss.on('connection', (ws) => {
 loadPersistedState();
 connectBinanceStream();
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`=======================================================`);
   console.log(` Sisir's Cloud Quant Engine running on port ${PORT}`);
-  console.log(` WebSocket & REST API endpoints live.`);
+  console.log(` WebSocket & REST API endpoints live at 0.0.0.0:${PORT}`);
   console.log(`=======================================================`);
 });
