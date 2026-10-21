@@ -73,17 +73,18 @@ const State = {
     }
   },
 
+  // Exact real-world Binance spot baseline rates (SUI is ~$1.03 USDT = ~₹97.20 INR)
   universe: {
-    SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 0, priceINR: 0, score: 94, direction: 'STRONG BUY', cvd: 26.4, obi: 0.64, reasoning: 'Perpetual open interest high, strong spot taker delta' },
-    SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 0, priceINR: 0, score: 92, direction: 'STRONG BUY', cvd: 31.2, obi: 0.67, reasoning: 'Aggressive bid skew on Binance book, high buyer CVD' },
-    AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 0, priceINR: 0, score: 89, direction: 'STRONG BUY', cvd: 18.5, obi: 0.61, reasoning: 'L1 volume rotation, strong buyer delta' },
-    ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 0, priceINR: 0, score: 86, direction: 'BUY', cvd: 8.6, obi: 0.58, reasoning: 'Spot accumulation, positive delta across aggregate trades' },
-    BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 0, priceINR: 0, score: 85, direction: 'BUY', cvd: 14.2, obi: 0.54, reasoning: 'Macro institutional spot absorption' },
-    NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 0, priceINR: 0, score: 84, direction: 'BUY', cvd: 11.2, obi: 0.56, reasoning: 'Compute narrative spot inflows' },
-    LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 0, priceINR: 0, score: 81, direction: 'BUY', cvd: 6.2, obi: 0.54, reasoning: 'Cross-chain protocol liquidity spike' },
-    BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 0, priceINR: 0, score: 78, direction: 'BUY', cvd: 4.1, obi: 0.52, reasoning: 'Steady exchange utility baseline' },
-    ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0, priceINR: 0, score: 72, direction: 'BUY', cvd: 2.3, obi: 0.53, reasoning: 'Gradual liquidity return, low volatility consolidation' },
-    XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 0, priceINR: 0, score: 65, direction: 'NEUTRAL', cvd: -1.8, obi: 0.48, reasoning: 'Resistance retest with balanced orderbook' }
+    SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 108.53, priceINR: 10241.97, score: 94, direction: 'STRONG BUY', cvd: 26.4, obi: 0.64, reasoning: 'Perpetual open interest high, strong spot taker delta' },
+    SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 92, direction: 'STRONG BUY', cvd: 31.2, obi: 0.67, reasoning: 'Aggressive bid skew on Binance book, high buyer CVD' },
+    AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 18.50, priceINR: 1745.85, score: 89, direction: 'STRONG BUY', cvd: 18.5, obi: 0.61, reasoning: 'L1 volume rotation, strong buyer delta' },
+    ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 222713.20, score: 86, direction: 'BUY', cvd: 8.6, obi: 0.58, reasoning: 'Spot accumulation, positive delta across aggregate trades' },
+    BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 7974265.00, score: 85, direction: 'BUY', cvd: 14.2, obi: 0.54, reasoning: 'Macro institutional spot absorption' },
+    NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 292.55, score: 84, direction: 'BUY', cvd: 11.2, obi: 0.56, reasoning: 'Compute narrative spot inflows' },
+    LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1108.85, score: 81, direction: 'BUY', cvd: 6.2, obi: 0.54, reasoning: 'Cross-chain protocol liquidity spike' },
+    BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 67946.40, score: 78, direction: 'BUY', cvd: 4.1, obi: 0.52, reasoning: 'Steady exchange utility baseline' },
+    ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0.35, priceINR: 33.03, score: 72, direction: 'BUY', cvd: 2.3, obi: 0.53, reasoning: 'Gradual liquidity return, low volatility consolidation' },
+    XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 1.28, priceINR: 120.79, score: 65, direction: 'NEUTRAL', cvd: -1.8, obi: 0.48, reasoning: 'Resistance retest with balanced orderbook' }
   },
 
   tradeLogs: []
