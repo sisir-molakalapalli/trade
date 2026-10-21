@@ -18,22 +18,17 @@ const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 
 const app = express();
 
-// Allow requests from all origins, specifically mobile WebViews and Capacitor
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
 }));
-
-// Handle pre-flight requests globally
 app.options('*', cors());
-
 app.use(express.json());
 
-// Immediate console log to guarantee output in Render logs
 console.log('=======================================================');
-console.log('[Cloud Engine] Initializing Node process on Render...');
-console.log(`[Cloud Engine] Environment Port: ${process.env.PORT || 'default 8080'}`);
+console.log('[Cloud Engine] Initializing 24/7 Dedicated Server...');
+console.log(`[Cloud Engine] Environment Port: ${PORT}`);
 console.log('=======================================================');
 
 const State = {
@@ -65,35 +60,44 @@ const State = {
   tradeLogs: []
 };
 
-// Auto-load state from disk
+// Auto-load state from disk ensuring continuous persistence
 function loadPersistedState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-      if (data.portfolio) State.portfolio = data.portfolio;
-      if (data.activePosition !== undefined) State.activePosition = data.activePosition;
-      if (data.autopilotEnabled !== undefined) State.autopilotEnabled = data.autopilotEnabled;
-      if (data.tradeLogs) State.tradeLogs = data.tradeLogs;
-      console.log('[Cloud Engine] Restored portfolio state successfully.');
+      if (data.portfolio && typeof data.portfolio.cashINR === 'number') {
+        State.portfolio = data.portfolio;
+      }
+      if (data.activePosition) {
+        State.activePosition = data.activePosition;
+      }
+      if (typeof data.autopilotEnabled === 'boolean') {
+        State.autopilotEnabled = data.autopilotEnabled;
+      }
+      if (Array.isArray(data.tradeLogs)) {
+        State.tradeLogs = data.tradeLogs;
+      }
+      console.log(`[Cloud Engine] Restored state: Cash=₹${State.portfolio.cashINR}, Position=${State.activePosition ? State.activePosition.pairSymbol : 'None'}, TradeLogs=${State.tradeLogs.length}`);
+    } else {
+      persistState();
     }
   } catch (err) {
-    console.error('[Cloud Engine] Failed loading state:', err.message);
+    console.error('[Cloud Engine] Error reading state file:', err.message);
   }
 }
 
-// Auto-save state to disk
 function persistState() {
   try {
     const payload = {
       portfolio: State.portfolio,
       activePosition: State.activePosition,
       autopilotEnabled: State.autopilotEnabled,
-      tradeLogs: State.tradeLogs.slice(-50),
+      tradeLogs: State.tradeLogs.slice(0, 100),
       timestamp: Date.now()
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2));
   } catch (err) {
-    console.error('[Cloud Engine] Error persisting state:', err.message);
+    console.error('[Cloud Engine] Error saving state file:', err.message);
   }
 }
 
@@ -101,11 +105,8 @@ let binanceSocket = null;
 let reconnectTimer = null;
 let currentEndpointIndex = 0;
 
-// Resilient multi-endpoint rotation that bypasses geo-blocking and regional restrictions
 const STREAM_ENDPOINTS = [
-  // 1. Binance Vision Public Market Data Stream (designed for cloud workers)
   'wss://data-stream.binance.vision:9443/stream?streams=',
-  // 2. Binance Global Standard
   'wss://stream.binance.com:9443/stream?streams=',
   'wss://stream.binance.com/stream?streams='
 ];
@@ -120,7 +121,7 @@ function connectBinanceStream() {
   const baseEndpoint = STREAM_ENDPOINTS[currentEndpointIndex % STREAM_ENDPOINTS.length];
   const wsUrl = `${baseEndpoint}${streams}`;
   
-  console.log(`[Market Stream] Connecting to stream source [${currentEndpointIndex + 1}/${STREAM_ENDPOINTS.length}]: ${baseEndpoint}...`);
+  console.log(`[Market Stream] Connecting to feed source: ${baseEndpoint}...`);
 
   try {
     binanceSocket = new WebSocket(wsUrl, {
@@ -130,7 +131,7 @@ function connectBinanceStream() {
     });
 
     binanceSocket.on('open', () => {
-      console.log(`[Market Stream] Connected successfully to live feed via ${baseEndpoint}.`);
+      console.log(`[Market Stream] Connected to Binance 24/7 stream via ${baseEndpoint}.`);
     });
 
     binanceSocket.on('message', (raw) => {
@@ -138,10 +139,8 @@ function connectBinanceStream() {
       try {
         const payload = JSON.parse(raw);
         const data = payload.data || payload;
-
         if (!data) return;
 
-        // Process aggregate trade ticks
         if (data.e === 'aggTrade') {
           const symbol = data.s;
           const usdtPrice = parseFloat(data.p);
@@ -156,45 +155,44 @@ function connectBinanceStream() {
           }
 
           checkPositionExits(symbol, inrPrice);
+        } else if (data.e === '24hrTicker') {
+          const symbol = data.s;
+          const usdtPrice = parseFloat(data.c);
+          if (State.universe[symbol]) {
+            State.universe[symbol].priceINR = usdtPrice * State.usdtToInrRate;
+          }
         }
       } catch (e) {}
     });
 
     binanceSocket.on('error', (err) => {
-      console.warn(`[Market Stream] Connection notice from current endpoint: ${err.message}`);
-      
-      // If HTTP 451 (Geo-blocked in US cloud regions) or handshake rejected
-      if (err.message && (err.message.includes('451') || err.message.includes('Unexpected server response'))) {
-        console.warn(`[Market Stream] Notice: Host IP is located in a restricted region (HTTP 451). Switching to alternative endpoint or engaging resilient stream handler...`);
-      }
+      console.warn(`[Market Stream] Stream notice: ${err.message}`);
     });
 
     binanceSocket.on('close', (code) => {
       currentEndpointIndex++;
-      const nextDelay = 3000;
-      console.log(`[Market Stream] Connection cycling (code ${code}). Next endpoint attempt in ${nextDelay / 1000}s...`);
-      reconnectTimer = setTimeout(connectBinanceStream, nextDelay);
+      console.log(`[Market Stream] Cycling stream connection. Reconnecting in 3s...`);
+      reconnectTimer = setTimeout(connectBinanceStream, 3000);
     });
   } catch (err) {
-    console.error('[Market Stream] Initialization error:', err.message);
+    console.error('[Market Stream] Connect error:', err.message);
     reconnectTimer = setTimeout(connectBinanceStream, 4000);
   }
 }
 
-// Resilient fallback price generator: guarantees that even if a cloud provider has strict geo-IP bans,
-// the quantitative scoring, paper positions, trailing stops, and Autopilot execution never freeze.
+// Continuous Tick & Price Drift Guardian (Ensures positions always monitor price even during socket reconnections)
 setInterval(() => {
   if (!State.analysisActive) return;
 
-  // If socket is disconnected, synthesize micro-ticks to keep orders and portfolio alive
-  if (!binanceSocket || binanceSocket.readyState !== WebSocket.OPEN) {
-    Object.keys(State.universe).forEach(sym => {
-      const item = State.universe[sym];
-      const drift = (Math.random() - 0.495) * (item.priceINR * 0.001);
+  Object.keys(State.universe).forEach(sym => {
+    const item = State.universe[sym];
+    // If live socket is momentarily cycling, synthesize micro-fluctuations
+    if (!binanceSocket || binanceSocket.readyState !== WebSocket.OPEN) {
+      const drift = (Math.random() - 0.495) * (item.priceINR * 0.0008);
       item.priceINR = Math.max(1, item.priceINR + drift);
-      checkPositionExits(sym, item.priceINR);
-    });
-  }
+    }
+    checkPositionExits(sym, item.priceINR);
+  });
 }, 1000);
 
 function checkPositionExits(symbol, currentPrice) {
@@ -203,9 +201,9 @@ function checkPositionExits(symbol, currentPrice) {
   if (pos.pairKey !== symbol) return;
 
   if (currentPrice >= pos.tp1) {
-    settlePosition('TP', currentPrice, 'Take-Profit Target Hit');
+    settlePosition('TP', currentPrice, 'Take-Profit Target (+3.6%) Hit');
   } else if (currentPrice <= pos.sl) {
-    settlePosition('SL', currentPrice, 'Stop-Loss Protected');
+    settlePosition('SL', currentPrice, 'Stop-Loss Target (-1.5%) Hit');
   }
 }
 
@@ -228,33 +226,37 @@ function settlePosition(type, exitPrice, reason) {
     exitPrice,
     pnlINR: pnl,
     reason,
-    time: new Date().toISOString()
+    time: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata' }),
+    date: new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })
   };
 
   State.tradeLogs.unshift(logEntry);
+  console.log(`[Cloud Engine 24/7] Trade Settled: ${type} on ${logEntry.pair}. PnL: ₹${Math.round(pnl)}. Realized total: ₹${Math.round(State.portfolio.realizedPnL)}`);
+  
   State.activePosition = null;
-
-  console.log(`[Trade Executed] Position closed (${type}) on ${logEntry.pair}. PnL: ₹${Math.round(pnl)}`);
   persistState();
   broadcastState();
 }
 
-// Background scheduler running every 5 seconds for radar scoring & auto-entry
+// 24/7 Autonomous Scanner: Evaluates market every 4s, picks potential cryptos & enters trades
 setInterval(() => {
   if (!State.analysisActive) return;
 
+  // Update momentum scores across universe
   Object.keys(State.universe).forEach(sym => {
     const item = State.universe[sym];
     const scoreDrift = (Math.random() - 0.49) * 2;
-    item.score = Math.min(98, Math.max(50, Math.round(item.score + scoreDrift)));
+    item.score = Math.min(98, Math.max(52, Math.round(item.score + scoreDrift)));
   });
 
+  // Only take new trade if autopilot is ON, no position is currently open, and cash is available
   if (State.autopilotEnabled && !State.activePosition && State.portfolio.cashINR >= 15000) {
     const sorted = Object.keys(State.universe).sort((a, b) => State.universe[b].score - State.universe[a].score);
     const topKey = sorted[0];
     const candidate = State.universe[topKey];
 
-    if (candidate && candidate.score >= 89) {
+    // High conviction entry threshold
+    if (candidate && candidate.score >= 88) {
       const allocateINR = Math.min(State.portfolio.cashINR, 50000);
       const price = candidate.priceINR;
       const qty = allocateINR / price;
@@ -269,7 +271,7 @@ setInterval(() => {
         qty,
         sl: price - slDist,
         tp1: price + (slDist * 2.4),
-        openedAt: new Date().toISOString()
+        openedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })
       };
 
       State.portfolio.cashINR -= allocateINR;
@@ -281,18 +283,68 @@ setInterval(() => {
         avgBuyPrice: price
       };
 
-      console.log(`[Autopilot Action] Bought ${candidate.name} (${candidate.symbol}) for ₹${allocateINR}`);
+      console.log(`[Cloud Engine 24/7] Autopilot Executed: ${candidate.symbol} @ ₹${Math.round(price)} (Allocation: ₹${allocateINR})`);
       persistState();
       broadcastState();
     }
   }
 
-  persistState();
-}, 5000);
+  // Periodic heartbeat broadcast of live prices to all connected phone clients
+  broadcastPricesOnly();
+}, 2500);
 
-// Root test endpoint
+// Broadcast state to all connected frontends
+function broadcastState() {
+  const payload = JSON.stringify({
+    type: 'STATE_UPDATE',
+    portfolio: State.portfolio,
+    activePosition: State.activePosition,
+    autopilotEnabled: State.autopilotEnabled,
+    universe: State.universe,
+    tradeLogs: State.tradeLogs.slice(0, 50),
+    timestamp: Date.now()
+  });
+
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  });
+}
+
+function broadcastPricesOnly() {
+  const priceMap = {};
+  Object.keys(State.universe).forEach(k => {
+    priceMap[k] = {
+      priceINR: State.universe[k].priceINR,
+      score: State.universe[k].score
+    };
+  });
+
+  const payload = JSON.stringify({
+    type: 'PRICE_TICK',
+    prices: priceMap,
+    activePosition: State.activePosition,
+    portfolio: State.portfolio
+  });
+
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  });
+}
+
+// REST Endpoints
 app.get('/', (req, res) => {
-  res.send({ status: 'online', service: "Sisir's Cloud Quant Engine", version: '1.0' });
+  res.json({
+    service: "Sisir's Dedicated 24/7 Cloud Quant Engine",
+    status: 'online',
+    uptimeHours: (process.uptime() / 3600).toFixed(2),
+    activePosition: State.activePosition ? `${State.activePosition.pairSymbol} (Opened @ ${State.activePosition.openedAt})` : 'None (Scanning)',
+    totalTradesExecuted: State.tradeLogs.length,
+    realizedPnL: State.portfolio.realizedPnL
+  });
 });
 
 app.get('/api/health', (req, res) => {
@@ -306,7 +358,7 @@ app.get('/api/state', (req, res) => {
     universe: State.universe,
     autopilotEnabled: State.autopilotEnabled,
     analysisActive: State.analysisActive,
-    tradeLogs: State.tradeLogs.slice(0, 15)
+    tradeLogs: State.tradeLogs.slice(0, 50)
   });
 });
 
@@ -317,11 +369,13 @@ app.post('/api/autopilot/toggle', (req, res) => {
   res.json({ success: true, autopilotEnabled: State.autopilotEnabled });
 });
 
-app.post('/api/analysis/toggle', (req, res) => {
-  State.analysisActive = !State.analysisActive;
-  persistState();
-  broadcastState();
-  res.json({ success: true, analysisActive: State.analysisActive });
+app.post('/api/trade/close-position', (req, res) => {
+  if (State.activePosition) {
+    const curPrice = State.universe[State.activePosition.pairKey]?.priceINR || State.activePosition.entryPrice;
+    settlePosition('MANUAL', curPrice, 'Manual User Override');
+    return res.json({ success: true, message: 'Position closed' });
+  }
+  res.json({ success: false, message: 'No active position' });
 });
 
 app.post('/api/trade/manual-buy', (req, res) => {
@@ -349,7 +403,7 @@ app.post('/api/trade/manual-buy', (req, res) => {
     qty,
     sl: price - slDist,
     tp1: price + (slDist * 2.4),
-    openedAt: new Date().toISOString()
+    openedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })
   };
 
   State.portfolio.cashINR -= amountINR;
@@ -366,23 +420,6 @@ app.post('/api/trade/manual-buy', (req, res) => {
   res.json({ success: true, position: State.activePosition });
 });
 
-app.post('/api/trade/close-all', (req, res) => {
-  let liquidated = 0;
-  Object.keys(State.portfolio.holdings).forEach(k => {
-    const h = State.portfolio.holdings[k];
-    const p = State.universe[k]?.priceINR || h.avgBuyPrice;
-    liquidated += h.qty * p;
-  });
-
-  State.portfolio.cashINR += liquidated;
-  State.portfolio.holdings = {};
-  State.activePosition = null;
-
-  persistState();
-  broadcastState();
-  res.json({ success: true, cashINR: State.portfolio.cashINR });
-});
-
 app.post('/api/deposit', (req, res) => {
   const { amountINR } = req.body;
   if (!amountINR || amountINR <= 0) return res.status(400).json({ error: 'Invalid deposit' });
@@ -396,31 +433,66 @@ app.post('/api/deposit', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-function broadcastState() {
-  const payload = JSON.stringify({
-    type: 'STATE_UPDATE',
-    portfolio: State.portfolio,
-    activePosition: State.activePosition,
-    autopilotEnabled: State.autopilotEnabled,
-    tradeLogs: State.tradeLogs.slice(0, 10)
-  });
-
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
-  });
-}
-
 wss.on('connection', (ws) => {
-  console.log('[WebSocket Client] Mobile app connected to cloud feed.');
+  console.log('[WebSocket Client] Mobile app connected to cloud feed. Sending full state snapshot.');
+  
+  // Immediately send the exact cloud snapshot
   ws.send(JSON.stringify({
     type: 'INIT',
     portfolio: State.portfolio,
     activePosition: State.activePosition,
     universe: State.universe,
-    autopilotEnabled: State.autopilotEnabled
+    autopilotEnabled: State.autopilotEnabled,
+    tradeLogs: State.tradeLogs.slice(0, 50)
   }));
+
+  ws.on('message', (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      if (data.type === 'TOGGLE_AUTOPILOT') {
+        State.autopilotEnabled = Boolean(data.enabled);
+        persistState();
+        broadcastState();
+      } else if (data.type === 'CLOSE_POSITION') {
+        if (State.activePosition) {
+          const curPrice = State.universe[State.activePosition.pairKey]?.priceINR || State.activePosition.entryPrice;
+          settlePosition('MANUAL', curPrice, 'Manual User Override');
+        }
+      } else if (data.type === 'MANUAL_BUY') {
+        const { pairKey, amountINR } = data;
+        if (State.universe[pairKey] && amountINR <= State.portfolio.cashINR) {
+          const item = State.universe[pairKey];
+          const price = item.priceINR;
+          const qty = amountINR / price;
+          const slDist = price * 0.015;
+
+          State.activePosition = {
+            pairKey,
+            pairName: item.name,
+            pairSymbol: item.symbol,
+            entryPrice: price,
+            notionalINR: amountINR,
+            qty,
+            sl: price - slDist,
+            tp1: price + (slDist * 2.4),
+            openedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })
+          };
+
+          State.portfolio.cashINR -= amountINR;
+          State.portfolio.holdings[pairKey] = {
+            name: item.name,
+            symbol: item.symbol,
+            qty,
+            totalCostINR: amountINR,
+            avgBuyPrice: price
+          };
+
+          persistState();
+          broadcastState();
+        }
+      }
+    } catch (e) {}
+  });
 });
 
 loadPersistedState();
@@ -428,7 +500,7 @@ connectBinanceStream();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`=======================================================`);
-  console.log(` Sisir's Cloud Quant Engine running on port ${PORT}`);
-  console.log(` WebSocket & REST API endpoints live at 0.0.0.0:${PORT}`);
+  console.log(` Sisir's Cloud Quant Engine RUNNING 24/7 on port ${PORT}`);
+  console.log(` Dedicated Cloud Plan: Zero-Sleep Continuous Engine Active`);
   console.log(`=======================================================`);
 });
