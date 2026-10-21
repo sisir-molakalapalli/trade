@@ -41,8 +41,9 @@ console.log('=======================================================');
 const State = {
   autopilotEnabled: true,
   analysisActive: true,
-  // Matched to Binance standard global app conversion rate (~87.50)
-  usdtToInrRate: Number(process.env.USDT_INR_RATE) || 87.50,
+  // Matched exactly to Binance standard app reference rate (~94.37 INR per USDT)
+  // e.g. $108.53 SOL * 94.37 = ₹10,241.97 INR
+  usdtToInrRate: Number(process.env.USDT_INR_RATE) || 94.37,
   lastMarketSyncTime: null,
 
   // Multi-position portfolio management
@@ -144,6 +145,28 @@ const BINANCE_HOSTS = [
 ];
 let currentHostIndex = 0;
 
+// Periodically synchronize the exact live USDT/INR reference rate from Binance
+async function syncBinanceUsdtInrRate() {
+  const host = BINANCE_HOSTS[currentHostIndex];
+  try {
+    const res = await fetch(`${host}/api/v3/ticker/price?symbol=USDTINR`, {
+      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const liveRate = parseFloat(data.price);
+      if (liveRate && liveRate > 80 && liveRate < 120) {
+        State.usdtToInrRate = Math.round(liveRate * 100) / 100;
+        console.log(`[FX Engine] Live Binance USDT/INR rate synced: ₹${State.usdtToInrRate}`);
+      }
+    }
+  } catch (e) {
+    // Falls back to calibrated standard market rate: 94.37
+  }
+}
+setInterval(syncBinanceUsdtInrRate, 60000);
+syncBinanceUsdtInrRate();
+
 async function fetchLiveBinancePrices() {
   if (!State.analysisActive) return;
 
@@ -171,7 +194,7 @@ async function fetchLiveBinancePrices() {
         priceMap[item.symbol] = parseFloat(item.price);
       });
 
-      // Update actual live prices in INR
+      // Update actual live prices in INR using exact Binance reference conversion
       symbols.forEach(sym => {
         if (priceMap[sym]) {
           const usdtPrice = priceMap[sym];
