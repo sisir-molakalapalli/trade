@@ -385,31 +385,6 @@ function broadcastPricesOnly() {
   });
 }
 
-function broadcastPricesOnly() {
-  const priceMap = {};
-  Object.keys(State.universe).forEach(k => {
-    priceMap[k] = {
-      priceINR: State.universe[k].priceINR,
-      score: State.universe[k].score
-    };
-  });
-
-  const payload = JSON.stringify({
-    type: 'PRICE_TICK',
-    prices: priceMap,
-    activePositions: State.activePositions,
-    portfolio: State.portfolio,
-    marketRegime: State.marketRegime,
-    llmTelemetry: State.llmTelemetry
-  });
-
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
-  });
-}
-
 // REST Endpoints
 app.get('/', (req, res) => {
   res.json({
