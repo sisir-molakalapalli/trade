@@ -1,13 +1,13 @@
 /**
- * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v7.2 - Multi-Asset High Conviction)
+ * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v7.4)
  * ------------------------------------------------------------------------------------
  * Runs 24/7 on Render ($7 Dedicated Plan).
  * Features:
  *  - Dynamic multi-asset simultaneous paper trading (up to 3 high-conviction assets)
- *  - Responsive relative-score ranking (lowered threshold to 75 to guarantee active scanning)
- *  - Immediate execution tick on autopilot toggle
- *  - 24/7 continuous tick monitoring, Stop-Loss (-1.5%) and Take-Profit (+3.6%)
- *  - Authoritative persistence in cloud_portfolio_state.json
+ *  - 24/7 Continuous tick monitoring, Stop-Loss (-1.5%) and Take-Profit (+3.6%)
+ *  - Trailing Stop Ratchet (Auto moves SL to Break-Even +0.2% upon reaching +1.5% gain)
+ *  - Predictive Position Health Scoring (0-100% Decay Risk with SAFE / CAUTION / EXITING tags)
+ *  - Comprehensive LLM Logic Telemetry broadcast
  */
 
 const express = require('express');
@@ -19,34 +19,24 @@ const path = require('path');
 
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
-
-// User's Binance API Key for real-time market spot data
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
 
 const app = express();
-
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'X-MBX-APIKEY']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'X-MBX-APIKEY'] }));
 app.options('*', cors());
 app.use(express.json());
 
 console.log('=======================================================');
-console.log("[Cloud Engine v7.3] 24/7 Binance Live Quant & Market Sync");
-console.log(`[Cloud Engine v7.3] Port: ${PORT} | Binance Auth: Active`);
+console.log("[Cloud Engine v7.4] 24/7 Binance Live Quant & Market Sync");
+console.log(`[Cloud Engine v7.4] Port: ${PORT} | Binance Auth: Active`);
 console.log('=======================================================');
 
 const State = {
   autopilotEnabled: true,
   analysisActive: true,
-  // Matched exactly to Binance standard app reference rate (~94.37 INR per USDT)
-  // e.g. $108.53 SOL * 94.37 = ₹10,241.97 INR
   usdtToInrRate: Number(process.env.USDT_INR_RATE) || 94.37,
   lastMarketSyncTime: null,
 
-  // Multi-position portfolio management for ₹20,000 total capital
   maxConcurrentPositions: 3,
   allocationPerTradeINR: 6000,
   marketRegime: 'MULTI_EXPANSION',
@@ -61,7 +51,7 @@ const State = {
 
   llmTelemetry: {
     model: 'gemini-3-flash-preview',
-    frequencySeconds: 15,
+    frequencySeconds: 10,
     lastAnalysisTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }),
     promptExecutionCount: 0,
     regimeReasoning: "Streaming live tick prices from Binance spot markets. Quantitative delta active.",
@@ -70,10 +60,16 @@ const State = {
       cumulativeVolumeDelta: 0.30,
       momentumBreakout: 0.25,
       volatilityCompression: 0.15
+    },
+    rules: {
+      stopLossPct: 1.5,
+      takeProfitPct: 3.6,
+      trailingRatchetTriggerPct: 1.5,
+      trailingRatchetLockPct: 0.2,
+      predictiveDecayExitThreshold: 65
     }
   },
 
-  // Exact real-world Binance spot baseline rates (SUI is ~$1.03 USDT = ~₹97.20 INR)
   universe: {
     SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 108.53, priceINR: 10241.97, score: 94, direction: 'STRONG BUY', cvd: 26.4, obi: 0.64, reasoning: 'Perpetual open interest high, strong spot taker delta' },
     SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 92, direction: 'STRONG BUY', cvd: 31.2, obi: 0.67, reasoning: 'Aggressive bid skew on Binance book, high buyer CVD' },
@@ -90,7 +86,6 @@ const State = {
   tradeLogs: []
 };
 
-// Auto-load state from disk ensuring continuous persistence
 function loadPersistedState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
@@ -108,13 +103,12 @@ function loadPersistedState() {
       if (Array.isArray(data.tradeLogs)) {
         State.tradeLogs = data.tradeLogs;
       }
-      const posCount = Object.keys(State.activePositions).length;
-      console.log(`[Cloud Engine] Restored state: Cash=₹${Math.round(State.portfolio.cashINR)}, Active Positions=${posCount}, TradeLogs=${State.tradeLogs.length}`);
+      console.log(`[Cloud Engine] Restored state: Cash=₹${Math.round(State.portfolio.cashINR)}, Positions=${Object.keys(State.activePositions).length}`);
     } else {
       persistState();
     }
   } catch (err) {
-    console.error('[Cloud Engine] Error reading state file:', err.message);
+    console.error('[Cloud Engine] Error reading state:', err.message);
   }
 }
 
@@ -130,14 +124,10 @@ function persistState() {
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2));
   } catch (err) {
-    console.error('[Cloud Engine] Error saving state file:', err.message);
+    console.error('[Cloud Engine] Error saving state:', err.message);
   }
 }
 
-/**
- * Fetches actual live market spot prices from Binance API using your API key.
- * Rotates through multiple base endpoints to guarantee zero downtime on any cloud host.
- */
 const BINANCE_HOSTS = [
   'https://api.binance.com',
   'https://data-api.binance.vision',
@@ -146,7 +136,6 @@ const BINANCE_HOSTS = [
 ];
 let currentHostIndex = 0;
 
-// Periodically synchronize the exact live USDT/INR reference rate from Binance
 async function syncBinanceUsdtInrRate() {
   const host = BINANCE_HOSTS[currentHostIndex];
   try {
@@ -158,12 +147,9 @@ async function syncBinanceUsdtInrRate() {
       const liveRate = parseFloat(data.price);
       if (liveRate && liveRate > 80 && liveRate < 120) {
         State.usdtToInrRate = Math.round(liveRate * 100) / 100;
-        console.log(`[FX Engine] Live Binance USDT/INR rate synced: ₹${State.usdtToInrRate}`);
       }
     }
-  } catch (e) {
-    // Falls back to calibrated standard market rate: 94.37
-  }
+  } catch (e) {}
 }
 setInterval(syncBinanceUsdtInrRate, 60000);
 syncBinanceUsdtInrRate();
@@ -191,11 +177,8 @@ async function fetchLiveBinancePrices() {
     if (res.ok) {
       const data = await res.json();
       const priceMap = {};
-      data.forEach(item => {
-        priceMap[item.symbol] = parseFloat(item.price);
-      });
+      data.forEach(item => { priceMap[item.symbol] = parseFloat(item.price); });
 
-      // Update actual live prices in INR using exact Binance reference conversion
       symbols.forEach(sym => {
         if (priceMap[sym]) {
           const usdtPrice = priceMap[sym];
@@ -206,7 +189,7 @@ async function fetchLiveBinancePrices() {
 
       State.lastMarketSyncTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
 
-      // Check Stop-Loss / Take-Profit triggers against actual live market ticks
+      // Run dynamic risk guardian across active positions
       symbols.forEach(sym => {
         const livePrice = State.universe[sym].priceINR;
         if (livePrice > 0) {
@@ -216,7 +199,6 @@ async function fetchLiveBinancePrices() {
 
       broadcastPricesOnly();
     } else {
-      // Rotate host if rate-limited or regional restriction
       currentHostIndex = (currentHostIndex + 1) % BINANCE_HOSTS.length;
     }
   } catch (err) {
@@ -224,9 +206,7 @@ async function fetchLiveBinancePrices() {
   }
 }
 
-// Poll real Binance market prices every 2 seconds continuously
 setInterval(fetchLiveBinancePrices, 2000);
-// Initial fetch immediately on boot
 fetchLiveBinancePrices();
 
 function checkPositionExits(symbol, currentPrice) {
@@ -235,46 +215,58 @@ function checkPositionExits(symbol, currentPrice) {
 
   const currentGainPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
-  // 1. Trailing Stop Ratchet: Protect capital once in profit
-  // If gain crosses +1.5%, move hard Stop-Loss up to Break-Even (+0.2%)
+  // 1. TRAILING STOP RATCHET: Move Stop-Loss to Break-Even (+0.2%) when gain >= +1.5%
   const breakEvenPrice = pos.entryPrice * 1.002;
   if (currentGainPct >= 1.5 && pos.sl < breakEvenPrice) {
     pos.sl = breakEvenPrice;
+    pos.isTrailingActive = true;
     console.log(`[Risk Guardian] ${pos.pairSymbol} Stop-Loss ratcheted to Break-Even @ ₹${Math.round(pos.sl)}`);
   }
 
-  // 2. Predictive LLM Early-Warning Exit
-  // If trade is in profit (> +0.5%) but order-flow metrics (OBI/CVD) rapidly deteriorate,
-  // front-run the reversal and take profit before it retraces back to Stop-Loss.
+  // 2. PREDICTIVE HEALTH SCORING (0-100% Risk):
+  // Assesses Order Book Imbalance (OBI), Cumulative Volume Delta (CVD), and relative score
   const assetData = State.universe[symbol];
+  let decayRisk = 15; // Baseline healthy risk
+
   if (assetData) {
-    const isObiBearish = assetData.obi < 0.49;
-    const isCvdFlipping = assetData.cvd < 0;
-    const isScoreDropping = assetData.score < 65;
-
-    // Calculate dynamic risk/decay score (0 to 100)
-    let decayRisk = 0;
-    if (isObiBearish) decayRisk += 35;
-    if (isCvdFlipping) decayRisk += 40;
-    if (isScoreDropping) decayRisk += 25;
-    pos.decayRisk = decayRisk;
-
-    if (currentGainPct >= 0.5 && decayRisk >= 65) {
-      settlePosition(
-        symbol,
-        'PREDICTIVE TP',
-        currentPrice,
-        `AI Early Exit: Order flow turned bearish (Risk: ${decayRisk}%). Secured +${currentGainPct.toFixed(2)}% gain before retracement.`
-      );
-      return;
-    }
+    if (assetData.obi < 0.50) decayRisk += 35;
+    if (assetData.cvd < 0) decayRisk += 35;
+    if (assetData.score < 70) decayRisk += 25;
   }
 
-  // 3. Standard Hard Take-Profit (+3.6%) and Stop-Loss (-1.5%) triggers
+  pos.decayRisk = Math.min(99, Math.max(5, decayRisk));
+
+  // Determine label for UI
+  if (pos.decayRisk >= 65) {
+    pos.predictiveStatus = 'EXITING';
+  } else if (pos.decayRisk >= 40) {
+    pos.predictiveStatus = 'CAUTION';
+  } else {
+    pos.predictiveStatus = 'SAFE';
+  }
+
+  // 3. PREDICTIVE TAKE-PROFIT: Exit if in green (> +0.5%) and order flow shows high decay risk (>= 65%)
+  if (currentGainPct >= 0.5 && pos.decayRisk >= 65) {
+    settlePosition(
+      symbol,
+      'PREDICTIVE TP',
+      currentPrice,
+      `AI Predictive Exit: Order flow reversal detected (Decay Risk: ${pos.decayRisk}%). Secured +${currentGainPct.toFixed(2)}% gain before retracement.`
+    );
+    return;
+  }
+
+  // 4. HARD TARGETS: Take-Profit (+3.6%) and Stop-Loss (-1.5% or Break-Even)
   if (currentPrice >= pos.tp1) {
     settlePosition(symbol, 'TP', currentPrice, `Take-Profit Target (+3.6%) Hit on Binance @ ₹${currentPrice}`);
   } else if (currentPrice <= pos.sl) {
-    settlePosition(symbol, 'SL', currentPrice, `Stop-Loss Target Hit on Binance @ ₹${currentPrice}`);
+    const isTrailingStop = pos.isTrailingActive;
+    settlePosition(
+      symbol,
+      isTrailingStop ? 'TRAILING SL' : 'SL',
+      currentPrice,
+      isTrailingStop ? `Trailing Break-Even Stop Hit @ ₹${currentPrice}` : `Stop-Loss Target Hit on Binance @ ₹${currentPrice}`
+    );
   }
 }
 
@@ -304,23 +296,18 @@ function settlePosition(pairKey, type, exitPrice, reason) {
   };
 
   State.tradeLogs.unshift(logEntry);
-  console.log(`[Binance Live Trade] ${type} on ${logEntry.pair}. Live Price: ₹${exitPrice}. PnL: ₹${Math.round(pnl)}`);
+  console.log(`[Binance Live Trade] ${type} on ${logEntry.pair}. Live: ₹${exitPrice}. PnL: ₹${Math.round(pnl)}`);
   
   persistState();
   broadcastState();
 }
 
-/**
- * Autopilot Portfolio Execution Core
- * Evaluates candidate scores against live prices and executes trades
- */
 function evaluateAutopilotTradeCycle() {
   if (!State.analysisActive) return;
 
   State.llmTelemetry.promptExecutionCount++;
   State.llmTelemetry.lastAnalysisTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
 
-  // 1. Update quantitative indicator values across universe
   const qualifiedAssets = [];
   Object.keys(State.universe).forEach(sym => {
     const item = State.universe[sym];
@@ -332,16 +319,14 @@ function evaluateAutopilotTradeCycle() {
     }
   });
 
-  // 2. Determine Market Regime
   if (qualifiedAssets.length >= 2) {
     State.marketRegime = 'MULTI_EXPANSION';
-    State.llmTelemetry.regimeReasoning = `Multiple assets (${qualifiedAssets.slice(0, 3).map(a => a.symbol).join(', ')}) exhibit live order-flow expansion. Multi-basket mode active.`;
+    State.llmTelemetry.regimeReasoning = `Multiple assets (${qualifiedAssets.slice(0, 3).map(a => a.symbol).join(', ')}) exhibit order-flow expansion. Multi-basket mode active (holding up to 3 positions).`;
   } else {
     State.marketRegime = 'TIGHT_DEFENSIVE';
-    State.llmTelemetry.regimeReasoning = 'Market breadth is selective. Capital concentrated in top conviction setup.';
+    State.llmTelemetry.regimeReasoning = 'Market breadth is selective. Capital concentrated in a single top-conviction setup.';
   }
 
-  // 3. Autopilot Multi-Asset Execution with ACTUAL LIVE PRICES
   if (State.autopilotEnabled && State.portfolio.cashINR >= 2500) {
     const currentOpenCount = Object.keys(State.activePositions).length;
     const maxAllowed = State.marketRegime === 'MULTI_EXPANSION' ? State.maxConcurrentPositions : 1;
@@ -372,6 +357,9 @@ function evaluateAutopilotTradeCycle() {
             qty,
             sl: livePrice - slDist,
             tp1: livePrice + (slDist * 2.4),
+            decayRisk: 15,
+            predictiveStatus: 'SAFE',
+            isTrailingActive: false,
             openedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }),
             reasoning: candidate.reasoning
           };
@@ -385,7 +373,7 @@ function evaluateAutopilotTradeCycle() {
             avgBuyPrice: livePrice
           };
 
-          console.log(`[Binance Live Trade Entered] ${candidate.symbol} @ Real-Market ₹${livePrice.toLocaleString('en-IN')} | Allocation: ₹${targetAllocation}`);
+          console.log(`[Autopilot Order Entered] ${candidate.symbol} @ ₹${livePrice.toLocaleString('en-IN')} | ₹${targetAllocation}`);
           persistState();
           broadcastState();
         }
@@ -396,7 +384,6 @@ function evaluateAutopilotTradeCycle() {
   broadcastPricesOnly();
 }
 
-// Run autopilot evaluation every 10 seconds
 setInterval(evaluateAutopilotTradeCycle, 10000);
 
 function broadcastState() {
@@ -413,9 +400,7 @@ function broadcastState() {
   });
 
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
+    if (client.readyState === WebSocket.OPEN) client.send(payload);
   });
 }
 
@@ -441,9 +426,7 @@ function broadcastPricesOnly() {
   });
 
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
+    if (client.readyState === WebSocket.OPEN) client.send(payload);
   });
 }
 
@@ -458,19 +441,12 @@ app.get('/', (req, res) => {
     cashINR: State.portfolio.cashINR,
     activePositionsCount: Object.keys(State.activePositions).length,
     activePositions: Object.keys(State.activePositions).map(k => `${State.activePositions[k].pairSymbol} (₹${Math.round(State.activePositions[k].notionalINR)})`),
-    totalTradesExecuted: State.tradeLogs.length,
     realizedPnL: State.portfolio.realizedPnL
   });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    uptime: process.uptime(), 
-    binanceConnected: State.lastMarketSyncTime !== null,
-    lastMarketSync: State.lastMarketSyncTime,
-    time: new Date() 
-  });
+  res.json({ status: 'healthy', uptime: process.uptime(), lastMarketSync: State.lastMarketSyncTime });
 });
 
 app.get('/api/state', (req, res) => {
@@ -481,31 +457,13 @@ app.get('/api/state', (req, res) => {
     autopilotEnabled: State.autopilotEnabled,
     marketRegime: State.marketRegime,
     llmTelemetry: State.llmTelemetry,
-    analysisActive: State.analysisActive,
-    lastMarketSync: State.lastMarketSyncTime,
     tradeLogs: State.tradeLogs.slice(0, 50)
   });
 });
 
-// Endpoint to update live USDT/INR rate on the fly if needed
-app.post('/api/fx/usdt-rate', (req, res) => {
-  const { rate } = req.body;
-  if (rate && Number(rate) > 0) {
-    State.usdtToInrRate = Number(rate);
-    fetchLiveBinancePrices();
-    return res.json({ success: true, usdtToInrRate: State.usdtToInrRate });
-  }
-  res.status(400).json({ error: 'Invalid rate' });
-});
-
 app.post('/api/autopilot/toggle', (req, res) => {
   State.autopilotEnabled = !State.autopilotEnabled;
-  console.log(`[Autopilot Status Changed] Autopilot is now: ${State.autopilotEnabled ? 'ACTIVE' : 'STOPPED'}`);
-  
-  if (State.autopilotEnabled) {
-    evaluateAutopilotTradeCycle();
-  }
-
+  if (State.autopilotEnabled) evaluateAutopilotTradeCycle();
   persistState();
   broadcastState();
   res.json({ success: true, autopilotEnabled: State.autopilotEnabled });
@@ -522,61 +480,8 @@ app.post('/api/trade/close-position', (req, res) => {
 });
 
 app.post('/api/reset-portfolio', (req, res) => {
-  State.portfolio = {
-    cashINR: 20000,
-    holdings: {},
-    realizedPnL: 0
-  };
+  State.portfolio = { cashINR: 20000, holdings: {}, realizedPnL: 0 };
   State.activePositions = {};
-  persistState();
-  broadcastState();
-  res.json({ success: true, cashINR: State.portfolio.cashINR });
-});
-
-app.post('/api/trade/manual-buy', (req, res) => {
-  const { pairKey, amountINR } = req.body;
-  if (!pairKey || !amountINR || amountINR <= 0) return res.status(400).json({ error: 'Invalid trade inputs' });
-  if (amountINR > State.portfolio.cashINR) return res.status(400).json({ error: 'Insufficient funds' });
-
-  const candidate = State.universe[pairKey];
-  if (!candidate || candidate.priceINR <= 0) return res.status(400).json({ error: 'Live price not yet available from Binance' });
-
-  const price = candidate.priceINR;
-  const qty = amountINR / price;
-  const slDist = price * 0.015;
-
-  State.activePositions[pairKey] = {
-    pairKey,
-    pairName: candidate.name,
-    pairSymbol: candidate.symbol,
-    entryPrice: price,
-    notionalINR: amountINR,
-    qty,
-    sl: price - slDist,
-    tp1: price + (slDist * 2.4),
-    openedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }),
-    reasoning: candidate.reasoning
-  };
-
-  State.portfolio.cashINR -= amountINR;
-  State.portfolio.holdings[pairKey] = {
-    name: candidate.name,
-    symbol: candidate.symbol,
-    qty,
-    totalCostINR: amountINR,
-    avgBuyPrice: price
-  };
-
-  persistState();
-  broadcastState();
-  res.json({ success: true, position: State.activePositions[pairKey] });
-});
-
-app.post('/api/deposit', (req, res) => {
-  const { amountINR } = req.body;
-  if (!amountINR || amountINR <= 0) return res.status(400).json({ error: 'Invalid deposit' });
-
-  State.portfolio.cashINR += Number(amountINR);
   persistState();
   broadcastState();
   res.json({ success: true, cashINR: State.portfolio.cashINR });
@@ -586,8 +491,6 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
-  console.log('[WebSocket Client] Client connected. Sending live market snapshot.');
-  
   ws.send(JSON.stringify({
     type: 'INIT',
     portfolio: State.portfolio,
@@ -613,39 +516,6 @@ wss.on('connection', (ws) => {
         if (pairKey && State.activePositions[pairKey]) {
           const curPrice = State.universe[pairKey]?.priceINR || State.activePositions[pairKey].entryPrice;
           settlePosition(pairKey, 'MANUAL', curPrice, 'Manual User Override');
-        }
-      } else if (data.type === 'MANUAL_BUY') {
-        const { pairKey, amountINR } = data;
-        const item = State.universe[pairKey];
-        if (item && item.priceINR > 0 && amountINR <= State.portfolio.cashINR) {
-          const price = item.priceINR;
-          const qty = amountINR / price;
-          const slDist = price * 0.015;
-
-          State.activePositions[pairKey] = {
-            pairKey,
-            pairName: item.name,
-            pairSymbol: item.symbol,
-            entryPrice: price,
-            notionalINR: amountINR,
-            qty,
-            sl: price - slDist,
-            tp1: price + (slDist * 2.4),
-            openedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }),
-            reasoning: item.reasoning
-          };
-
-          State.portfolio.cashINR -= amountINR;
-          State.portfolio.holdings[pairKey] = {
-            name: item.name,
-            symbol: item.symbol,
-            qty,
-            totalCostINR: amountINR,
-            avgBuyPrice: price
-          };
-
-          persistState();
-          broadcastState();
         }
       }
     } catch (e) {}
