@@ -46,13 +46,13 @@ const State = {
   usdtToInrRate: Number(process.env.USDT_INR_RATE) || 94.37,
   lastMarketSyncTime: null,
 
-  // Multi-position portfolio management
+  // Multi-position portfolio management for ₹20,000 total capital
   maxConcurrentPositions: 3,
-  allocationPerTradeINR: 50000,
+  allocationPerTradeINR: 6000,
   marketRegime: 'MULTI_EXPANSION',
   
   portfolio: {
-    cashINR: 300000,
+    cashINR: 20000,
     holdings: {},
     realizedPnL: 0
   },
@@ -232,10 +232,48 @@ function checkPositionExits(symbol, currentPrice) {
   if (!State.activePositions[symbol]) return;
   const pos = State.activePositions[symbol];
 
+  const currentGainPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+
+  // 1. Trailing Stop Ratchet: Protect capital once in profit
+  // If gain crosses +1.5%, move hard Stop-Loss up to Break-Even (+0.2%)
+  const breakEvenPrice = pos.entryPrice * 1.002;
+  if (currentGainPct >= 1.5 && pos.sl < breakEvenPrice) {
+    pos.sl = breakEvenPrice;
+    console.log(`[Risk Guardian] ${pos.pairSymbol} Stop-Loss ratcheted to Break-Even @ ₹${Math.round(pos.sl)}`);
+  }
+
+  // 2. Predictive LLM Early-Warning Exit
+  // If trade is in profit (> +0.5%) but order-flow metrics (OBI/CVD) rapidly deteriorate,
+  // front-run the reversal and take profit before it retraces back to Stop-Loss.
+  const assetData = State.universe[symbol];
+  if (assetData) {
+    const isObiBearish = assetData.obi < 0.49;
+    const isCvdFlipping = assetData.cvd < 0;
+    const isScoreDropping = assetData.score < 65;
+
+    // Calculate dynamic risk/decay score (0 to 100)
+    let decayRisk = 0;
+    if (isObiBearish) decayRisk += 35;
+    if (isCvdFlipping) decayRisk += 40;
+    if (isScoreDropping) decayRisk += 25;
+    pos.decayRisk = decayRisk;
+
+    if (currentGainPct >= 0.5 && decayRisk >= 65) {
+      settlePosition(
+        symbol,
+        'PREDICTIVE TP',
+        currentPrice,
+        `AI Early Exit: Order flow turned bearish (Risk: ${decayRisk}%). Secured +${currentGainPct.toFixed(2)}% gain before retracement.`
+      );
+      return;
+    }
+  }
+
+  // 3. Standard Hard Take-Profit (+3.6%) and Stop-Loss (-1.5%) triggers
   if (currentPrice >= pos.tp1) {
     settlePosition(symbol, 'TP', currentPrice, `Take-Profit Target (+3.6%) Hit on Binance @ ₹${currentPrice}`);
   } else if (currentPrice <= pos.sl) {
-    settlePosition(symbol, 'SL', currentPrice, `Stop-Loss Target (-1.5%) Hit on Binance @ ₹${currentPrice}`);
+    settlePosition(symbol, 'SL', currentPrice, `Stop-Loss Target Hit on Binance @ ₹${currentPrice}`);
   }
 }
 
@@ -303,7 +341,7 @@ function evaluateAutopilotTradeCycle() {
   }
 
   // 3. Autopilot Multi-Asset Execution with ACTUAL LIVE PRICES
-  if (State.autopilotEnabled && State.portfolio.cashINR >= 15000) {
+  if (State.autopilotEnabled && State.portfolio.cashINR >= 2500) {
     const currentOpenCount = Object.keys(State.activePositions).length;
     const maxAllowed = State.marketRegime === 'MULTI_EXPANSION' ? State.maxConcurrentPositions : 1;
 
@@ -319,7 +357,7 @@ function evaluateAutopilotTradeCycle() {
         const slotsAvailable = maxAllowed - currentOpenCount;
         const targetAllocation = Math.min(State.allocationPerTradeINR, Math.floor(State.portfolio.cashINR / Math.max(1, slotsAvailable)));
 
-        if (targetAllocation >= 10000) {
+        if (targetAllocation >= 2000) {
           const livePrice = candidate.priceINR;
           const qty = targetAllocation / livePrice;
           const slDist = livePrice * 0.015;
@@ -478,16 +516,20 @@ app.post('/api/trade/close-position', (req, res) => {
     const curPrice = State.universe[pairKey]?.priceINR || State.activePositions[pairKey].entryPrice;
     settlePosition(pairKey, 'MANUAL', curPrice, 'Manual User Override');
     return res.json({ success: true, message: `Position ${pairKey} closed` });
-  } else if (!pairKey) {
-    const keys = Object.keys(State.activePositions);
-    if (keys.length > 0) {
-      const k = keys[0];
-      const curPrice = State.universe[k]?.priceINR || State.activePositions[k].entryPrice;
-      settlePosition(k, 'MANUAL', curPrice, 'Manual User Override');
-      return res.json({ success: true, message: `Position ${k} closed` });
-    }
   }
-  res.json({ success: false, message: 'No matching active position found' });
+  res.status(404).json({ error: 'Position not found' });
+});
+
+app.post('/api/reset-portfolio', (req, res) => {
+  State.portfolio = {
+    cashINR: 20000,
+    holdings: {},
+    realizedPnL: 0
+  };
+  State.activePositions = {};
+  persistState();
+  broadcastState();
+  res.json({ success: true, cashINR: State.portfolio.cashINR });
 });
 
 app.post('/api/trade/manual-buy', (req, res) => {
