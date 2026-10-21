@@ -41,7 +41,8 @@ console.log('=======================================================');
 const State = {
   autopilotEnabled: true,
   analysisActive: true,
-  usdtToInrRate: 94.50, // Live Binance P2P / INR baseline
+  // Matched to Binance standard global app conversion rate (~87.50)
+  usdtToInrRate: Number(process.env.USDT_INR_RATE) || 87.50,
   lastMarketSyncTime: null,
 
   // Multi-position portfolio management
@@ -373,6 +374,7 @@ function broadcastPricesOnly() {
     portfolio: State.portfolio,
     marketRegime: State.marketRegime,
     llmTelemetry: State.llmTelemetry,
+    usdtToInrRate: State.usdtToInrRate,
     syncTime: State.lastMarketSyncTime
   });
 
