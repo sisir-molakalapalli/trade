@@ -1,14 +1,14 @@
 /**
- * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v11.1)
+ * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v11.2)
  * ------------------------------------------------------------------------------------
  * Features:
- *  - Dynamic Two-Stage Screener:
- *      * Stage 1: Market-wide scan across all 350+ Binance USDT pairs (Volume >= $30M).
+ *  - Dynamic Two-Stage Screener with Geo-Resilient Binance Vision Mirrors:
+ *      * Stage 1: Market-wide scan across all 350+ Binance USDT pairs (Volume >= $10M).
+ *      * Dynamic rotation: Detects top momentum/breakout candidates.
  *      * Stage 2: Deep 20-level Order Book Imbalance (OBI) + Gemini 3.8 Flash on Top 10.
- *  - Immediate Pre-Seeded Dynamic Universe (Zero empty table delay on startup).
+ *  - Instant Universe Initialization with live fallback.
  *  - Anti-Ghost Spike Protection Filter:
- *      * Prevents entering trades on unverified/stale fallback prices.
- *      * Dynamic live verification eliminates 40%-50% anchor gap anomalies (AVAX, SOL).
+ *      * Requires fresh live Binance verification within 5 seconds before trade execution.
  *  - Predictive Position Health (SAFE / CAUTION / EXITING) with early loss cut at -0.5%.
  *  - Trailing Stop Ratchet (+0.2% Break-Even lock on +1.5% unrealized gain).
  */
@@ -31,10 +31,40 @@ app.options('*', cors());
 app.use(express.json());
 
 console.log('================================================================');
-console.log("[Cloud Engine v11.1] Dynamic Two-Stage Screener & Gemini 3.8 Flash Engine");
-console.log(`[Cloud Engine v11.1] Port: ${PORT} | Render 24/7 Dedicated Server`);
-console.log(`[Cloud Engine v11.1] Gemini AI: ${GEMINI_API_KEY ? 'ACTIVE (Key Loaded from Env)' : 'STANDBY'}`);
+console.log("[Cloud Engine v11.2] Geo-Resilient Dynamic Screener & Gemini 3.8 Flash");
+console.log(`[Cloud Engine v11.2] Port: ${PORT} | Render 24/7 Dedicated Server`);
+console.log(`[Cloud Engine v11.2] Gemini AI: ${GEMINI_API_KEY ? 'ACTIVE (Env Loaded)' : 'STANDBY'}`);
 console.log('================================================================');
+
+// Multi-endpoint mirror array to bypass datacenter/cloud geoblocks
+const BINANCE_HOSTS = [
+  'https://data-api.binance.vision',
+  'https://api1.binance.com',
+  'https://api3.binance.com',
+  'https://api.binance.com'
+];
+let currentHostIndex = 0;
+
+async function fetchFromBinance(path) {
+  for (let i = 0; i < BINANCE_HOSTS.length; i++) {
+    const hostIdx = (currentHostIndex + i) % BINANCE_HOSTS.length;
+    const url = `${BINANCE_HOSTS[hostIdx]}${path}`;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      const res = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+      });
+      clearTimeout(timeout);
+      if (res.ok) {
+        currentHostIndex = hostIdx;
+        return await res.json();
+      }
+    } catch (e) {}
+  }
+  return null;
+}
 
 const State = {
   autopilotEnabled: true,
@@ -42,6 +72,7 @@ const State = {
   usdtToInrRate: Number(process.env.USDT_INR_RATE) || 94.37,
   lastMarketSyncTime: null,
   marketSyncCount: 0,
+  lastScreenerRunTime: null,
 
   maxConcurrentPositions: 3,
   allocationPerTradeINR: 6000,
@@ -67,7 +98,6 @@ const State = {
     screenerMode: "DYNAMIC_MARKET_WIDE"
   },
 
-  // Dynamic Universe initialized with live-calibrated spot anchors (Instant UI availability)
   universe: {
     SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9927.72, score: 85, direction: 'BUY', cvd: 14.2, obi: 0.54, source: 'GEMINI_3_8_FLASH', reasoning: 'High spot volume dominance', verifiedAt: Date.now() },
     SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 58, direction: 'NEUTRAL', cvd: -4.5, obi: 0.44, source: 'GEMINI_3_8_FLASH', reasoning: 'Balanced bid/ask distribution', verifiedAt: Date.now() },
@@ -126,22 +156,10 @@ function persistState() {
   }
 }
 
-const BINANCE_HOSTS = [
-  'https://api.binance.com',
-  'https://data-api.binance.vision',
-  'https://api1.binance.com',
-  'https://api3.binance.com'
-];
-let currentHostIndex = 0;
-
 async function syncBinanceUsdtInrRate() {
-  const host = BINANCE_HOSTS[currentHostIndex];
   try {
-    const res = await fetch(`${host}/api/v3/ticker/price?symbol=USDTINR`, {
-      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
-    });
-    if (res.ok) {
-      const data = await res.json();
+    const data = await fetchFromBinance('/api/v3/ticker/price?symbol=USDTINR');
+    if (data && data.price) {
       const liveRate = parseFloat(data.price);
       if (liveRate && liveRate > 80 && liveRate < 120) {
         State.usdtToInrRate = Math.round(liveRate * 100) / 100;
@@ -154,48 +172,52 @@ syncBinanceUsdtInrRate();
 
 /**
  * STAGE 1: DYNAMIC MARKET-WIDE SCREENER
- * Queries all USDT pairs on Binance, filters by volume >= $30M,
- * ranks by combined momentum/volume score, and shortlists the top 10 assets.
+ * Evaluates all 350+ Binance USDT pairs using geo-resilient mirrors.
+ * Filters by volume >= $10M, ranks by combined price velocity and volume activity.
  */
 async function runDynamicMarketScreener() {
-  const host = BINANCE_HOSTS[currentHostIndex];
   try {
-    const res = await fetch(`${host}/api/v3/ticker/24hr`, {
-      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
-    });
-    if (!res.ok) return;
+    console.log('[Dynamic Screener] Initiating market-wide scan across all Binance USDT pairs...');
+    const allTickers = await fetchFromBinance('/api/v3/ticker/24hr');
+    if (!allTickers || !Array.isArray(allTickers)) {
+      console.log('[Dynamic Screener] Warning: Ticker fetch returned non-array, trying next cycle');
+      return { success: false, reason: 'Failed to fetch tickers' };
+    }
 
-    const allTickers = await res.json();
     const activeSymbols = Object.keys(State.activePositions);
-
     const eligible = [];
+
     allTickers.forEach(item => {
       const sym = item.symbol;
       if (!sym.endsWith('USDT')) return;
       if (sym.includes('UP') || sym.includes('DOWN') || sym.includes('BEAR') || sym.includes('BULL')) return;
+      if (sym.startsWith('USDC') || sym.startsWith('FDUSD') || sym.startsWith('TUSD') || sym.startsWith('EUR')) return;
 
       const volumeUSDT = parseFloat(item.quoteVolume) || 0;
       const priceChangePct = parseFloat(item.priceChangePercent) || 0;
       const lastPrice = parseFloat(item.lastPrice) || 0;
 
-      if (volumeUSDT >= 30000000 && lastPrice > 0) {
-        const momentumScore = (priceChangePct * 1.5) + (Math.log10(volumeUSDT) * 4);
+      // Filter: Liquid tokens with at least $10M 24h volume
+      if (volumeUSDT >= 10000000 && lastPrice > 0) {
+        // Balanced Breakout Score: Absolute momentum + volume scale
+        const breakoutScore = (Math.abs(priceChangePct) * 2.2) + (Math.log10(volumeUSDT) * 1.5) + (priceChangePct > 0 ? 3.0 : 0);
         eligible.push({
           symbol: sym,
           baseAsset: sym.replace('USDT', ''),
           priceUSDT: lastPrice,
           priceChangePct,
           volumeUSDT,
-          momentumScore
+          breakoutScore
         });
       }
     });
 
-    eligible.sort((a, b) => b.momentumScore - a.momentumScore);
+    eligible.sort((a, b) => b.breakoutScore - a.breakoutScore);
 
     const newUniverse = {};
     const addedSymbols = new Set();
 
+    // Preserve any active positions
     activeSymbols.forEach(sym => {
       if (State.universe[sym]) {
         newUniverse[sym] = State.universe[sym];
@@ -203,6 +225,7 @@ async function runDynamicMarketScreener() {
       }
     });
 
+    // Populate top candidates dynamically
     for (const cand of eligible) {
       if (Object.keys(newUniverse).length >= 10) break;
       if (addedSymbols.has(cand.symbol)) continue;
@@ -215,47 +238,46 @@ async function runDynamicMarketScreener() {
         symbol: cand.baseAsset,
         priceUSDT: cand.priceUSDT,
         priceINR: Math.round(cand.priceUSDT * State.usdtToInrRate * 100) / 100,
-        score: existing ? existing.score : 70,
-        direction: existing ? existing.direction : 'BUY',
-        cvd: existing ? existing.cvd : 5.0,
+        score: existing ? existing.score : (cand.priceChangePct > 0 ? 75 : 65),
+        direction: existing ? existing.direction : (cand.priceChangePct > 0 ? 'BUY' : 'NEUTRAL'),
+        cvd: existing ? existing.cvd : (cand.priceChangePct * 1.2),
         obi: existing ? existing.obi : 0.52,
         source: existing ? existing.source : 'GEMINI_3_8_FLASH',
-        reasoning: existing ? existing.reasoning : `High 24h Volume ($${Math.round(cand.volumeUSDT / 1e6)}M)`,
+        reasoning: existing ? existing.reasoning : `${cand.priceChangePct >= 0 ? '+' : ''}${cand.priceChangePct.toFixed(1)}% 24h ($${Math.round(cand.volumeUSDT / 1e6)}M Vol)`,
         verifiedAt: Date.now()
       };
       addedSymbols.add(sym);
     }
 
-    if (Object.keys(newUniverse).length > 0) {
+    if (Object.keys(newUniverse).length >= 5) {
       State.universe = newUniverse;
-      console.log(`[Dynamic Screener] Universe refreshed. Active candidates: ${Object.keys(State.universe).join(', ')}`);
+      State.lastScreenerRunTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata' });
+      console.log(`[Dynamic Screener] Universe updated at ${State.lastScreenerRunTime}: ${Object.keys(State.universe).join(', ')}`);
       broadcastState();
+      return { success: true, count: Object.keys(State.universe).length, assets: Object.keys(State.universe) };
     }
   } catch (err) {
     console.error('[Dynamic Screener] Error running stage 1:', err.message);
+    return { success: false, error: err.message };
   }
 }
-runDynamicMarketScreener();
-setInterval(runDynamicMarketScreener, 15 * 60 * 1000);
+
+// Run screener on boot, and every 10 minutes
+setTimeout(runDynamicMarketScreener, 3000);
+setInterval(runDynamicMarketScreener, 10 * 60 * 1000);
 
 async function fetchRealOrderBookDepth(symbol) {
-  const host = BINANCE_HOSTS[currentHostIndex];
   try {
-    const res = await fetch(`${host}/api/v3/depth?symbol=${symbol}&limit=20`, {
-      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
-    });
-    if (res.ok) {
-      const data = await res.json();
+    const data = await fetchFromBinance(`/api/v3/depth?symbol=${symbol}&limit=20`);
+    if (data && data.bids && data.asks) {
       let bidVol = 0;
       let askVol = 0;
-      (data.bids || []).forEach(b => { bidVol += parseFloat(b[1]) || 0; });
-      (data.asks || []).forEach(a => { askVol += parseFloat(a[1]) || 0; });
+      data.bids.forEach(b => { bidVol += parseFloat(b[1]) || 0; });
+      data.asks.forEach(a => { askVol += parseFloat(a[1]) || 0; });
       const total = bidVol + askVol;
       return total > 0 ? bidVol / total : 0.50;
     }
-  } catch (e) {
-    currentHostIndex = (currentHostIndex + 1) % BINANCE_HOSTS.length;
-  }
+  } catch (e) {}
   return null;
 }
 
@@ -263,13 +285,9 @@ async function fetchRealOrderBookDepth(symbol) {
  * LIVE BINANCE PRICE STREAM
  */
 async function fetchLiveBinancePrices() {
-  const host = BINANCE_HOSTS[currentHostIndex];
   try {
-    const res = await fetch(`${host}/api/v3/ticker/price`, {
-      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
-    });
-    if (res.ok) {
-      const allTickers = await res.json();
+    const allTickers = await fetchFromBinance('/api/v3/ticker/price');
+    if (allTickers && Array.isArray(allTickers)) {
       const tickerMap = {};
       allTickers.forEach(t => { tickerMap[t.symbol] = parseFloat(t.price); });
 
@@ -294,9 +312,7 @@ async function fetchLiveBinancePrices() {
         await monitorOpenPositionsHealth();
       }
     }
-  } catch (e) {
-    currentHostIndex = (currentHostIndex + 1) % BINANCE_HOSTS.length;
-  }
+  } catch (e) {}
 }
 setInterval(fetchLiveBinancePrices, 2500);
 
@@ -409,12 +425,10 @@ async function runLLMQuantitativeAnalysis() {
     hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata'
   });
 
-  const host = BINANCE_HOSTS[currentHostIndex];
   let ticker24hMap = {};
   try {
-    const res = await fetch(`${host}/api/v3/ticker/24hr`, { headers: { 'X-MBX-APIKEY': BINANCE_API_KEY } });
-    if (res.ok) {
-      const data = await res.json();
+    const data = await fetchFromBinance('/api/v3/ticker/24hr');
+    if (data && Array.isArray(data)) {
       data.forEach(item => {
         ticker24hMap[item.symbol] = {
           priceChangePercent: parseFloat(item.priceChangePercent) || 0,
@@ -515,7 +529,6 @@ Keep reasoning under 8 words per coin. Output valid JSON only.`;
                   });
                 }
                 geminiSuccess = true;
-                console.log(`[Gemini AI Live Evaluation] Success via ${model}: ${parsed.reasoning}`);
                 break;
               }
             }
@@ -528,7 +541,6 @@ Keep reasoning under 8 words per coin. Output valid JSON only.`;
         }
       }
     } catch (err) {
-      console.error('[Gemini AI] Call error:', err.message);
       State.llmTelemetry.lastError = err.message;
     }
   }
@@ -546,7 +558,7 @@ Keep reasoning under 8 words per coin. Output valid JSON only.`;
 
       if (computed >= 82) {
         State.universe[sym].direction = 'STRONG BUY';
-        State.universe[sym].reasoning = `High order book buyer skew (${Math.round(m.orderBookImbalance * 100)}%) with 24h momentum +${m.priceChange24hPct}%`;
+        State.universe[sym].reasoning = `Buyer skew (${Math.round(m.orderBookImbalance * 100)}%) with 24h momentum +${m.priceChange24hPct}%`;
       } else if (computed >= 72) {
         State.universe[sym].direction = 'BUY';
         State.universe[sym].reasoning = `Healthy accumulation baseline (OBI: ${Math.round(m.orderBookImbalance * 100)}%)`;
@@ -681,15 +693,24 @@ app.get('/', (req, res) => {
     screenerMode: 'Dynamic Two-Stage Market-Wide Screener',
     universeSize: Object.keys(State.universe).length,
     universeAssets: Object.keys(State.universe),
+    lastScreenerRun: State.lastScreenerRunTime,
     geminiConfigured: Boolean(GEMINI_API_KEY),
     geminiSource: State.llmTelemetry.source,
     lastAiAnalysisTime: State.llmTelemetry.lastAnalysisTime,
-    lastAiLatencyMs: State.llmTelemetry.lastLatencyMs,
     autopilotEnabled: State.autopilotEnabled,
     cashINR: State.portfolio.cashINR,
     activePositionsCount: Object.keys(State.activePositions).length,
-    activePositions: Object.keys(State.activePositions).map(k => `${State.activePositions[k].pairSymbol} (₹${Math.round(State.activePositions[k].notionalINR)}, Risk: ${State.activePositions[k].decayRisk}%)`),
     realizedPnL: State.portfolio.realizedPnL
+  });
+});
+
+app.get('/api/screener/run', async (req, res) => {
+  const result = await runDynamicMarketScreener();
+  res.json({
+    trigger: 'manual_screener_run',
+    result,
+    currentUniverse: Object.keys(State.universe),
+    lastRun: State.lastScreenerRunTime
   });
 });
 
@@ -698,11 +719,11 @@ app.get('/api/health', (req, res) => {
     status: 'healthy',
     uptime: process.uptime(),
     geminiActive: State.llmTelemetry.source === 'GEMINI_3_8_FLASH',
-    geminiConfigured: Boolean(GEMINI_API_KEY),
     lastMarketSync: State.lastMarketSyncTime,
     lastAiAnalysis: State.llmTelemetry.lastAnalysisTime,
+    lastScreenerRun: State.lastScreenerRunTime,
     autopilot: State.autopilotEnabled,
-    positions: Object.keys(State.activePositions).length
+    universeSize: Object.keys(State.universe).length
   });
 });
 
@@ -723,7 +744,7 @@ app.get('/api/llm/test', async (req, res) => {
   };
 
   if (!GEMINI_API_KEY) {
-    result.diagnosis = 'GEMINI_API_KEY environment variable is missing on Render. Running on Microstructure Fallback.';
+    result.diagnosis = 'GEMINI_API_KEY missing on Render.';
     return res.json(result);
   }
 
@@ -749,21 +770,13 @@ app.get('/api/llm/test', async (req, res) => {
 
       if (testRes.ok) {
         result.geminiActive = true;
-        result.diagnosis = `Gemini API verified and operational 24/7 using ${m}.`;
+        result.diagnosis = `Gemini API operational 24/7 using ${m}.`;
         connected = true;
-      } else {
-        result.geminiActive = false;
-        result.geminiErrorDetails = await testRes.text();
       }
-    }
-
-    if (!connected) {
-      result.diagnosis = 'Gemini API returned an error status across tested models.';
     }
   } catch (err) {
     result.geminiActive = false;
     result.geminiException = err.message;
-    result.diagnosis = 'Network connection to Google Gemini API failed.';
   }
 
   res.json(result);
@@ -846,9 +859,8 @@ loadPersistedState();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`================================================================`);
-  console.log(` Sisir's Cloud Quant Engine v11.1 RUNNING on port ${PORT}`);
-  console.log(` Screener: Dynamic Two-Stage Market-Wide Filter Active`);
-  console.log(` Pre-seeded Instant Universe: ${Object.keys(State.universe).length} Coins Ready`);
+  console.log(` Sisir's Cloud Quant Engine v11.2 RUNNING on port ${PORT}`);
+  console.log(` Screener: Geo-Resilient Binance Vision Multi-Mirror Active`);
   console.log(` Real-time Binance Depth & Health: Active every 2.5s`);
   console.log(` Gemini AI Market Evaluation Loop: Active every 60s`);
   console.log(`================================================================`);
