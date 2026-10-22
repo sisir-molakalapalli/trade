@@ -22,7 +22,7 @@ const path = require('path');
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyAHFhOI8ZLKx0ii346W19Z9G8OoCKmzrP8';
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'X-MBX-APIKEY'] }));
@@ -323,7 +323,9 @@ async function runLLMQuantitativeAnalysis() {
   if (!State.analysisActive) return;
 
   State.llmTelemetry.promptExecutionCount++;
-  State.llmTelemetry.lastAnalysisTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
+  State.llmTelemetry.lastAnalysisTime = new Date().toLocaleTimeString('en-IN', {
+    hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata'
+  });
 
   // 1. Fetch live 24h ticker metrics
   const host = BINANCE_HOSTS[currentHostIndex];
@@ -514,13 +516,13 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
 
           console.log(`[Gemini Autopilot Entered] ${candidate.symbol} @ ₹${livePrice.toLocaleString('en-IN')} | AI Score: ${candidate.score}/100 | Allocation: ₹${targetAllocation}`);
           persistState();
-          broadcastState();
         }
       }
     }
   }
 
-  broadcastPricesOnly();
+  // Always broadcast state so all clients receive updated lastAnalysisTime & reasoning
+  broadcastState();
 }
 setInterval(runLLMQuantitativeAnalysis, 20000);
 
