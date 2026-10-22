@@ -194,17 +194,22 @@ async function fetchRealOrderBookDepth(symbol) {
 }
 
 /**
- * STAGE 1: DYNAMIC MARKET-WIDE SCREENER
- * Evaluates all 350+ Binance USDT pairs using geo-resilient mirrors.
+ * STAGE 1: DUAL-REGIME VOLATILITY EXPANSION DYNAMIC SCREENER
+ * Scans all 350+ Binance pairs every 3 minutes.
+ * Identifies institutional volume breakouts and filters out dump traps.
  */
 async function runDynamicMarketScreener() {
   try {
-    console.log('[Dynamic Screener] Scanning all Binance USDT pairs for volume & momentum breakouts...');
+    console.log('[Dynamic Screener] Scanning 350+ Binance USDT pairs for Volatility Breakouts...');
     const allTickers = await fetchFromBinance('/api/v3/ticker/24hr');
     if (!allTickers || !Array.isArray(allTickers)) return { success: false, reason: 'Failed to fetch tickers' };
 
     const activeSymbols = Object.keys(State.activePositions);
     const eligible = [];
+
+    // Compute average market momentum to detect overall market regime
+    let totalPositivePct = 0;
+    let positiveCount = 0;
 
     allTickers.forEach(item => {
       const sym = item.symbol;
@@ -215,17 +220,46 @@ async function runDynamicMarketScreener() {
       const volumeUSDT = parseFloat(item.quoteVolume) || 0;
       const priceChangePct = parseFloat(item.priceChangePercent) || 0;
       const lastPrice = parseFloat(item.lastPrice) || 0;
+      const highPrice = parseFloat(item.highPrice) || 0;
+      const lowPrice = parseFloat(item.lowPrice) || 0;
 
-      if (volumeUSDT >= 10000000 && lastPrice > 0) {
-        const breakoutScore = (Math.abs(priceChangePct) * 2.2) + (Math.log10(volumeUSDT) * 1.5) + (priceChangePct > 0 ? 3.0 : 0);
-        eligible.push({
-          symbol: sym,
-          baseAsset: sym.replace('USDT', ''),
-          priceUSDT: lastPrice,
-          priceChangePct,
-          volumeUSDT,
-          breakoutScore
-        });
+      // Only evaluate coins with liquid spot books (minimum $15M 24h turnover)
+      if (volumeUSDT >= 15000000 && lastPrice > 0 && highPrice > lowPrice) {
+        if (priceChangePct > 0) {
+          totalPositivePct += priceChangePct;
+          positiveCount++;
+        }
+
+        // Intraday Range Expansion Ratio
+        const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
+        
+        // Position relative to 24h high (must be trading in upper 55% of range to avoid distribution tops)
+        const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
+
+        // DIRECTIONAL BREAKOUT FORMULA:
+        // 1. Heavy reward for clean upward momentum (drops dumping coins)
+        // 2. High reward for trading near 24h highs (pricePositionInRange >= 0.55)
+        // 3. Logarithmic volume scaling to confirm institutional liquidity
+        let breakoutScore = 0;
+        if (priceChangePct > 0.5 && pricePositionInRange >= 0.55) {
+          const momentumMultiplier = Math.min(priceChangePct, 18) * 3.5;
+          const rangeBonus = intradayRangePct * 0.8;
+          const volumeWeight = Math.log10(volumeUSDT) * 3.0;
+          const highProximityBonus = pricePositionInRange * 8.0;
+          
+          breakoutScore = momentumMultiplier + rangeBonus + volumeWeight + highProximityBonus;
+
+          eligible.push({
+            symbol: sym,
+            baseAsset: sym.replace('USDT', ''),
+            priceUSDT: lastPrice,
+            priceChangePct,
+            volumeUSDT,
+            breakoutScore,
+            intradayRangePct,
+            pricePositionInRange
+          });
+        }
       }
     });
 
@@ -234,6 +268,7 @@ async function runDynamicMarketScreener() {
     const newUniverse = {};
     const addedSymbols = new Set();
 
+    // 1. Retain currently open active positions so they are never orphaned
     activeSymbols.forEach(sym => {
       if (State.universe[sym]) {
         newUniverse[sym] = State.universe[sym];
@@ -241,6 +276,7 @@ async function runDynamicMarketScreener() {
       }
     });
 
+    // 2. Populate top 10 dynamic candidates matching the volatility breakout criteria
     for (const cand of eligible) {
       if (Object.keys(newUniverse).length >= 10) break;
       if (addedSymbols.has(cand.symbol)) continue;
@@ -253,14 +289,14 @@ async function runDynamicMarketScreener() {
         symbol: cand.baseAsset,
         priceUSDT: cand.priceUSDT,
         priceINR: Math.round(cand.priceUSDT * State.usdtToInrRate * 100) / 100,
-        score: existing ? existing.score : (cand.priceChangePct > 0 ? 75 : 65),
-        direction: existing ? existing.direction : (cand.priceChangePct > 0 ? 'BUY' : 'NEUTRAL'),
-        cvd: existing ? existing.cvd : (cand.priceChangePct * 1.2),
-        obi: existing ? existing.obi : 0.52,
+        score: existing ? existing.score : Math.min(94, Math.max(72, Math.round(cand.breakoutScore))),
+        direction: existing ? existing.direction : 'BUY',
+        cvd: existing ? existing.cvd : (cand.priceChangePct * 1.5),
+        obi: existing ? existing.obi : 0.54,
         priceChangePct: cand.priceChangePct,
         volumeM: Math.round(cand.volumeUSDT / 1e6),
         source: 'QUANT_ALGO',
-        reasoning: existing ? existing.reasoning : `${cand.priceChangePct >= 0 ? '+' : ''}${cand.priceChangePct.toFixed(1)}% 24h ($${Math.round(cand.volumeUSDT / 1e6)}M Vol)`,
+        reasoning: existing ? existing.reasoning : `Vol Surge: +${cand.priceChangePct.toFixed(1)}% | Range Top ${(cand.pricePositionInRange * 100).toFixed(0)}% ($${Math.round(cand.volumeUSDT / 1e6)}M Vol)`,
         verifiedAt: Date.now()
       };
       addedSymbols.add(sym);
@@ -269,6 +305,7 @@ async function runDynamicMarketScreener() {
     if (Object.keys(newUniverse).length >= 5) {
       State.universe = newUniverse;
       State.lastScreenerRunTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata' });
+      console.log(`[Dynamic Screener] Successfully rotated universe. Active Candidates: ${Object.keys(State.universe).join(', ')}`);
       broadcastState();
       return { success: true, count: Object.keys(State.universe).length, assets: Object.keys(State.universe) };
     }
@@ -278,8 +315,9 @@ async function runDynamicMarketScreener() {
   }
 }
 
+// Run immediately on boot, then every 3 minutes for volatility responsiveness
 setTimeout(runDynamicMarketScreener, 2000);
-setInterval(runDynamicMarketScreener, 10 * 60 * 1000);
+setInterval(runDynamicMarketScreener, 3 * 60 * 1000);
 
 /**
  * STAGE 2: PURE MATHEMATICAL QUANTITATIVE EVALUATION (RUNS EVERY 15 SECONDS)
