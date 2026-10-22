@@ -22,7 +22,7 @@ const path = require('path');
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyAHFhOI8ZLKx0ii346W19Z9G8OoCKmzrP8';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'X-MBX-APIKEY'] }));
