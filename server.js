@@ -1,15 +1,15 @@
 /**
- * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v10.0)
+ * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v10.5)
  * ------------------------------------------------------------------------------------
  * Runs 24/7 on Render ($7 Dedicated Plan).
- * Real-Time Features:
- *  - Active Google Gemini AI Quantitative Prompting Engine
- *  - Live Binance Spot Depth (/api/v3/depth) for real Order Book Imbalance (OBI)
- *  - Deterministic Microstructure Scoring fallback (No random numbers)
- *  - Real-Time Predictive Health & Decay Risk computed continuously
- *  - Early Loss Mitigation (Cuts bad trades early if order book deteriorates)
- *  - Trailing Break-Even Ratchet (+0.2% locked at +1.5% gain)
- *  - Fully independent of phone state (Runs 24/7 in cloud)
+ * Features:
+ *  - Official Google Gemini AI Quantitative Reasoning Pipeline
+ *  - Live Binance Depth (/api/v3/depth) for Real-Time Order Book Imbalance (OBI)
+ *  - Clear Source Attribution: GEMINI_2_5_FLASH vs. DETERMINISTIC_FALLBACK
+ *  - Dedicated /api/llm/test diagnostic endpoint
+ *  - Real-time Predictive Position Health (SAFE / CAUTION / EXITING)
+ *  - Loss Mitigation Early Exit (Cuts bad trades at -0.5% if OBI decays >= 70%)
+ *  - Trailing Stop Ratchet (+0.2% Break-Even lock upon crossing +1.5% unrealized gain)
  */
 
 const express = require('express');
@@ -22,7 +22,7 @@ const path = require('path');
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
-// Strictly load from Render Environment Variables - no hardcoded keys in source
+// Strictly retrieved from Render Environment Settings - no hardcoded credentials
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 const app = express();
@@ -30,11 +30,11 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders:
 app.options('*', cors());
 app.use(express.json());
 
-console.log('=======================================================');
-console.log("[Cloud Engine v10.0] 24/7 Autonomous Microstructure & Gemini AI Engine");
-console.log(`[Cloud Engine v10.0] Port: ${PORT} | Render Dedicated 24/7 Active`);
-console.log(`[Cloud Engine v10.0] Gemini AI Mode: ${GEMINI_API_KEY ? 'ACTIVE (Env Var Configured)' : 'FALLBACK (Deterministic Quant Engine)'}`);
-console.log('=======================================================');
+console.log('================================================================');
+console.log("[Cloud Engine v10.5] 24/7 Autonomous Microstructure & Gemini AI Engine");
+console.log(`[Cloud Engine v10.5] Port: ${PORT} | Render 24/7 Dedicated Server`);
+console.log(`[Cloud Engine v10.5] Gemini AI Configured: ${GEMINI_API_KEY ? 'YES (Key Loaded from Env)' : 'NO (Using Microstructure Fallback)'}`);
+console.log('================================================================');
 
 const State = {
   autopilotEnabled: true,
@@ -55,11 +55,14 @@ const State = {
   activePositions: {},
 
   llmTelemetry: {
-    model: 'Gemini 2.5 Flash (Live 24/7 Cloud API)',
+    model: GEMINI_API_KEY ? 'Gemini 2.5 Flash (Live 24/7 Cloud API)' : 'Deterministic Microstructure Engine',
+    source: GEMINI_API_KEY ? 'GEMINI_2_5_FLASH' : 'DETERMINISTIC_FALLBACK',
     frequencySeconds: 20,
     lastAnalysisTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }),
     promptExecutionCount: 0,
-    regimeReasoning: "Initializing Google Gemini 24/7 quantitative market evaluation...",
+    lastLatencyMs: 0,
+    lastError: null,
+    regimeReasoning: "Initializing real-time quantitative microstructure and AI market evaluation...",
     weights: {
       orderBookImbalance: 0.35,
       cumulativeVolumeDelta: 0.30,
@@ -77,16 +80,16 @@ const State = {
   },
 
   universe: {
-    SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 108.53, priceINR: 10241.97, score: 94, direction: 'STRONG BUY', cvd: 24.2, obi: 0.62, reasoning: 'Perpetual open interest high, strong spot taker delta' },
-    SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 92, direction: 'STRONG BUY', cvd: 28.5, obi: 0.65, reasoning: 'Aggressive bid skew on Binance book, high buyer CVD' },
-    AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 18.50, priceINR: 1745.85, score: 89, direction: 'STRONG BUY', cvd: 16.4, obi: 0.59, reasoning: 'L1 volume rotation, strong buyer delta' },
-    ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 222713.20, score: 86, direction: 'BUY', cvd: 8.1, obi: 0.56, reasoning: 'Spot accumulation, positive delta across aggregate trades' },
-    BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 7974265.00, score: 85, direction: 'BUY', cvd: 12.3, obi: 0.53, reasoning: 'Macro institutional spot absorption' },
-    NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 292.55, score: 84, direction: 'BUY', cvd: 10.4, obi: 0.55, reasoning: 'Compute narrative spot inflows' },
-    LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1108.85, score: 81, direction: 'BUY', cvd: 5.8, obi: 0.52, reasoning: 'Cross-chain protocol liquidity spike' },
-    BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 67946.40, score: 78, direction: 'BUY', cvd: 3.8, obi: 0.51, reasoning: 'Steady exchange utility baseline' },
-    ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0.35, priceINR: 33.03, score: 72, direction: 'BUY', cvd: 2.1, obi: 0.52, reasoning: 'Gradual liquidity return, low volatility consolidation' },
-    XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 1.28, priceINR: 120.79, score: 65, direction: 'NEUTRAL', cvd: -1.5, obi: 0.48, reasoning: 'Resistance retest with balanced orderbook' }
+    SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 108.53, priceINR: 10241.97, score: 92, direction: 'STRONG BUY', cvd: 24.2, obi: 0.62, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Perpetual open interest high, strong spot taker delta' },
+    SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 57, direction: 'NEUTRAL', cvd: -4.5, obi: 0.44, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Balanced bid/ask distribution, short-term consolidation' },
+    AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 18.50, priceINR: 1745.85, score: 88, direction: 'STRONG BUY', cvd: 16.4, obi: 0.59, source: 'DETERMINISTIC_FALLBACK', reasoning: 'L1 volume rotation, strong buyer delta' },
+    ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 222713.20, score: 84, direction: 'BUY', cvd: 8.1, obi: 0.56, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Spot accumulation, positive delta across aggregate trades' },
+    BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 7974265.00, score: 85, direction: 'BUY', cvd: 12.3, obi: 0.53, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Macro institutional spot absorption' },
+    NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 292.55, score: 82, direction: 'BUY', cvd: 10.4, obi: 0.55, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Compute narrative spot inflows' },
+    LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1108.85, score: 79, direction: 'BUY', cvd: 5.8, obi: 0.52, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Cross-chain protocol liquidity spike' },
+    BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 67946.40, score: 78, direction: 'BUY', cvd: 3.8, obi: 0.51, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Steady exchange utility baseline' },
+    ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0.35, priceINR: 33.03, score: 71, direction: 'BUY', cvd: 2.1, obi: 0.52, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Low volatility consolidation breakout' },
+    XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 1.28, priceINR: 120.79, score: 62, direction: 'NEUTRAL', cvd: -1.5, obi: 0.48, source: 'DETERMINISTIC_FALLBACK', reasoning: 'Resistance retest with balanced orderbook' }
   },
 
   tradeLogs: []
@@ -109,7 +112,7 @@ function loadPersistedState() {
       if (Array.isArray(data.tradeLogs)) {
         State.tradeLogs = data.tradeLogs;
       }
-      console.log(`[Cloud Engine] Restored state: Cash=₹${Math.round(State.portfolio.cashINR)}, Positions=${Object.keys(State.activePositions).length}`);
+      console.log(`[Cloud Engine] Restored state: Cash=₹${Math.round(State.portfolio.cashINR)}, Active Positions=${Object.keys(State.activePositions).length}`);
     } else {
       persistState();
     }
@@ -230,14 +233,14 @@ async function monitorOpenPositionsHealth() {
       pos.peakGainPct = gainPct;
     }
 
-    // Trailing Stop Ratchet: Once up +1.5%, move Stop-Loss to Break-Even (+0.2%)
+    // Trailing Stop Ratchet: Once up +1.5%, advance Stop-Loss to Break-Even (+0.2%)
     if (gainPct >= 1.5 && !pos.isTrailingActive) {
       pos.isTrailingActive = true;
       pos.sl = pos.entryPrice * 1.002;
-      console.log(`[Trailing Ratchet] ${pos.pairSymbol} locked at Break-Even +0.2%`);
+      console.log(`[Trailing Ratchet Triggered] ${pos.pairSymbol} locked at Break-Even (+0.2%)`);
     }
 
-    // Live Order Book Imbalance check for active positions
+    // Live Order Book Imbalance evaluation for active trade
     const realObi = await fetchRealOrderBookDepth(pairKey);
     let decayRisk = 15;
 
@@ -251,7 +254,7 @@ async function monitorOpenPositionsHealth() {
     if (dropFromPeak >= 0.8) decayRisk += 30;
     else if (dropFromPeak >= 0.4) decayRisk += 15;
 
-    // Retracing in negative territory
+    // Price slipping into negative territory
     if (gainPct < -0.3) decayRisk += 25;
 
     pos.decayRisk = Math.min(95, decayRisk);
@@ -259,25 +262,25 @@ async function monitorOpenPositionsHealth() {
 
     // 1. Hard Stop-Loss Hit
     if (livePrice <= pos.sl) {
-      settlePosition(pairKey, 'HARD SL', livePrice, 'Hit Stop-Loss limit');
+      settlePosition(pairKey, 'HARD SL', livePrice, 'Hit designated Stop-Loss boundary');
       continue;
     }
 
     // 2. Hard Take-Profit Hit
     if (livePrice >= pos.tp1) {
-      settlePosition(pairKey, 'HARD TP', livePrice, 'Target profit achieved (+3.6%)');
+      settlePosition(pairKey, 'HARD TP', livePrice, 'Target profit attained (+3.6%)');
       continue;
     }
 
-    // 3. Early Loss Mitigation Exit (Cuts trade at -0.5% if order book breaks down)
+    // 3. Early Loss Mitigation Exit (Cuts trade at -0.5% if order book deteriorates >= 70%)
     if (gainPct <= -0.5 && pos.decayRisk >= 70) {
-      settlePosition(pairKey, 'PREDICTIVE SL', livePrice, `Early mitigation: Decay ${pos.decayRisk}% (Cut at ${gainPct.toFixed(2)}%)`);
+      settlePosition(pairKey, 'PREDICTIVE SL', livePrice, `Loss mitigation cut: Decay ${pos.decayRisk}% (Closed at ${gainPct.toFixed(2)}%)`);
       continue;
     }
 
-    // 4. Predictive Take-Profit Exit (Locks in gain if momentum reverses)
+    // 4. Predictive Take-Profit Exit (Locks in positive gains if order flow flips >= 65%)
     if (gainPct >= 0.5 && pos.decayRisk >= 65) {
-      settlePosition(pairKey, 'PREDICTIVE TP', livePrice, `Predictive harvest: Decay ${pos.decayRisk}% (Locked +${gainPct.toFixed(2)}%)`);
+      settlePosition(pairKey, 'PREDICTIVE TP', livePrice, `Predictive profit capture: Decay ${pos.decayRisk}% (Locked +${gainPct.toFixed(2)}%)`);
       continue;
     }
   }
@@ -317,18 +320,16 @@ function settlePosition(pairKey, type, exitPrice, reason) {
   broadcastState();
 }
 
-/**
- * 24/7 Google Gemini AI Analysis & Trade Allocation Loop
- */
 async function runLLMQuantitativeAnalysis() {
   if (!State.analysisActive) return;
 
+  const startTime = Date.now();
   State.llmTelemetry.promptExecutionCount++;
   State.llmTelemetry.lastAnalysisTime = new Date().toLocaleTimeString('en-IN', {
     hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata'
   });
 
-  // 1. Fetch live 24h ticker metrics
+  // 1. Gather live 24h ticker performance from Binance
   const host = BINANCE_HOSTS[currentHostIndex];
   let ticker24hMap = {};
   try {
@@ -344,7 +345,7 @@ async function runLLMQuantitativeAnalysis() {
     }
   } catch (e) {}
 
-  // 2. Gather market telemetry for universe assets
+  // 2. Aggregate telemetry across all assets
   const marketTelemetry = [];
   for (const sym of Object.keys(State.universe)) {
     const item = State.universe[sym];
@@ -363,17 +364,17 @@ async function runLLMQuantitativeAnalysis() {
     });
   }
 
-  // 3. Query Google Gemini AI API
+  // 3. Query Google Gemini AI API if configured
   let geminiSuccess = false;
   if (GEMINI_API_KEY) {
     try {
-      const promptText = `You are an institutional quant trader managing a crypto fund.
+      const promptText = `You are an institutional quant fund manager.
 Analyze this live Binance market telemetry:
 ${JSON.stringify(marketTelemetry, null, 2)}
 
 Active Open Positions in Portfolio: ${JSON.stringify(Object.keys(State.activePositions))}
 
-Respond ONLY with valid JSON strictly conforming to this schema, without markdown formatting or code fences:
+Respond ONLY with valid JSON conforming strictly to this schema, without markdown formatting or code fences:
 {
   "marketRegime": "MULTI_EXPANSION" or "TIGHT_DEFENSIVE",
   "reasoning": "1 concise sentence explaining market breadth and capital flow",
@@ -381,7 +382,7 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
     "SYMBOL": {
       "score": number from 50 to 98,
       "direction": "STRONG BUY" or "BUY" or "NEUTRAL",
-      "reasoning": "brief note on order flow"
+      "reasoning": "brief note on order flow and depth"
     }
   }
 }`;
@@ -391,7 +392,7 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
         if (geminiSuccess) break;
         try {
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 7000);
+          const timeout = setTimeout(() => controller.abort(), 7500);
 
           const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
             method: 'POST',
@@ -400,7 +401,7 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
             body: JSON.stringify({
               contents: [{ parts: [{ text: promptText }] }],
               generationConfig: {
-                temperature: 0.2,
+                temperature: 0.15,
                 maxOutputTokens: 800
               }
             })
@@ -417,6 +418,8 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
               if (parsed.marketRegime) State.marketRegime = parsed.marketRegime;
               if (parsed.reasoning) State.llmTelemetry.regimeReasoning = `Gemini AI: ${parsed.reasoning}`;
               State.llmTelemetry.model = `${model} (Live 24/7 Cloud API)`;
+              State.llmTelemetry.source = 'GEMINI_2_5_FLASH';
+              State.llmTelemetry.lastError = null;
 
               if (parsed.ratings && typeof parsed.ratings === 'object') {
                 Object.keys(parsed.ratings).forEach(sym => {
@@ -425,21 +428,28 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
                     if (typeof r.score === 'number') State.universe[sym].score = Math.min(98, Math.max(50, Math.round(r.score)));
                     if (r.direction) State.universe[sym].direction = r.direction;
                     if (r.reasoning) State.universe[sym].reasoning = r.reasoning;
+                    State.universe[sym].source = 'GEMINI_2_5_FLASH';
                   }
                 });
               }
               geminiSuccess = true;
-              console.log(`[Gemini AI Analysis] Evaluated by ${model}: ${parsed.reasoning}`);
+              console.log(`[Gemini AI Live Evaluation] Success via ${model}: ${parsed.reasoning}`);
             }
+          } else {
+            const errBody = await geminiRes.text();
+            State.llmTelemetry.lastError = `HTTP ${geminiRes.status}: ${errBody.slice(0, 100)}`;
           }
-        } catch (mErr) {}
+        } catch (mErr) {
+          State.llmTelemetry.lastError = mErr.message;
+        }
       }
     } catch (err) {
       console.error('[Gemini AI] Call error:', err.message);
+      State.llmTelemetry.lastError = err.message;
     }
   }
 
-  // 4. Deterministic Quantitative Fallback if API was unavailable
+  // 4. Deterministic Microstructure Fallback if Gemini is not configured or fails
   if (!geminiSuccess) {
     for (const m of marketTelemetry) {
       const sym = m.symbol;
@@ -449,6 +459,8 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
       const computed = Math.min(98, Math.max(50, Math.round(obiScore + momScore + volScore)));
 
       State.universe[sym].score = computed;
+      State.universe[sym].source = 'DETERMINISTIC_FALLBACK';
+
       if (computed >= 82) {
         State.universe[sym].direction = 'STRONG BUY';
         State.universe[sym].reasoning = `High order book buyer skew (${Math.round(m.orderBookImbalance * 100)}%) with 24h momentum +${m.priceChange24hPct}%`;
@@ -457,17 +469,22 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
         State.universe[sym].reasoning = `Healthy accumulation baseline (OBI: ${Math.round(m.orderBookImbalance * 100)}%)`;
       } else {
         State.universe[sym].direction = 'NEUTRAL';
-        State.universe[sym].reasoning = `Balanced or ask-dominant book (OBI: ${Math.round(m.orderBookImbalance * 100)}%)`;
+        State.universe[sym].reasoning = `Balanced or ask-skewed book (OBI: ${Math.round(m.orderBookImbalance * 100)}%)`;
       }
     }
+
     const qualified = Object.keys(State.universe).filter(k => State.universe[k].score >= 80);
     State.marketRegime = qualified.length >= 2 ? 'MULTI_EXPANSION' : 'TIGHT_DEFENSIVE';
+    State.llmTelemetry.model = 'Deterministic Microstructure Engine';
+    State.llmTelemetry.source = 'DETERMINISTIC_FALLBACK';
     State.llmTelemetry.regimeReasoning = qualified.length >= 2
-      ? `Multi-Basket Expansion: Multiple assets (${qualified.slice(0, 3).map(k => State.universe[k].symbol).join(', ')}) showing buyer order-book dominance.`
-      : 'Tight Defensive: Narrow market breadth. Capital focused on top setup.';
+      ? `Multi-Basket Expansion: Multiple assets (${qualified.slice(0, 3).map(k => State.universe[k].symbol).join(', ')}) exhibit verified buyer dominance.`
+      : 'Tight Defensive: Narrow market breadth. Capital preserved for top setups.';
   }
 
-  // 5. Autonomous Autopilot Trade Allocation
+  State.llmTelemetry.lastLatencyMs = Date.now() - startTime;
+
+  // 5. Autonomous Trade Execution based on AI Conviction
   if (State.autopilotEnabled && State.portfolio.cashINR >= 2500) {
     const currentOpenCount = Object.keys(State.activePositions).length;
     const maxAllowed = State.marketRegime === 'MULTI_EXPANSION' ? State.maxConcurrentPositions : 1;
@@ -515,14 +532,14 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
             avgBuyPrice: livePrice
           };
 
-          console.log(`[Gemini Autopilot Entered] ${candidate.symbol} @ ₹${livePrice.toLocaleString('en-IN')} | AI Score: ${candidate.score}/100 | Allocation: ₹${targetAllocation}`);
+          console.log(`[Autopilot Entry Executed] ${candidate.symbol} @ ₹${livePrice.toLocaleString('en-IN')} | Conviction Score: ${candidate.score}/100 | Capital: ₹${targetAllocation}`);
           persistState();
         }
       }
     }
   }
 
-  // Always broadcast state so all clients receive updated lastAnalysisTime & reasoning
+  // Push authoritative state to all connected devices
   broadcastState();
 }
 setInterval(runLLMQuantitativeAnalysis, 20000);
@@ -552,7 +569,8 @@ function broadcastPricesOnly() {
       priceINR: State.universe[k].priceINR,
       priceUSDT: State.universe[k].priceUSDT,
       score: State.universe[k].score,
-      obi: State.universe[k].obi
+      obi: State.universe[k].obi,
+      source: State.universe[k].source
     };
   });
 
@@ -572,14 +590,15 @@ function broadcastPricesOnly() {
   });
 }
 
-// REST Endpoints
 app.get('/', (req, res) => {
   res.json({
     service: "Sisir's Dedicated 24/7 Cloud Quant Engine",
     status: 'online',
     binanceFeed: 'live',
-    geminiAi: 'active',
-    lastSync: State.lastMarketSyncTime,
+    geminiConfigured: Boolean(GEMINI_API_KEY),
+    geminiSource: State.llmTelemetry.source,
+    lastAiAnalysisTime: State.llmTelemetry.lastAnalysisTime,
+    lastAiLatencyMs: State.llmTelemetry.lastLatencyMs,
     autopilotEnabled: State.autopilotEnabled,
     cashINR: State.portfolio.cashINR,
     activePositionsCount: Object.keys(State.activePositions).length,
@@ -592,10 +611,63 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
     uptime: process.uptime(),
+    geminiActive: State.llmTelemetry.source === 'GEMINI_2_5_FLASH',
+    geminiConfigured: Boolean(GEMINI_API_KEY),
     lastMarketSync: State.lastMarketSyncTime,
+    lastAiAnalysis: State.llmTelemetry.lastAnalysisTime,
     autopilot: State.autopilotEnabled,
     positions: Object.keys(State.activePositions).length
   });
+});
+
+// Dedicated Diagnostic Route to verify Gemini AI connectivity with Binance data
+app.get('/api/llm/test', async (req, res) => {
+  const result = {
+    geminiApiKeyPresent: Boolean(GEMINI_API_KEY),
+    currentTelemetrySource: State.llmTelemetry.source,
+    lastLatencyMs: State.llmTelemetry.lastLatencyMs,
+    lastError: State.llmTelemetry.lastError,
+    sampleAsset: {
+      symbol: 'SUIUSDT',
+      score: State.universe.SUIUSDT?.score,
+      direction: State.universe.SUIUSDT?.direction,
+      obi: State.universe.SUIUSDT?.obi,
+      reasoning: State.universe.SUIUSDT?.reasoning,
+      source: State.universe.SUIUSDT?.source
+    }
+  };
+
+  if (!GEMINI_API_KEY) {
+    result.diagnosis = 'GEMINI_API_KEY environment variable is missing on Render. Running on Microstructure Fallback.';
+    return res.json(result);
+  }
+
+  try {
+    const t0 = Date.now();
+    const testRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: 'Respond with exactly: {"status":"OK"}' }] }]
+      })
+    });
+    result.geminiHttpStatus = testRes.status;
+    result.geminiTestLatencyMs = Date.now() - t0;
+    if (testRes.ok) {
+      result.geminiActive = true;
+      result.diagnosis = 'Gemini API is verified and operational 24/7.';
+    } else {
+      result.geminiActive = false;
+      result.geminiErrorDetails = await testRes.text();
+      result.diagnosis = 'Gemini API returned an error status.';
+    }
+  } catch (err) {
+    result.geminiActive = false;
+    result.geminiException = err.message;
+    result.diagnosis = 'Network connection to Google Gemini API failed.';
+  }
+
+  res.json(result);
 });
 
 app.get('/api/state', (req, res) => {
@@ -674,9 +746,10 @@ wss.on('connection', (ws) => {
 loadPersistedState();
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`=======================================================`);
-  console.log(` Sisir's Cloud Quant Engine v10.0 RUNNING on port ${PORT}`);
+  console.log(`================================================================`);
+  console.log(` Sisir's Cloud Quant Engine v10.5 RUNNING on port ${PORT}`);
   console.log(` Real-time Binance Depth & Health: Active every 2.5s`);
-  console.log(` Gemini AI Market Analysis Loop: Active every 20s`);
-  console.log(`=======================================================`);
+  console.log(` Gemini AI Market Evaluation Loop: Active every 20s`);
+  console.log(` Diagnostic Endpoint Available: /api/llm/test`);
+  console.log(`================================================================`);
 });
