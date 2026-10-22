@@ -57,7 +57,7 @@ const State = {
   llmTelemetry: {
     model: GEMINI_API_KEY ? 'Gemini 3.8 Flash (Live 24/7 Cloud API)' : 'Deterministic Microstructure Engine',
     source: GEMINI_API_KEY ? 'GEMINI_3_8_FLASH' : 'DETERMINISTIC_FALLBACK',
-    frequencySeconds: 20,
+    frequencySeconds: 60,
     lastAnalysisTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }),
     promptExecutionCount: 0,
     lastLatencyMs: 0,
@@ -374,23 +374,24 @@ ${JSON.stringify(marketTelemetry, null, 2)}
 
 Active Open Positions in Portfolio: ${JSON.stringify(Object.keys(State.activePositions))}
 
-Provide your quantitative market regime evaluation and per-asset scoring in strictly structured JSON matching this format:
+Provide your quantitative market regime evaluation and per-asset scoring in strictly structured JSON matching this exact format:
 {
   "marketRegime": "MULTI_EXPANSION",
-  "reasoning": "Brief summary of market breadth, taker delta, and order depth",
+  "reasoning": "Brief summary of market breadth and taker delta",
   "ratings": {
-    "SOLUSDT": {
-      "score": 88,
-      "direction": "STRONG BUY",
-      "reasoning": "Strong bid depth dominance"
-    },
-    "SUIUSDT": {
-      "score": 58,
-      "direction": "NEUTRAL",
-      "reasoning": "Ask depth resistance"
-    }
+    "SOLUSDT": { "score": 88, "direction": "STRONG BUY", "reasoning": "Strong bid depth dominance" },
+    "SUIUSDT": { "score": 58, "direction": "NEUTRAL", "reasoning": "Ask depth resistance" },
+    "AVAXUSDT": { "score": 85, "direction": "BUY", "reasoning": "Positive buyer delta" },
+    "ETHUSDT": { "score": 82, "direction": "BUY", "reasoning": "Spot accumulation" },
+    "BTCUSDT": { "score": 84, "direction": "BUY", "reasoning": "Institutional absorption" },
+    "NEARUSDT": { "score": 80, "direction": "BUY", "reasoning": "Steady inflows" },
+    "LINKUSDT": { "score": 78, "direction": "BUY", "reasoning": "Protocol liquidity" },
+    "BNBUSDT": { "score": 76, "direction": "BUY", "reasoning": "Exchange baseline" },
+    "ADAUSDT": { "score": 70, "direction": "BUY", "reasoning": "Consolidation" },
+    "XRPUSDT": { "score": 60, "direction": "NEUTRAL", "reasoning": "Balanced orderbook" }
   }
-}`;
+}
+Keep reasoning under 8 words per coin. Output valid JSON only.`;
 
       // Only verified active models — deprecated models (2.0, 1.5, 2.5) completely removed
       const geminiModels = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview'];
@@ -398,7 +399,7 @@ Provide your quantitative market regime evaluation and per-asset scoring in stri
         if (geminiSuccess) break;
         try {
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 12000);
+          const timeout = setTimeout(() => controller.abort(), 14000);
 
           const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
             method: 'POST',
@@ -408,7 +409,7 @@ Provide your quantitative market regime evaluation and per-asset scoring in stri
               contents: [{ parts: [{ text: promptText }] }],
               generationConfig: {
                 temperature: 0.1,
-                maxOutputTokens: 1000,
+                maxOutputTokens: 2500,
                 responseMimeType: "application/json"
               }
             })
@@ -422,33 +423,54 @@ Provide your quantitative market regime evaluation and per-asset scoring in stri
 
             // Resilient JSON extractor: locate the outer enclosing braces
             const firstBrace = rawText.indexOf('{');
-            const lastBrace = rawText.lastIndexOf('}');
-            if (firstBrace !== -1 && lastBrace !== -1) {
-              rawText = rawText.substring(firstBrace, lastBrace + 1);
+            let lastBrace = rawText.lastIndexOf('}');
+            if (firstBrace !== -1) {
+              if (lastBrace === -1 || lastBrace <= firstBrace) {
+                // If closing brace was clipped, auto-close it
+                rawText = rawText.substring(firstBrace) + '\n}\n}';
+              } else {
+                rawText = rawText.substring(firstBrace, lastBrace + 1);
+              }
             }
 
             if (rawText) {
-              const parsed = JSON.parse(rawText);
-              if (parsed.marketRegime) State.marketRegime = parsed.marketRegime;
-              if (parsed.reasoning) State.llmTelemetry.regimeReasoning = `Gemini AI (${model}): ${parsed.reasoning}`;
-              State.llmTelemetry.model = `${model} (Live 24/7 Cloud API)`;
-              State.llmTelemetry.source = 'GEMINI_3_8_FLASH';
-              State.llmTelemetry.lastError = null;
-
-              if (parsed.ratings && typeof parsed.ratings === 'object') {
-                Object.keys(parsed.ratings).forEach(sym => {
-                  if (State.universe[sym] && parsed.ratings[sym]) {
-                    const r = parsed.ratings[sym];
-                    if (typeof r.score === 'number') State.universe[sym].score = Math.min(98, Math.max(50, Math.round(r.score)));
-                    if (r.direction) State.universe[sym].direction = r.direction;
-                    if (r.reasoning) State.universe[sym].reasoning = r.reasoning;
-                    State.universe[sym].source = 'GEMINI_3_8_FLASH';
-                  }
-                });
+              let parsed = null;
+              try {
+                parsed = JSON.parse(rawText);
+              } catch (parseErr) {
+                // Auto-repair trailing missing braces if response ended prematurely
+                const openCount = (rawText.match(/\{/g) || []).length;
+                const closeCount = (rawText.match(/\}/g) || []).length;
+                if (openCount > closeCount) {
+                  rawText += '}'.repeat(openCount - closeCount);
+                  parsed = JSON.parse(rawText);
+                } else {
+                  throw parseErr;
+                }
               }
-              geminiSuccess = true;
-              console.log(`[Gemini AI Live Evaluation] Success via ${model}: ${parsed.reasoning}`);
-              break; // Immediately exit loop on success
+
+              if (parsed && typeof parsed === 'object') {
+                if (parsed.marketRegime) State.marketRegime = parsed.marketRegime;
+                if (parsed.reasoning) State.llmTelemetry.regimeReasoning = `Gemini AI (${model}): ${parsed.reasoning}`;
+                State.llmTelemetry.model = `${model} (Live 24/7 Cloud API)`;
+                State.llmTelemetry.source = 'GEMINI_3_8_FLASH';
+                State.llmTelemetry.lastError = null;
+
+                if (parsed.ratings && typeof parsed.ratings === 'object') {
+                  Object.keys(parsed.ratings).forEach(sym => {
+                    if (State.universe[sym] && parsed.ratings[sym]) {
+                      const r = parsed.ratings[sym];
+                      if (typeof r.score === 'number') State.universe[sym].score = Math.min(98, Math.max(50, Math.round(r.score)));
+                      if (r.direction) State.universe[sym].direction = r.direction;
+                      if (r.reasoning) State.universe[sym].reasoning = r.reasoning;
+                      State.universe[sym].source = 'GEMINI_3_8_FLASH';
+                    }
+                  });
+                }
+                geminiSuccess = true;
+                console.log(`[Gemini AI Live Evaluation] Success via ${model}: ${parsed.reasoning}`);
+                break; // Immediately exit loop on success
+              }
             }
           } else {
             const errBody = await geminiRes.text();
@@ -557,7 +579,7 @@ Provide your quantitative market regime evaluation and per-asset scoring in stri
   // Push authoritative state to all connected devices
   broadcastState();
 }
-setInterval(runLLMQuantitativeAnalysis, 20000);
+setInterval(runLLMQuantitativeAnalysis, 60000);
 
 function broadcastState() {
   const payload = JSON.stringify({
