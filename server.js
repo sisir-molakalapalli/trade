@@ -368,32 +368,37 @@ async function runLLMQuantitativeAnalysis() {
   let geminiSuccess = false;
   if (GEMINI_API_KEY) {
     try {
-      const promptText = `You are an institutional quant fund manager.
+      const promptText = `You are an institutional quant fund manager analyzing real-time crypto microstructure.
 Analyze this live Binance market telemetry:
 ${JSON.stringify(marketTelemetry, null, 2)}
 
 Active Open Positions in Portfolio: ${JSON.stringify(Object.keys(State.activePositions))}
 
-Respond ONLY with valid JSON conforming strictly to this schema, without markdown formatting or code fences:
+Provide your quantitative market regime evaluation and per-asset scoring in strictly structured JSON matching this format:
 {
-  "marketRegime": "MULTI_EXPANSION" or "TIGHT_DEFENSIVE",
-  "reasoning": "1 concise sentence explaining market breadth and capital flow",
+  "marketRegime": "MULTI_EXPANSION",
+  "reasoning": "Brief summary of market breadth, taker delta, and order depth",
   "ratings": {
-    "SYMBOL": {
-      "score": number from 50 to 98,
-      "direction": "STRONG BUY" or "BUY" or "NEUTRAL",
-      "reasoning": "brief note on order flow and depth"
+    "SOLUSDT": {
+      "score": 88,
+      "direction": "STRONG BUY",
+      "reasoning": "Strong bid depth dominance"
+    },
+    "SUIUSDT": {
+      "score": 58,
+      "direction": "NEUTRAL",
+      "reasoning": "Ask depth resistance"
     }
   }
 }`;
 
-      // Current supported Google Gemini models (Gemini 3.8 / 3.6 Flash)
+      // Current supported Google Gemini models
       const geminiModels = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-2.0-flash'];
       for (const model of geminiModels) {
         if (geminiSuccess) break;
         try {
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 7500);
+          const timeout = setTimeout(() => controller.abort(), 8500);
 
           const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
             method: 'POST',
@@ -402,8 +407,9 @@ Respond ONLY with valid JSON conforming strictly to this schema, without markdow
             body: JSON.stringify({
               contents: [{ parts: [{ text: promptText }] }],
               generationConfig: {
-                temperature: 0.15,
-                maxOutputTokens: 800
+                temperature: 0.1,
+                maxOutputTokens: 1000,
+                responseMimeType: "application/json"
               }
             })
           });
@@ -413,6 +419,13 @@ Respond ONLY with valid JSON conforming strictly to this schema, without markdow
             const geminiData = await geminiRes.json();
             let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
             rawText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+            // Resilient JSON extractor: locate the outer enclosing braces
+            const firstBrace = rawText.indexOf('{');
+            const lastBrace = rawText.lastIndexOf('}');
+            if (firstBrace !== -1 && lastBrace !== -1) {
+              rawText = rawText.substring(firstBrace, lastBrace + 1);
+            }
 
             if (rawText) {
               const parsed = JSON.parse(rawText);
