@@ -392,13 +392,13 @@ Provide your quantitative market regime evaluation and per-asset scoring in stri
   }
 }`;
 
-      // Current supported Google Gemini models
-      const geminiModels = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-2.0-flash'];
+      // Only verified active models — deprecated models (2.0, 1.5, 2.5) completely removed
+      const geminiModels = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview'];
       for (const model of geminiModels) {
         if (geminiSuccess) break;
         try {
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 8500);
+          const timeout = setTimeout(() => controller.abort(), 12000);
 
           const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
             method: 'POST',
@@ -448,6 +448,7 @@ Provide your quantitative market regime evaluation and per-asset scoring in stri
               }
               geminiSuccess = true;
               console.log(`[Gemini AI Live Evaluation] Success via ${model}: ${parsed.reasoning}`);
+              break; // Immediately exit loop on success
             }
           } else {
             const errBody = await geminiRes.text();
@@ -658,7 +659,7 @@ app.get('/api/llm/test', async (req, res) => {
 
   try {
     const t0 = Date.now();
-    const testModels = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-2.0-flash'];
+    const testModels = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview'];
     let connected = false;
 
     for (const m of testModels) {
