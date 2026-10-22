@@ -1,13 +1,13 @@
 /**
- * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v9.0)
+ * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v10.0)
  * ------------------------------------------------------------------------------------
  * Runs 24/7 on Render ($7 Dedicated Plan).
  * Real-Time Features:
  *  - Active Google Gemini AI Quantitative Prompting Engine
  *  - Live Binance Spot Depth (/api/v3/depth) for real Order Book Imbalance (OBI)
  *  - Deterministic Microstructure Scoring fallback (No random numbers)
- *  - Real-Time Predictive Health & Decay Risk computed every 2s
- *  - Early Loss Mitigation (Cuts bad trades at -0.5% if order book deteriorates)
+ *  - Real-Time Predictive Health & Decay Risk computed continuously
+ *  - Early Loss Mitigation (Cuts bad trades early if order book deteriorates)
  *  - Trailing Break-Even Ratchet (+0.2% locked at +1.5% gain)
  *  - Fully independent of phone state (Runs 24/7 in cloud)
  */
@@ -22,7 +22,6 @@ const path = require('path');
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
-// Configured Google Gemini API Key for 24/7 Autonomous Market Microstructure Intelligence
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyAHFhOI8ZLKx0ii346W19Z9G8OoCKmzrP8';
 
 const app = express();
@@ -33,7 +32,7 @@ app.use(express.json());
 console.log('=======================================================');
 console.log("[Cloud Engine v10.0] 24/7 Autonomous Microstructure & Gemini AI Engine");
 console.log(`[Cloud Engine v10.0] Port: ${PORT} | Render Dedicated 24/7 Active`);
-console.log(`[Cloud Engine v10.0] Gemini AI Mode: ACTIVE (Google Gemini AI Studio API Key Configured)`);
+console.log(`[Cloud Engine v10.0] Gemini AI Mode: ACTIVE`);
 console.log('=======================================================');
 
 const State = {
@@ -160,9 +159,165 @@ async function syncBinanceUsdtInrRate() {
 setInterval(syncBinanceUsdtInrRate, 60000);
 syncBinanceUsdtInrRate();
 
+async function fetchRealOrderBookDepth(symbol) {
+  const host = BINANCE_HOSTS[currentHostIndex];
+  try {
+    const res = await fetch(`${host}/api/v3/depth?symbol=${symbol}&limit=20`, {
+      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      let bidVol = 0;
+      let askVol = 0;
+      (data.bids || []).forEach(b => { bidVol += parseFloat(b[1]) || 0; });
+      (data.asks || []).forEach(a => { askVol += parseFloat(a[1]) || 0; });
+      const total = bidVol + askVol;
+      return total > 0 ? bidVol / total : 0.50;
+    }
+  } catch (e) {
+    currentHostIndex = (currentHostIndex + 1) % BINANCE_HOSTS.length;
+  }
+  return null;
+}
+
+async function fetchLiveBinancePrices() {
+  const host = BINANCE_HOSTS[currentHostIndex];
+  try {
+    const res = await fetch(`${host}/api/v3/ticker/price`, {
+      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+    });
+    if (res.ok) {
+      const allTickers = await res.json();
+      const tickerMap = {};
+      allTickers.forEach(t => { tickerMap[t.symbol] = parseFloat(t.price); });
+
+      let anyUpdated = false;
+      Object.keys(State.universe).forEach(sym => {
+        if (tickerMap[sym]) {
+          const usdt = tickerMap[sym];
+          State.universe[sym].priceUSDT = usdt;
+          State.universe[sym].priceINR = Math.round(usdt * State.usdtToInrRate * 100) / 100;
+          anyUpdated = true;
+        }
+      });
+
+      if (anyUpdated) {
+        State.lastMarketSyncTime = new Date().toLocaleTimeString('en-IN', {
+          hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata'
+        });
+        await monitorOpenPositionsHealth();
+      }
+    }
+  } catch (e) {
+    currentHostIndex = (currentHostIndex + 1) % BINANCE_HOSTS.length;
+  }
+}
+setInterval(fetchLiveBinancePrices, 2500);
+
+async function monitorOpenPositionsHealth() {
+  const activeKeys = Object.keys(State.activePositions);
+  if (activeKeys.length === 0) return;
+
+  for (const pairKey of activeKeys) {
+    const pos = State.activePositions[pairKey];
+    if (!pos) continue;
+
+    const livePrice = State.universe[pairKey]?.priceINR || pos.entryPrice;
+    const gainPct = ((livePrice - pos.entryPrice) / pos.entryPrice) * 100;
+
+    if (gainPct > (pos.peakGainPct || 0)) {
+      pos.peakGainPct = gainPct;
+    }
+
+    // Trailing Stop Ratchet: Once up +1.5%, move Stop-Loss to Break-Even (+0.2%)
+    if (gainPct >= 1.5 && !pos.isTrailingActive) {
+      pos.isTrailingActive = true;
+      pos.sl = pos.entryPrice * 1.002;
+      console.log(`[Trailing Ratchet] ${pos.pairSymbol} locked at Break-Even +0.2%`);
+    }
+
+    // Live Order Book Imbalance check for active positions
+    const realObi = await fetchRealOrderBookDepth(pairKey);
+    let decayRisk = 15;
+
+    if (realObi !== null) {
+      if (realObi < 0.45) decayRisk += 35;
+      else if (realObi < 0.50) decayRisk += 20;
+    }
+
+    // Drawdown from peak gain
+    const dropFromPeak = (pos.peakGainPct || 0) - gainPct;
+    if (dropFromPeak >= 0.8) decayRisk += 30;
+    else if (dropFromPeak >= 0.4) decayRisk += 15;
+
+    // Retracing in negative territory
+    if (gainPct < -0.3) decayRisk += 25;
+
+    pos.decayRisk = Math.min(95, decayRisk);
+    pos.predictiveStatus = pos.decayRisk >= 65 ? 'EXITING' : (pos.decayRisk >= 40 ? 'CAUTION' : 'SAFE');
+
+    // 1. Hard Stop-Loss Hit
+    if (livePrice <= pos.sl) {
+      settlePosition(pairKey, 'HARD SL', livePrice, 'Hit Stop-Loss limit');
+      continue;
+    }
+
+    // 2. Hard Take-Profit Hit
+    if (livePrice >= pos.tp1) {
+      settlePosition(pairKey, 'HARD TP', livePrice, 'Target profit achieved (+3.6%)');
+      continue;
+    }
+
+    // 3. Early Loss Mitigation Exit (Cuts trade at -0.5% if order book breaks down)
+    if (gainPct <= -0.5 && pos.decayRisk >= 70) {
+      settlePosition(pairKey, 'PREDICTIVE SL', livePrice, `Early mitigation: Decay ${pos.decayRisk}% (Cut at ${gainPct.toFixed(2)}%)`);
+      continue;
+    }
+
+    // 4. Predictive Take-Profit Exit (Locks in gain if momentum reverses)
+    if (gainPct >= 0.5 && pos.decayRisk >= 65) {
+      settlePosition(pairKey, 'PREDICTIVE TP', livePrice, `Predictive harvest: Decay ${pos.decayRisk}% (Locked +${gainPct.toFixed(2)}%)`);
+      continue;
+    }
+  }
+
+  broadcastPricesOnly();
+}
+
+function settlePosition(pairKey, type, exitPrice, reason) {
+  const pos = State.activePositions[pairKey];
+  if (!pos) return;
+
+  const finalVal = pos.qty * exitPrice;
+  const pnl = finalVal - pos.notionalINR;
+
+  State.portfolio.cashINR += finalVal;
+  State.portfolio.realizedPnL += pnl;
+
+  delete State.portfolio.holdings[pairKey];
+  delete State.activePositions[pairKey];
+
+  const logEntry = {
+    id: Date.now(),
+    type,
+    pair: `${pos.pairSymbol}/INR`,
+    entryPrice: pos.entryPrice,
+    exitPrice,
+    pnlINR: pnl,
+    reason,
+    time: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata' }),
+    date: new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })
+  };
+
+  State.tradeLogs.unshift(logEntry);
+  console.log(`[Trade Settle] ${type} on ${logEntry.pair} | Exit: ₹${exitPrice} | PnL: ₹${Math.round(pnl)} | Reason: ${reason}`);
+
+  persistState();
+  broadcastState();
+}
+
 /**
- * Real Gemini AI Quantitative Reasoning Pipeline
- * Runs autonomously on Render 24/7 without needing the phone to be open
+ * 24/7 Google Gemini AI Analysis & Trade Allocation Loop
  */
 async function runLLMQuantitativeAnalysis() {
   if (!State.analysisActive) return;
@@ -170,7 +325,7 @@ async function runLLMQuantitativeAnalysis() {
   State.llmTelemetry.promptExecutionCount++;
   State.llmTelemetry.lastAnalysisTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
 
-  // 1. Fetch live 24h ticker data for universe to assess real volume delta and momentum
+  // 1. Fetch live 24h ticker metrics
   const host = BINANCE_HOSTS[currentHostIndex];
   let ticker24hMap = {};
   try {
@@ -186,7 +341,7 @@ async function runLLMQuantitativeAnalysis() {
     }
   } catch (e) {}
 
-  // 2. Fetch live order book imbalance for universe assets
+  // 2. Gather market telemetry for universe assets
   const marketTelemetry = [];
   for (const sym of Object.keys(State.universe)) {
     const item = State.universe[sym];
@@ -205,12 +360,12 @@ async function runLLMQuantitativeAnalysis() {
     });
   }
 
-  // 3. Query Google Gemini AI API with Market Microstructure Prompt
+  // 3. Query Google Gemini AI API
   let geminiSuccess = false;
   if (GEMINI_API_KEY) {
     try {
-      const promptText = `You are a quantitative cryptocurrency portfolio manager.
-Evaluate the current Binance market microstructure telemetry for these 10 assets:
+      const promptText = `You are an institutional quant trader managing a crypto fund.
+Analyze this live Binance market telemetry:
 ${JSON.stringify(marketTelemetry, null, 2)}
 
 Active Open Positions in Portfolio: ${JSON.stringify(Object.keys(State.activePositions))}
@@ -281,7 +436,7 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
     }
   }
 
-  // 4. Fallback Deterministic Calculation if Gemini call was delayed or throttled
+  // 4. Deterministic Quantitative Fallback if API was unavailable
   if (!geminiSuccess) {
     for (const m of marketTelemetry) {
       const sym = m.symbol;
@@ -309,7 +464,7 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
       : 'Tight Defensive: Narrow market breadth. Capital focused on top setup.';
   }
 
-  // 5. Autonomous Autopilot Trade Execution on Render
+  // 5. Autonomous Autopilot Trade Allocation
   if (State.autopilotEnabled && State.portfolio.cashINR >= 2500) {
     const currentOpenCount = Object.keys(State.activePositions).length;
     const maxAllowed = State.marketRegime === 'MULTI_EXPANSION' ? State.maxConcurrentPositions : 1;
@@ -322,7 +477,6 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
       const topKey = availableCandidates[0];
       const candidate = State.universe[topKey];
 
-      // Enter only if strong conviction (score >= 78)
       if (candidate && candidate.score >= 78) {
         const slotsAvailable = maxAllowed - currentOpenCount;
         const targetAllocation = Math.min(State.allocationPerTradeINR, Math.floor(State.portfolio.cashINR / Math.max(1, slotsAvailable)));
@@ -368,194 +522,7 @@ Respond ONLY with valid JSON strictly conforming to this schema, without markdow
 
   broadcastPricesOnly();
 }
-
-// 20-second evaluation interval runs 24/7 on Render
 setInterval(runLLMQuantitativeAnalysis, 20000);
-  if (!pos) return;
-
-  const finalVal = pos.qty * exitPrice;
-  const pnl = finalVal - pos.notionalINR;
-
-  State.portfolio.cashINR += finalVal;
-  State.portfolio.realizedPnL += pnl;
-
-  delete State.portfolio.holdings[pairKey];
-  delete State.activePositions[pairKey];
-
-  const logEntry = {
-    id: Date.now(),
-    type,
-    pair: `${pos.pairSymbol}/INR`,
-    entryPrice: pos.entryPrice,
-    exitPrice,
-    pnlINR: pnl,
-    reason,
-    time: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata' }),
-    date: new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })
-  };
-
-  State.tradeLogs.unshift(logEntry);
-  console.log(`[Binance Live Trade] ${type} on ${logEntry.pair}. Exit: ₹${exitPrice}. PnL: ₹${Math.round(pnl)} | Reason: ${reason}`);
-
-  persistState();
-  broadcastState();
-}
-
-/**
- * Real LLM & Quantitative Reasoning Engine
- * Runs completely on Render 24/7 without needing the phone to be open
- */
-async function runLLMQuantitativeAnalysis() {
-  if (!State.analysisActive) return;
-
-  State.llmTelemetry.promptExecutionCount++;
-  State.llmTelemetry.lastAnalysisTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
-
-  // 1. Fetch live 24h ticker data for universe to assess real volume delta and momentum
-  const host = BINANCE_HOSTS[currentHostIndex];
-  let ticker24hMap = {};
-  try {
-    const res = await fetch(`${host}/api/v3/ticker/24hr`, { headers: { 'X-MBX-APIKEY': BINANCE_API_KEY } });
-    if (res.ok) {
-      const data = await res.json();
-      data.forEach(item => {
-        ticker24hMap[item.symbol] = {
-          priceChangePercent: parseFloat(item.priceChangePercent),
-          quoteVolume: parseFloat(item.quoteVolume),
-          highPrice: parseFloat(item.highPrice),
-          lowPrice: parseFloat(item.lowPrice)
-        };
-      });
-    }
-  } catch (e) {}
-
-  // 2. Compute Deterministic Quantitative Scoring for each universe asset
-  const qualifiedAssets = [];
-  const analysisSummary = [];
-
-  for (const sym of Object.keys(State.universe)) {
-    const item = State.universe[sym];
-    const liveObi = await fetchRealOrderBookDepth(sym);
-    const obi = liveObi !== null ? liveObi : (item.obi || 0.50);
-    const ticker = ticker24hMap[sym] || { priceChangePercent: 0, quoteVolume: 10000000 };
-
-    // Real quantitative scoring based on order book + 24h momentum + volume
-    // OBI > 0.55 = buyer dominance (0 to 40 pts)
-    const obiScore = Math.max(0, Math.min(40, (obi - 0.40) * 133));
-    
-    // 24h Momentum: positive trend (+0.5% to +8%) gives (0 to 35 pts)
-    const momScore = Math.max(0, Math.min(35, (ticker.priceChangePercent + 3) * 3.5));
-
-    // Volume liquidity baseline: (0 to 25 pts)
-    const volScore = Math.min(25, Math.log10(Math.max(1, ticker.quoteVolume / 1000000)) * 8);
-
-    const calculatedScore = Math.min(98, Math.max(50, Math.round(obiScore + momScore + volScore)));
-    item.score = calculatedScore;
-    item.obi = obi;
-
-    if (calculatedScore >= 80) {
-      item.direction = 'STRONG BUY';
-      item.reasoning = `High order book buyer skew (${(obi * 100).toFixed(0)}%) with 24h momentum +${ticker.priceChangePercent.toFixed(1)}%`;
-      qualifiedAssets.push({ key: sym, ...item });
-    } else if (calculatedScore >= 70) {
-      item.direction = 'BUY';
-      item.reasoning = `Healthy accumulation baseline (OBI: ${(obi * 100).toFixed(0)}%)`;
-    } else {
-      item.direction = 'NEUTRAL';
-      item.reasoning = `Balanced order book or selling pressure (OBI: ${(obi * 100).toFixed(0)}%)`;
-    }
-
-    analysisSummary.push(`${item.symbol}: ${calculatedScore}/100 (OBI: ${(obi*100).toFixed(0)}%)`);
-  }
-
-  // 3. Optional: Call Gemini 1.5 Flash if GEMINI_API_KEY is configured on Render
-  if (GEMINI_API_KEY) {
-    try {
-      const prompt = `You are a quant trader. Market metrics: ${analysisSummary.join(', ')}. Which single asset has highest conviction? Answer in 1 short sentence.`;
-      const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-      });
-      if (geminiRes.ok) {
-        const geminiData = await geminiRes.json();
-        const aiText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (aiText) {
-          State.llmTelemetry.regimeReasoning = `Gemini AI: ${aiText.trim()}`;
-        }
-      }
-    } catch (err) {}
-  } else {
-    if (qualifiedAssets.length >= 2) {
-      State.marketRegime = 'MULTI_EXPANSION';
-      State.llmTelemetry.regimeReasoning = `Multiple assets (${qualifiedAssets.slice(0, 3).map(a => a.symbol).join(', ')}) exhibit order-flow expansion. Multi-basket mode active (holding up to 3 positions).`;
-    } else {
-      State.marketRegime = 'TIGHT_DEFENSIVE';
-      State.llmTelemetry.regimeReasoning = 'Market breadth is selective. Capital concentrated in a single top-conviction setup.';
-    }
-  }
-
-  // 4. Autonomous Autopilot Execution (24/7 on Render)
-  if (State.autopilotEnabled && State.portfolio.cashINR >= 2500) {
-    const currentOpenCount = Object.keys(State.activePositions).length;
-    const maxAllowed = State.marketRegime === 'MULTI_EXPANSION' ? State.maxConcurrentPositions : 1;
-
-    if (currentOpenCount < maxAllowed) {
-      const availableCandidates = Object.keys(State.universe)
-        .filter(key => !State.activePositions[key] && State.universe[key].priceINR > 0)
-        .sort((a, b) => State.universe[b].score - State.universe[a].score);
-
-      const topKey = availableCandidates[0];
-      const candidate = State.universe[topKey];
-
-      // Enter only if high conviction (>= 75 score)
-      if (candidate && candidate.score >= 75) {
-        const slotsAvailable = maxAllowed - currentOpenCount;
-        const targetAllocation = Math.min(State.allocationPerTradeINR, Math.floor(State.portfolio.cashINR / Math.max(1, slotsAvailable)));
-
-        if (targetAllocation >= 2000) {
-          const livePrice = candidate.priceINR;
-          const qty = targetAllocation / livePrice;
-          const slDist = livePrice * 0.015;
-
-          State.activePositions[topKey] = {
-            pairKey: topKey,
-            pairName: candidate.name,
-            pairSymbol: candidate.symbol,
-            entryPrice: livePrice,
-            notionalINR: targetAllocation,
-            qty,
-            sl: livePrice - slDist,
-            tp1: livePrice + (slDist * 2.4),
-            peakGainPct: 0,
-            decayRisk: 15,
-            predictiveStatus: 'SAFE',
-            isTrailingActive: false,
-            openedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }),
-            reasoning: candidate.reasoning
-          };
-
-          State.portfolio.cashINR -= targetAllocation;
-          State.portfolio.holdings[topKey] = {
-            name: candidate.name,
-            symbol: candidate.symbol,
-            qty,
-            totalCostINR: targetAllocation,
-            avgBuyPrice: livePrice
-          };
-
-          console.log(`[Cloud Autopilot Entered] ${candidate.symbol} @ ₹${livePrice.toLocaleString('en-IN')} | Conviction Score: ${candidate.score}/100 | Allocation: ₹${targetAllocation}`);
-          persistState();
-          broadcastState();
-        }
-      }
-    }
-  }
-
-  broadcastPricesOnly();
-}
-
-setInterval(runLLMQuantitativeAnalysis, 15000);
 
 function broadcastState() {
   const payload = JSON.stringify({
@@ -608,6 +575,7 @@ app.get('/', (req, res) => {
     service: "Sisir's Dedicated 24/7 Cloud Quant Engine",
     status: 'online',
     binanceFeed: 'live',
+    geminiAi: 'active',
     lastSync: State.lastMarketSyncTime,
     autopilotEnabled: State.autopilotEnabled,
     cashINR: State.portfolio.cashINR,
@@ -704,8 +672,8 @@ loadPersistedState();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`=======================================================`);
-  console.log(` Sisir's Cloud Quant Engine v9.0 RUNNING on port ${PORT}`);
-  console.log(` Real-time Binance API & Depth Polling: Active every 2s`);
-  console.log(` AI Trade Analysis Loop: Active every 15s in background`);
+  console.log(` Sisir's Cloud Quant Engine v10.0 RUNNING on port ${PORT}`);
+  console.log(` Real-time Binance Depth & Health: Active every 2.5s`);
+  console.log(` Gemini AI Market Analysis Loop: Active every 20s`);
   console.log(`=======================================================`);
 });
