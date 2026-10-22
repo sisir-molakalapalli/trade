@@ -71,6 +71,9 @@ const State = {
   allocationPerTradeINR: 6000,
   marketRegime: 'EXPANSION',
 
+  // Cooldown tracker: pairKey -> timestamp when trade ended
+  pairCooldowns: {},
+
   portfolio: {
     cashINR: 20000,
     holdings: {},
@@ -118,10 +121,17 @@ function loadPersistedState() {
       if (typeof data.autopilotEnabled === 'boolean') {
         State.autopilotEnabled = data.autopilotEnabled;
       }
-      if (Array.isArray(data.tradeLogs)) {
-        State.tradeLogs = data.tradeLogs;
+      // CRITICAL FIX: Merge trade logs safely, never clobber with empty
+      if (Array.isArray(data.tradeLogs) && data.tradeLogs.length > 0) {
+        const existingIds = new Set(State.tradeLogs.map(l => l.id));
+        data.tradeLogs.forEach(l => {
+          if (!existingIds.has(l.id)) {
+            State.tradeLogs.push(l);
+          }
+        });
+        State.tradeLogs.sort((a, b) => b.id - a.id);
       }
-      console.log(`[Quant Engine] Restored state: Cash=₹${Math.round(State.portfolio.cashINR)}, Active Positions=${Object.keys(State.activePositions).length}`);
+      console.log(`[Quant Engine] Restored state: Cash=₹${Math.round(State.portfolio.cashINR)}, Positions=${Object.keys(State.activePositions).length}, Trades=${State.tradeLogs.length}`);
     } else {
       persistState();
     }
@@ -137,7 +147,8 @@ function persistState() {
       activePositions: State.activePositions,
       autopilotEnabled: State.autopilotEnabled,
       marketRegime: State.marketRegime,
-      tradeLogs: State.tradeLogs.slice(0, 100),
+      // Retain up to 500 completed trades permanently
+      tradeLogs: State.tradeLogs.slice(0, 500),
       timestamp: Date.now()
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2));
@@ -163,13 +174,20 @@ syncBinanceUsdtInrRate();
 async function fetchRealOrderBookDepth(symbol) {
   try {
     const data = await fetchFromBinance(`/api/v3/depth?symbol=${symbol}&limit=20`);
-    if (data && data.bids && data.asks) {
+    if (data && data.bids && data.asks && data.bids.length > 0 && data.asks.length > 0) {
       let bidVol = 0;
       let askVol = 0;
       data.bids.forEach(b => { bidVol += parseFloat(b[1]) || 0; });
       data.asks.forEach(a => { askVol += parseFloat(a[1]) || 0; });
       const total = bidVol + askVol;
-      return total > 0 ? bidVol / total : 0.50;
+      const obi = total > 0 ? bidVol / total : 0.50;
+
+      // Calculate Bid-Ask Spread % to detect choppy volatility
+      const bestBid = parseFloat(data.bids[0][0]);
+      const bestAsk = parseFloat(data.asks[0][0]);
+      const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0;
+
+      return { obi, spreadPct, bestBid, bestAsk };
     }
   } catch (e) {}
   return null;
@@ -292,11 +310,13 @@ async function runPureQuantitativeAnalysis() {
 
   for (const sym of Object.keys(State.universe)) {
     const item = State.universe[sym];
-    const liveObi = await fetchRealOrderBookDepth(sym);
-    const obi = (liveObi !== null && liveObi !== undefined) ? liveObi : (item.obi || 0.50);
+    const depthInfo = await fetchRealOrderBookDepth(sym);
+    const obi = (depthInfo && typeof depthInfo.obi === 'number') ? depthInfo.obi : (item.obi || 0.50);
+    const spreadPct = depthInfo ? depthInfo.spreadPct : 0.05;
     const ticker = ticker24hMap[sym] || { priceChangePercent: item.priceChangePct || 0, quoteVolume: 50000000 };
 
     item.obi = obi;
+    item.spreadPct = spreadPct;
     item.priceChangePct = ticker.priceChangePercent;
     item.volumeM = Math.round(ticker.quoteVolume / 1e6);
 
@@ -307,7 +327,11 @@ async function runPureQuantitativeAnalysis() {
     // 3. Dollar Turnover Liquidity Component (Max 25 pts)
     const volScore = Math.min(25, Math.log10(Math.max(1, item.volumeM)) * 8);
 
-    const computedScore = Math.min(98, Math.max(50, Math.round(obiScore + momScore + volScore)));
+    // Spread Penalty: penalize volatile/wide books heavily to avoid opening in choppy whipsaws
+    let computedScore = Math.min(98, Math.max(50, Math.round(obiScore + momScore + volScore)));
+    if (spreadPct > 0.20) {
+      computedScore = Math.max(50, computedScore - 15); // Drop score by 15 if spread is wider than 0.20%
+    }
 
     item.score = computedScore;
     item.source = 'QUANT_ALGO';
@@ -340,7 +364,7 @@ async function runPureQuantitativeAnalysis() {
     State.quantTelemetry.regimeReasoning = `Ask resistance dominance across universe. Defensive risk parameters active.`;
   }
 
-  // Autopilot Execution Check
+  // Autopilot Execution Check with Volatility & Cooldown Guards
   if (State.autopilotEnabled && State.portfolio.cashINR >= 2500 && State.marketSyncCount >= 2) {
     const currentOpenCount = Object.keys(State.activePositions).length;
     const maxAllowed = State.marketRegime === 'EXPANSION' ? State.maxConcurrentPositions : 1;
@@ -351,21 +375,24 @@ async function runPureQuantitativeAnalysis() {
         .filter(key => {
           const item = State.universe[key];
           const isFresh = (now - (item.verifiedAt || 0)) <= 5000;
-          return !State.activePositions[key] && item.priceINR > 0 && isFresh;
+          const isOffCooldown = !State.pairCooldowns[key] || (now - State.pairCooldowns[key] >= 15 * 60 * 1000); // 15 min cooloff
+          const isTightSpread = (item.spreadPct || 0) <= 0.18; // Prevent entering choppy/illiquid spreads
+          return !State.activePositions[key] && item.priceINR > 0 && isFresh && isOffCooldown && isTightSpread;
         })
         .sort((a, b) => State.universe[b].score - State.universe[a].score);
 
       const topKey = availableCandidates[0];
       const candidate = State.universe[topKey];
 
-      if (candidate && candidate.score >= 78) {
+      // Enhanced Entry Condition: Must score >= 80 (stricter quality), with buyer skew > 52%
+      if (candidate && candidate.score >= 80 && (candidate.obi || 0) >= 0.52) {
         const slotsAvailable = maxAllowed - currentOpenCount;
         const targetAllocation = Math.min(State.allocationPerTradeINR, Math.floor(State.portfolio.cashINR / Math.max(1, slotsAvailable)));
 
         if (targetAllocation >= 2000) {
           const livePrice = candidate.priceINR;
           const qty = targetAllocation / livePrice;
-          const slDist = livePrice * 0.015;
+          const slDist = livePrice * 0.012; // Tighter initial SL: 1.2% (down from 1.5%)
 
           State.activePositions[topKey] = {
             pairKey: topKey,
@@ -375,11 +402,12 @@ async function runPureQuantitativeAnalysis() {
             notionalINR: targetAllocation,
             qty,
             sl: livePrice - slDist,
-            tp1: livePrice + (slDist * 2.4),
+            tp1: livePrice + (slDist * 2.2),
             peakGainPct: 0,
-            decayRisk: 15,
+            decayRisk: 10,
             predictiveStatus: 'SAFE',
             isTrailingActive: false,
+            enteredAtMs: Date.now(),
             openedAt: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }),
             reasoning: candidate.reasoning
           };
@@ -446,57 +474,85 @@ async function monitorOpenPositionsHealth() {
     return;
   }
 
+  const now = Date.now();
+
   for (const pairKey of activeKeys) {
     const pos = State.activePositions[pairKey];
     if (!pos) continue;
 
     const livePrice = State.universe[pairKey]?.priceINR || pos.entryPrice;
     const gainPct = ((livePrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const holdSeconds = Math.floor((now - (pos.enteredAtMs || now)) / 1000);
 
+    // Track peak gain
     if (gainPct > (pos.peakGainPct || 0)) {
       pos.peakGainPct = gainPct;
     }
 
-    if (gainPct >= 1.5 && !pos.isTrailingActive) {
+    // ULTRA-FAST TRAILING BE: Lock in Break-Even at +0.75% gain (previously +1.5%)
+    if (gainPct >= 0.75 && !pos.isTrailingActive) {
       pos.isTrailingActive = true;
-      pos.sl = pos.entryPrice * 1.002;
-      console.log(`[Trailing Ratchet Triggered] ${pos.pairSymbol} locked at Break-Even (+0.2%)`);
+      pos.sl = pos.entryPrice * 1.0015; // Lock +0.15% net profit
+      console.log(`[Fast Trailing Ratchet] ${pos.pairSymbol} locked at Break-Even (+0.15% profit guard)`);
     }
 
-    const realObi = await fetchRealOrderBookDepth(pairKey);
-    let decayRisk = 15;
+    // Dynamic Microstructure Health Check
+    const depthInfo = await fetchRealOrderBookDepth(pairKey);
+    let decayRisk = 10;
+    const realObi = depthInfo ? depthInfo.obi : null;
+    const spreadPct = depthInfo ? depthInfo.spreadPct : 0.05;
 
+    // 1. Order book skew degradation
     if (realObi !== null) {
-      if (realObi < 0.45) decayRisk += 35;
-      else if (realObi < 0.50) decayRisk += 20;
+      if (realObi < 0.43) decayRisk += 45; // Sellers dominating book
+      else if (realObi < 0.48) decayRisk += 25;
+      else if (realObi >= 0.55) decayRisk -= 10; // Buyers healthy
     }
 
+    // 2. Spread widening (high slippage risk)
+    if (spreadPct > 0.18) decayRisk += 20;
+
+    // 3. Drop from peak momentum (giving back profits)
     const dropFromPeak = (pos.peakGainPct || 0) - gainPct;
-    if (dropFromPeak >= 0.8) decayRisk += 30;
-    else if (dropFromPeak >= 0.4) decayRisk += 15;
+    if (dropFromPeak >= 0.5) decayRisk += 30;
+    else if (dropFromPeak >= 0.3) decayRisk += 15;
 
-    if (gainPct < -0.3) decayRisk += 25;
+    // 4. Stagnation / Initial adverse drift
+    if (gainPct < -0.2) decayRisk += 25;
+    if (gainPct < -0.35) decayRisk += 35;
 
-    pos.decayRisk = Math.min(95, decayRisk);
-    pos.predictiveStatus = pos.decayRisk >= 65 ? 'EXITING' : (pos.decayRisk >= 40 ? 'CAUTION' : 'SAFE');
+    pos.decayRisk = Math.min(99, Math.max(5, decayRisk));
+    pos.predictiveStatus = pos.decayRisk >= 55 ? 'EXITING' : (pos.decayRisk >= 35 ? 'CAUTION' : 'SAFE');
 
+    // === TIER 1: HARD STOP-LOSS / TAKE-PROFIT ===
     if (livePrice <= pos.sl) {
-      settlePosition(pairKey, 'HARD SL', livePrice, 'Hit designated Stop-Loss boundary');
+      const reason = pos.isTrailingActive ? 'Trailing Stop-Loss triggered (Locked profit)' : 'Hit Initial Stop-Loss';
+      settlePosition(pairKey, pos.isTrailingActive ? 'TRAILING SL' : 'HARD SL', livePrice, reason);
       continue;
     }
 
     if (livePrice >= pos.tp1) {
-      settlePosition(pairKey, 'HARD TP', livePrice, 'Target profit attained (+3.6%)');
+      settlePosition(pairKey, 'HARD TP', livePrice, 'Target profit attained (+2.6%)');
       continue;
     }
 
-    if (gainPct <= -0.5 && pos.decayRisk >= 70) {
-      settlePosition(pairKey, 'PREDICTIVE SL', livePrice, `Loss mitigation cut: Decay ${pos.decayRisk}% (Closed at ${gainPct.toFixed(2)}%)`);
+    // === TIER 2: HIGH-EFFICIENCY PREDICTIVE EARLY CUT (SAVES FROM SL) ===
+    // If trade drops to only -0.25% and book reveals seller pressure (Decay >= 50%), exit immediately!
+    if (gainPct <= -0.25 && pos.decayRisk >= 50) {
+      settlePosition(pairKey, 'PREDICTIVE SL', livePrice, `Early mitigation: Decay ${pos.decayRisk}% (Prevented SL, closed at ${gainPct.toFixed(2)}%)`);
       continue;
     }
 
-    if (gainPct >= 0.5 && pos.decayRisk >= 65) {
-      settlePosition(pairKey, 'PREDICTIVE TP', livePrice, `Predictive profit capture: Decay ${pos.decayRisk}% (Locked +${gainPct.toFixed(2)}%)`);
+    // === TIER 3: EMERGENCY SKEW FLIP (FIRST 90 SECONDS) ===
+    // If within 90 seconds of entry the buyers evaporate (OBI < 0.42), abort immediately
+    if (holdSeconds <= 90 && realObi !== null && realObi < 0.42 && gainPct <= -0.15) {
+      settlePosition(pairKey, 'ORDERBOOK FLIP', livePrice, `Emergency book abort: Buyer depth collapsed to ${Math.round(realObi * 100)}%`);
+      continue;
+    }
+
+    // === TIER 4: PREDICTIVE TAKE-PROFIT (PROTECT RUNNER) ===
+    if (gainPct >= 0.45 && pos.decayRisk >= 55) {
+      settlePosition(pairKey, 'PREDICTIVE TP', livePrice, `Early profit locked: Momentum peak reached (+${gainPct.toFixed(2)}%)`);
       continue;
     }
   }
@@ -516,6 +572,9 @@ function settlePosition(pairKey, type, exitPrice, reason) {
 
   delete State.portfolio.holdings[pairKey];
   delete State.activePositions[pairKey];
+
+  // Put this pair on 15-minute cooldown to prevent repetitive churn/whipsawing
+  State.pairCooldowns[pairKey] = Date.now();
 
   const logEntry = {
     id: Date.now(),
@@ -545,7 +604,7 @@ function broadcastState() {
     marketRegime: State.marketRegime,
     quantTelemetry: State.quantTelemetry,
     universe: State.universe,
-    tradeLogs: State.tradeLogs.slice(0, 50),
+    tradeLogs: State.tradeLogs.slice(0, 200),
     timestamp: Date.now()
   });
 
