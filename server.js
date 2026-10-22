@@ -55,8 +55,8 @@ const State = {
   activePositions: {},
 
   llmTelemetry: {
-    model: GEMINI_API_KEY ? 'Gemini 2.5 Flash (Live 24/7 Cloud API)' : 'Deterministic Microstructure Engine',
-    source: GEMINI_API_KEY ? 'GEMINI_2_5_FLASH' : 'DETERMINISTIC_FALLBACK',
+    model: GEMINI_API_KEY ? 'Gemini 3.8 Flash (Live 24/7 Cloud API)' : 'Deterministic Microstructure Engine',
+    source: GEMINI_API_KEY ? 'GEMINI_3_8_FLASH' : 'DETERMINISTIC_FALLBACK',
     frequencySeconds: 20,
     lastAnalysisTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }),
     promptExecutionCount: 0,
@@ -387,7 +387,8 @@ Respond ONLY with valid JSON conforming strictly to this schema, without markdow
   }
 }`;
 
-      const geminiModels = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+      // Current supported Google Gemini models (Gemini 3.8 / 3.6 Flash)
+      const geminiModels = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-2.0-flash'];
       for (const model of geminiModels) {
         if (geminiSuccess) break;
         try {
@@ -416,9 +417,9 @@ Respond ONLY with valid JSON conforming strictly to this schema, without markdow
             if (rawText) {
               const parsed = JSON.parse(rawText);
               if (parsed.marketRegime) State.marketRegime = parsed.marketRegime;
-              if (parsed.reasoning) State.llmTelemetry.regimeReasoning = `Gemini AI: ${parsed.reasoning}`;
+              if (parsed.reasoning) State.llmTelemetry.regimeReasoning = `Gemini AI (${model}): ${parsed.reasoning}`;
               State.llmTelemetry.model = `${model} (Live 24/7 Cloud API)`;
-              State.llmTelemetry.source = 'GEMINI_2_5_FLASH';
+              State.llmTelemetry.source = 'GEMINI_3_8_FLASH';
               State.llmTelemetry.lastError = null;
 
               if (parsed.ratings && typeof parsed.ratings === 'object') {
@@ -428,7 +429,7 @@ Respond ONLY with valid JSON conforming strictly to this schema, without markdow
                     if (typeof r.score === 'number') State.universe[sym].score = Math.min(98, Math.max(50, Math.round(r.score)));
                     if (r.direction) State.universe[sym].direction = r.direction;
                     if (r.reasoning) State.universe[sym].reasoning = r.reasoning;
-                    State.universe[sym].source = 'GEMINI_2_5_FLASH';
+                    State.universe[sym].source = 'GEMINI_3_8_FLASH';
                   }
                 });
               }
@@ -437,7 +438,7 @@ Respond ONLY with valid JSON conforming strictly to this schema, without markdow
             }
           } else {
             const errBody = await geminiRes.text();
-            State.llmTelemetry.lastError = `HTTP ${geminiRes.status}: ${errBody.slice(0, 100)}`;
+            State.llmTelemetry.lastError = `HTTP ${geminiRes.status} on ${model}: ${errBody.slice(0, 100)}`;
           }
         } catch (mErr) {
           State.llmTelemetry.lastError = mErr.message;
@@ -611,7 +612,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
     uptime: process.uptime(),
-    geminiActive: State.llmTelemetry.source === 'GEMINI_2_5_FLASH',
+    geminiActive: State.llmTelemetry.source === 'GEMINI_3_8_FLASH',
     geminiConfigured: Boolean(GEMINI_API_KEY),
     lastMarketSync: State.lastMarketSyncTime,
     lastAiAnalysis: State.llmTelemetry.lastAnalysisTime,
@@ -644,22 +645,35 @@ app.get('/api/llm/test', async (req, res) => {
 
   try {
     const t0 = Date.now();
-    const testRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: 'Respond with exactly: {"status":"OK"}' }] }]
-      })
-    });
-    result.geminiHttpStatus = testRes.status;
-    result.geminiTestLatencyMs = Date.now() - t0;
-    if (testRes.ok) {
-      result.geminiActive = true;
-      result.diagnosis = 'Gemini API is verified and operational 24/7.';
-    } else {
-      result.geminiActive = false;
-      result.geminiErrorDetails = await testRes.text();
-      result.diagnosis = 'Gemini API returned an error status.';
+    const testModels = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-2.0-flash'];
+    let connected = false;
+
+    for (const m of testModels) {
+      if (connected) break;
+      const testRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${GEMINI_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: 'Respond with exactly: {"status":"OK"}' }] }]
+        })
+      });
+
+      result.geminiHttpStatus = testRes.status;
+      result.geminiTestLatencyMs = Date.now() - t0;
+      result.modelTested = m;
+
+      if (testRes.ok) {
+        result.geminiActive = true;
+        result.diagnosis = `Gemini API verified and operational 24/7 using ${m}.`;
+        connected = true;
+      } else {
+        result.geminiActive = false;
+        result.geminiErrorDetails = await testRes.text();
+      }
+    }
+
+    if (!connected) {
+      result.diagnosis = 'Gemini API returned an error status across tested models.';
     }
   } catch (err) {
     result.geminiActive = false;
