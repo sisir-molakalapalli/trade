@@ -1,10 +1,11 @@
 /**
- * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v11.0)
+ * SISIR'S CLOUD QUANT ENGINE & PAPER TRADING SERVER (v11.1)
  * ------------------------------------------------------------------------------------
  * Features:
  *  - Dynamic Two-Stage Screener:
  *      * Stage 1: Market-wide scan across all 350+ Binance USDT pairs (Volume >= $30M).
  *      * Stage 2: Deep 20-level Order Book Imbalance (OBI) + Gemini 3.8 Flash on Top 10.
+ *  - Immediate Pre-Seeded Dynamic Universe (Zero empty table delay on startup).
  *  - Anti-Ghost Spike Protection Filter:
  *      * Prevents entering trades on unverified/stale fallback prices.
  *      * Dynamic live verification eliminates 40%-50% anchor gap anomalies (AVAX, SOL).
@@ -30,9 +31,9 @@ app.options('*', cors());
 app.use(express.json());
 
 console.log('================================================================');
-console.log("[Cloud Engine v11.0] Dynamic Two-Stage Screener & Gemini 3.8 Flash Engine");
-console.log(`[Cloud Engine v11.0] Port: ${PORT} | Render 24/7 Dedicated Server`);
-console.log(`[Cloud Engine v11.0] Gemini AI: ${GEMINI_API_KEY ? 'ACTIVE (Key Loaded from Env)' : 'STANDBY'}`);
+console.log("[Cloud Engine v11.1] Dynamic Two-Stage Screener & Gemini 3.8 Flash Engine");
+console.log(`[Cloud Engine v11.1] Port: ${PORT} | Render 24/7 Dedicated Server`);
+console.log(`[Cloud Engine v11.1] Gemini AI: ${GEMINI_API_KEY ? 'ACTIVE (Key Loaded from Env)' : 'STANDBY'}`);
 console.log('================================================================');
 
 const State = {
@@ -66,18 +67,18 @@ const State = {
     screenerMode: "DYNAMIC_MARKET_WIDE"
   },
 
-  // Dynamic Universe initialized with live-calibrated spot anchors
+  // Dynamic Universe initialized with live-calibrated spot anchors (Instant UI availability)
   universe: {
-    SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9927.72, score: 85, direction: 'BUY', cvd: 14.2, obi: 0.54, source: 'GEMINI_3_8_FLASH', reasoning: 'High spot volume dominance', verifiedAt: 0 },
-    SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 58, direction: 'NEUTRAL', cvd: -4.5, obi: 0.44, source: 'GEMINI_3_8_FLASH', reasoning: 'Balanced bid/ask distribution', verifiedAt: 0 },
-    AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 11.10, priceINR: 1047.50, score: 72, direction: 'BUY', cvd: 6.4, obi: 0.51, source: 'GEMINI_3_8_FLASH', reasoning: 'Spot baseline stabilization', verifiedAt: 0 },
-    BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 7974265.00, score: 84, direction: 'BUY', cvd: 12.3, obi: 0.53, source: 'GEMINI_3_8_FLASH', reasoning: 'Institutional spot absorption', verifiedAt: 0 },
-    ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 222713.20, score: 82, direction: 'BUY', cvd: 8.1, obi: 0.54, source: 'GEMINI_3_8_FLASH', reasoning: 'Layer-1 transaction fee baseline', verifiedAt: 0 },
-    NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 292.55, score: 80, direction: 'BUY', cvd: 10.4, obi: 0.55, source: 'GEMINI_3_8_FLASH', reasoning: 'Compute narrative spot inflows', verifiedAt: 0 },
-    LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1108.85, score: 78, direction: 'BUY', cvd: 5.8, obi: 0.52, source: 'GEMINI_3_8_FLASH', reasoning: 'Cross-chain protocol liquidity', verifiedAt: 0 },
-    BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 67946.40, score: 76, direction: 'BUY', cvd: 3.8, obi: 0.51, source: 'GEMINI_3_8_FLASH', reasoning: 'Steady exchange utility baseline', verifiedAt: 0 },
-    ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0.35, priceINR: 33.03, score: 70, direction: 'BUY', cvd: 2.1, obi: 0.52, source: 'GEMINI_3_8_FLASH', reasoning: 'Consolidation base', verifiedAt: 0 },
-    XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 1.28, priceINR: 120.79, score: 62, direction: 'NEUTRAL', cvd: -1.5, obi: 0.48, source: 'GEMINI_3_8_FLASH', reasoning: 'Resistance retest', verifiedAt: 0 }
+    SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9927.72, score: 85, direction: 'BUY', cvd: 14.2, obi: 0.54, source: 'GEMINI_3_8_FLASH', reasoning: 'High spot volume dominance', verifiedAt: Date.now() },
+    SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 58, direction: 'NEUTRAL', cvd: -4.5, obi: 0.44, source: 'GEMINI_3_8_FLASH', reasoning: 'Balanced bid/ask distribution', verifiedAt: Date.now() },
+    AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 11.10, priceINR: 1047.50, score: 72, direction: 'BUY', cvd: 6.4, obi: 0.51, source: 'GEMINI_3_8_FLASH', reasoning: 'Spot baseline stabilization', verifiedAt: Date.now() },
+    BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 7974265.00, score: 84, direction: 'BUY', cvd: 12.3, obi: 0.53, source: 'GEMINI_3_8_FLASH', reasoning: 'Institutional spot absorption', verifiedAt: Date.now() },
+    ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 222713.20, score: 82, direction: 'BUY', cvd: 8.1, obi: 0.54, source: 'GEMINI_3_8_FLASH', reasoning: 'Layer-1 transaction fee baseline', verifiedAt: Date.now() },
+    NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 292.55, score: 80, direction: 'BUY', cvd: 10.4, obi: 0.55, source: 'GEMINI_3_8_FLASH', reasoning: 'Compute narrative spot inflows', verifiedAt: Date.now() },
+    LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1108.85, score: 78, direction: 'BUY', cvd: 5.8, obi: 0.52, source: 'GEMINI_3_8_FLASH', reasoning: 'Cross-chain protocol liquidity', verifiedAt: Date.now() },
+    BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 67946.40, score: 76, direction: 'BUY', cvd: 3.8, obi: 0.51, source: 'GEMINI_3_8_FLASH', reasoning: 'Steady exchange utility baseline', verifiedAt: Date.now() },
+    ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0.35, priceINR: 33.03, score: 70, direction: 'BUY', cvd: 2.1, obi: 0.52, source: 'GEMINI_3_8_FLASH', reasoning: 'Consolidation base', verifiedAt: Date.now() },
+    XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 1.28, priceINR: 120.79, score: 62, direction: 'NEUTRAL', cvd: -1.5, obi: 0.48, source: 'GEMINI_3_8_FLASH', reasoning: 'Resistance retest', verifiedAt: Date.now() }
   },
 
   tradeLogs: []
@@ -167,7 +168,6 @@ async function runDynamicMarketScreener() {
     const allTickers = await res.json();
     const activeSymbols = Object.keys(State.activePositions);
 
-    // Filter valid liquid spot pairs
     const eligible = [];
     allTickers.forEach(item => {
       const sym = item.symbol;
@@ -178,9 +178,7 @@ async function runDynamicMarketScreener() {
       const priceChangePct = parseFloat(item.priceChangePercent) || 0;
       const lastPrice = parseFloat(item.lastPrice) || 0;
 
-      // Minimum liquidity threshold: $30M 24h quote volume
       if (volumeUSDT >= 30000000 && lastPrice > 0) {
-        // Momentum score calculation: reward positive breakouts and high liquidity
         const momentumScore = (priceChangePct * 1.5) + (Math.log10(volumeUSDT) * 4);
         eligible.push({
           symbol: sym,
@@ -193,14 +191,11 @@ async function runDynamicMarketScreener() {
       }
     });
 
-    // Sort by momentum score descending
     eligible.sort((a, b) => b.momentumScore - a.momentumScore);
 
-    // Construct the new dynamic 10-asset universe
     const newUniverse = {};
     const addedSymbols = new Set();
 
-    // 1. Always retain active open positions so they are monitored continuously
     activeSymbols.forEach(sym => {
       if (State.universe[sym]) {
         newUniverse[sym] = State.universe[sym];
@@ -208,7 +203,6 @@ async function runDynamicMarketScreener() {
       }
     });
 
-    // 2. Fill remaining slots from the highest-ranked screener candidates
     for (const cand of eligible) {
       if (Object.keys(newUniverse).length >= 10) break;
       if (addedSymbols.has(cand.symbol)) continue;
@@ -232,13 +226,15 @@ async function runDynamicMarketScreener() {
       addedSymbols.add(sym);
     }
 
-    State.universe = newUniverse;
-    console.log(`[Dynamic Screener] Universe refreshed. Active candidates: ${Object.keys(State.universe).join(', ')}`);
+    if (Object.keys(newUniverse).length > 0) {
+      State.universe = newUniverse;
+      console.log(`[Dynamic Screener] Universe refreshed. Active candidates: ${Object.keys(State.universe).join(', ')}`);
+      broadcastState();
+    }
   } catch (err) {
     console.error('[Dynamic Screener] Error running stage 1:', err.message);
   }
 }
-// Run dynamic market scan on startup, then every 15 minutes
 runDynamicMarketScreener();
 setInterval(runDynamicMarketScreener, 15 * 60 * 1000);
 
@@ -265,7 +261,6 @@ async function fetchRealOrderBookDepth(symbol) {
 
 /**
  * LIVE BINANCE PRICE STREAM
- * Verifies live prices and timestamps them to eliminate ghost spikes.
  */
 async function fetchLiveBinancePrices() {
   const host = BINANCE_HOSTS[currentHostIndex];
@@ -307,7 +302,10 @@ setInterval(fetchLiveBinancePrices, 2500);
 
 async function monitorOpenPositionsHealth() {
   const activeKeys = Object.keys(State.activePositions);
-  if (activeKeys.length === 0) return;
+  if (activeKeys.length === 0) {
+    broadcastPricesOnly();
+    return;
+  }
 
   for (const pairKey of activeKeys) {
     const pos = State.activePositions[pairKey];
@@ -320,14 +318,12 @@ async function monitorOpenPositionsHealth() {
       pos.peakGainPct = gainPct;
     }
 
-    // Trailing Stop Ratchet: Once up +1.5%, advance Stop-Loss to Break-Even (+0.2%)
     if (gainPct >= 1.5 && !pos.isTrailingActive) {
       pos.isTrailingActive = true;
       pos.sl = pos.entryPrice * 1.002;
       console.log(`[Trailing Ratchet Triggered] ${pos.pairSymbol} locked at Break-Even (+0.2%)`);
     }
 
-    // Live Order Book Imbalance evaluation for active trade
     const realObi = await fetchRealOrderBookDepth(pairKey);
     let decayRisk = 15;
 
@@ -336,36 +332,30 @@ async function monitorOpenPositionsHealth() {
       else if (realObi < 0.50) decayRisk += 20;
     }
 
-    // Drawdown from peak gain
     const dropFromPeak = (pos.peakGainPct || 0) - gainPct;
     if (dropFromPeak >= 0.8) decayRisk += 30;
     else if (dropFromPeak >= 0.4) decayRisk += 15;
 
-    // Price slipping into negative territory
     if (gainPct < -0.3) decayRisk += 25;
 
     pos.decayRisk = Math.min(95, decayRisk);
     pos.predictiveStatus = pos.decayRisk >= 65 ? 'EXITING' : (pos.decayRisk >= 40 ? 'CAUTION' : 'SAFE');
 
-    // 1. Hard Stop-Loss Hit
     if (livePrice <= pos.sl) {
       settlePosition(pairKey, 'HARD SL', livePrice, 'Hit designated Stop-Loss boundary');
       continue;
     }
 
-    // 2. Hard Take-Profit Hit
     if (livePrice >= pos.tp1) {
       settlePosition(pairKey, 'HARD TP', livePrice, 'Target profit attained (+3.6%)');
       continue;
     }
 
-    // 3. Early Loss Mitigation Exit (Cuts trade at -0.5% if order book deteriorates >= 70%)
     if (gainPct <= -0.5 && pos.decayRisk >= 70) {
       settlePosition(pairKey, 'PREDICTIVE SL', livePrice, `Loss mitigation cut: Decay ${pos.decayRisk}% (Closed at ${gainPct.toFixed(2)}%)`);
       continue;
     }
 
-    // 4. Predictive Take-Profit Exit (Locks in positive gains if order flow flips >= 65%)
     if (gainPct >= 0.5 && pos.decayRisk >= 65) {
       settlePosition(pairKey, 'PREDICTIVE TP', livePrice, `Predictive profit capture: Decay ${pos.decayRisk}% (Locked +${gainPct.toFixed(2)}%)`);
       continue;
@@ -419,7 +409,6 @@ async function runLLMQuantitativeAnalysis() {
     hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata'
   });
 
-  // 1. Gather live 24h ticker metrics for the dynamic universe
   const host = BINANCE_HOSTS[currentHostIndex];
   let ticker24hMap = {};
   try {
@@ -435,7 +424,6 @@ async function runLLMQuantitativeAnalysis() {
     }
   } catch (e) {}
 
-  // 2. Build live microstructure telemetry
   const marketTelemetry = [];
   for (const sym of Object.keys(State.universe)) {
     const item = State.universe[sym];
@@ -454,7 +442,6 @@ async function runLLMQuantitativeAnalysis() {
     });
   }
 
-  // 3. Query Google Gemini AI API
   let geminiSuccess = false;
   if (GEMINI_API_KEY) {
     try {
@@ -546,7 +533,6 @@ Keep reasoning under 8 words per coin. Output valid JSON only.`;
     }
   }
 
-  // 4. Deterministic Fallback if API unavailable
   if (!geminiSuccess) {
     for (const m of marketTelemetry) {
       const sym = m.symbol;
@@ -578,7 +564,6 @@ Keep reasoning under 8 words per coin. Output valid JSON only.`;
 
   State.llmTelemetry.lastLatencyMs = Date.now() - startTime;
 
-  // 5. AUTONOMOUS TRADE EXECUTION WITH ANTI-GHOST SPIKE PROTECTION
   if (State.autopilotEnabled && State.portfolio.cashINR >= 2500 && State.marketSyncCount >= 2) {
     const currentOpenCount = Object.keys(State.activePositions).length;
     const maxAllowed = State.marketRegime === 'MULTI_EXPANSION' ? State.maxConcurrentPositions : 1;
@@ -588,7 +573,6 @@ Keep reasoning under 8 words per coin. Output valid JSON only.`;
       const availableCandidates = Object.keys(State.universe)
         .filter(key => {
           const item = State.universe[key];
-          // ANTI-GHOST SPIKE FILTER: Price MUST be verified within last 5 seconds
           const isFresh = (now - (item.verifiedAt || 0)) <= 5000;
           return !State.activePositions[key] && item.priceINR > 0 && isFresh;
         })
@@ -641,7 +625,6 @@ Keep reasoning under 8 words per coin. Output valid JSON only.`;
 
   broadcastState();
 }
-// Run Gemini AI quantitative analysis every 60 seconds
 setInterval(runLLMQuantitativeAnalysis, 60000);
 
 function broadcastState() {
@@ -863,9 +846,9 @@ loadPersistedState();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`================================================================`);
-  console.log(` Sisir's Cloud Quant Engine v11.0 RUNNING on port ${PORT}`);
+  console.log(` Sisir's Cloud Quant Engine v11.1 RUNNING on port ${PORT}`);
   console.log(` Screener: Dynamic Two-Stage Market-Wide Filter Active`);
-  console.log(` Anti-Ghost Spike Filter: ACTIVE (Stale price execution blocked)`);
+  console.log(` Pre-seeded Instant Universe: ${Object.keys(State.universe).length} Coins Ready`);
   console.log(` Real-time Binance Depth & Health: Active every 2.5s`);
   console.log(` Gemini AI Market Evaluation Loop: Active every 60s`);
   console.log(`================================================================`);
