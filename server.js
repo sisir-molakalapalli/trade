@@ -194,124 +194,108 @@ async function fetchRealOrderBookDepth(symbol) {
 }
 
 /**
- * STAGE 1: DUAL-REGIME VOLATILITY EXPANSION DYNAMIC SCREENER
- * Scans all 350+ Binance pairs every 3 minutes.
- * Identifies institutional volume breakouts and filters out dump traps.
+ * DYNAMIC VOLATILITY REGIME DETECTOR
+ * Measures average market dispersion across the Binance universe to scale entry gates.
  */
-async function runDynamicMarketScreener() {
-  try {
-    console.log('[Dynamic Screener] Scanning 350+ Binance USDT pairs for Volatility Breakouts...');
-    const allTickers = await fetchFromBinance('/api/v3/ticker/24hr');
-    if (!allTickers || !Array.isArray(allTickers)) return { success: false, reason: 'Failed to fetch tickers' };
+function calculateMarketVolatilityRegime() {
+  const coins = Object.values(State.universe);
+  if (coins.length === 0) return { regime: 'NORMAL', scoreThreshold: 85, obiThreshold: 0.56, maxSpread: 0.12 };
 
-    const activeSymbols = Object.keys(State.activePositions);
-    const eligible = [];
+  let totalRangePct = 0;
+  let count = 0;
 
-    // Compute average market momentum to detect overall market regime
-    let totalPositivePct = 0;
-    let positiveCount = 0;
+  coins.forEach(c => {
+    if (c.intradayRangePct) {
+      totalRangePct += c.intradayRangePct;
+      count++;
+    }
+  });
 
-    allTickers.forEach(item => {
-      const sym = item.symbol;
-      if (!sym.endsWith('USDT')) return;
-      if (sym.includes('UP') || sym.includes('DOWN') || sym.includes('BEAR') || sym.includes('BULL')) return;
-      if (sym.startsWith('USDC') || sym.startsWith('FDUSD') || sym.startsWith('TUSD') || sym.startsWith('EUR')) return;
+  const avgRange = count > 0 ? (totalRangePct / count) : 8.0;
 
-      const volumeUSDT = parseFloat(item.quoteVolume) || 0;
-      const priceChangePct = parseFloat(item.priceChangePercent) || 0;
-      const lastPrice = parseFloat(item.lastPrice) || 0;
-      const highPrice = parseFloat(item.highPrice) || 0;
-      const lowPrice = parseFloat(item.lowPrice) || 0;
+  // HIGH VOLATILITY / WHIPSAW REGIME:
+  // When average intraday range exceeds 14%, market is erratic.
+  // Tighten standards to filter out false breakouts and distribution tops.
+  if (avgRange >= 14.0) {
+    return {
+      regime: 'TURBULENT',
+      scoreThreshold: 88,    // Demands higher quant score
+      obiThreshold: 0.58,     // Demands 58% buyer depth
+      maxSpread: 0.10,        // Stricter spread cap to prevent slippage
+      cooldownMinutes: 45
+    };
+  }
 
-      // Only evaluate coins with liquid spot books (minimum $15M 24h turnover)
-      if (volumeUSDT >= 15000000 && lastPrice > 0 && highPrice > lowPrice) {
-        if (priceChangePct > 0) {
-          totalPositivePct += priceChangePct;
-          positiveCount++;
-        }
+  // LOW VOLATILITY / ACCUMULATION REGIME:
+  // When average range is under 6%, market is quiet.
+  // Moderate thresholds to capture early accumulation before expansion.
+  if (avgRange <= 6.0) {
+    return {
+      regime: 'COMPRESSION',
+      scoreThreshold: 82,
+      obiThreshold: 0.54,
+      maxSpread: 0.15,
+      cooldownMinutes: 20
+    };
+  }
 
-        // Intraday Range Expansion Ratio
-        const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
-        
-        // Position relative to 24h high (must be trading in upper 55% of range to avoid distribution tops)
-        const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
+  // STANDARD REGIME:
+  return {
+    regime: 'BALANCED',
+    scoreThreshold: 85,
+    obiThreshold: 0.56,
+    maxSpread: 0.12,
+    cooldownMinutes: 30
+  };
+}
 
-        // DIRECTIONAL BREAKOUT FORMULA:
-        // 1. Heavy reward for clean upward momentum (drops dumping coins)
-        // 2. High reward for trading near 24h highs (pricePositionInRange >= 0.55)
-        // 3. Logarithmic volume scaling to confirm institutional liquidity
-        let breakoutScore = 0;
-        if (priceChangePct > 0.5 && pricePositionInRange >= 0.55) {
-          const momentumMultiplier = Math.min(priceChangePct, 18) * 3.5;
-          const rangeBonus = intradayRangePct * 0.8;
-          const volumeWeight = Math.log10(volumeUSDT) * 3.0;
-          const highProximityBonus = pricePositionInRange * 8.0;
-          
-          breakoutScore = momentumMultiplier + rangeBonus + volumeWeight + highProximityBonus;
+/**
+ * STAGE 2 AUTOPILOT EVALUATION WITH ADAPTIVE THRESHOLDS
+ */
+async function evaluateAutopilotEntries() {
+  if (!State.autopilotEnabled) return;
 
-          eligible.push({
-            symbol: sym,
-            baseAsset: sym.replace('USDT', ''),
-            priceUSDT: lastPrice,
-            priceChangePct,
-            volumeUSDT,
-            breakoutScore,
-            intradayRangePct,
-            pricePositionInRange
-          });
-        }
-      }
-    });
+  const currentPositionsCount = Object.keys(State.activePositions).length;
+  if (currentPositionsCount >= 3) return; // Max 3 positions
+  if (State.portfolio.cashINR < 3500) return; // Minimum cash reserve
 
-    eligible.sort((a, b) => b.breakoutScore - a.breakoutScore);
+  // Compute live market regime parameters
+  const regimeConfig = calculateMarketVolatilityRegime();
 
-    const newUniverse = {};
-    const addedSymbols = new Set();
+  const sortedCandidates = Object.keys(State.universe)
+    .filter(k => !State.activePositions[k])
+    .sort((a, b) => (State.universe[b].score || 0) - (State.universe[a].score || 0));
 
-    // 1. Retain currently open active positions so they are never orphaned
-    activeSymbols.forEach(sym => {
-      if (State.universe[sym]) {
-        newUniverse[sym] = State.universe[sym];
-        addedSymbols.add(sym);
-      }
-    });
+  for (const sym of sortedCandidates) {
+    const coin = State.universe[sym];
+    if (!coin || !coin.score) continue;
 
-    // 2. Populate top 10 dynamic candidates matching the volatility breakout criteria
-    for (const cand of eligible) {
-      if (Object.keys(newUniverse).length >= 10) break;
-      if (addedSymbols.has(cand.symbol)) continue;
-
-      const sym = cand.symbol;
-      const existing = State.universe[sym];
-
-      newUniverse[sym] = {
-        name: cand.baseAsset,
-        symbol: cand.baseAsset,
-        priceUSDT: cand.priceUSDT,
-        priceINR: Math.round(cand.priceUSDT * State.usdtToInrRate * 100) / 100,
-        score: existing ? existing.score : Math.min(94, Math.max(72, Math.round(cand.breakoutScore))),
-        direction: existing ? existing.direction : 'BUY',
-        cvd: existing ? existing.cvd : (cand.priceChangePct * 1.5),
-        obi: existing ? existing.obi : 0.54,
-        priceChangePct: cand.priceChangePct,
-        volumeM: Math.round(cand.volumeUSDT / 1e6),
-        source: 'QUANT_ALGO',
-        reasoning: existing ? existing.reasoning : `Vol Surge: +${cand.priceChangePct.toFixed(1)}% | Range Top ${(cand.pricePositionInRange * 100).toFixed(0)}% ($${Math.round(cand.volumeUSDT / 1e6)}M Vol)`,
-        verifiedAt: Date.now()
-      };
-      addedSymbols.add(sym);
+    // Check Cooldown
+    if (State.cooldowns && State.cooldowns[sym]) {
+      const remainingCooldown = State.cooldowns[sym] - Date.now();
+      if (remainingCooldown > 0) continue;
     }
 
-    if (Object.keys(newUniverse).length >= 5) {
-      State.universe = newUniverse;
-      State.lastScreenerRunTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata' });
-      console.log(`[Dynamic Screener] Successfully rotated universe. Active Candidates: ${Object.keys(State.universe).join(', ')}`);
-      broadcastState();
-      return { success: true, count: Object.keys(State.universe).length, assets: Object.keys(State.universe) };
-    }
-  } catch (err) {
-    console.error('[Dynamic Screener] Error running stage 1:', err.message);
-    return { success: false, error: err.message };
+    // Gate 1: Volatility-Adjusted Score Threshold
+    if (coin.score < regimeConfig.scoreThreshold) continue;
+
+    // Gate 2: Deep Microstructure Inspection
+    const book = await fetchRealOrderBookDepth(sym);
+    if (!book) continue;
+
+    // Gate 3: Volatility-Adjusted OBI Gate
+    if (book.obi < regimeConfig.obiThreshold) continue;
+
+    // Gate 4: Volatility-Adjusted Spread Guard
+    if (book.spreadPct > regimeConfig.maxSpread) continue;
+
+    // Gate 5: Range Proximity Gate
+    if (typeof coin.pricePositionInRange === 'number' && coin.pricePositionInRange < 0.55) continue;
+
+    // Confluence Achieved: Execute Buy
+    console.log(`[Autopilot Entry] ${sym} passed all 5 gates under ${regimeConfig.regime} regime (Score: ${coin.score}/${regimeConfig.scoreThreshold}, OBI: ${(book.obi * 100).toFixed(1)}%). Executing...`);
+    executeSimulatedBuy(sym, coin.priceINR, `Adaptive Gate Passed (${regimeConfig.regime})`);
+    break; // One entry per evaluation cycle
   }
 }
 
