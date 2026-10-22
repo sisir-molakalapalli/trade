@@ -22,7 +22,8 @@ const path = require('path');
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyAHFhOI8ZLKx0ii346W19Z9G8OoCKmzrP8';
+// Strictly load from Render Environment Variables - no hardcoded keys in source
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'X-MBX-APIKEY'] }));
@@ -32,7 +33,7 @@ app.use(express.json());
 console.log('=======================================================');
 console.log("[Cloud Engine v10.0] 24/7 Autonomous Microstructure & Gemini AI Engine");
 console.log(`[Cloud Engine v10.0] Port: ${PORT} | Render Dedicated 24/7 Active`);
-console.log(`[Cloud Engine v10.0] Gemini AI Mode: ACTIVE`);
+console.log(`[Cloud Engine v10.0] Gemini AI Mode: ${GEMINI_API_KEY ? 'ACTIVE (Env Var Configured)' : 'FALLBACK (Deterministic Quant Engine)'}`);
 console.log('=======================================================');
 
 const State = {
