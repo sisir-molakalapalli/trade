@@ -11,7 +11,6 @@ const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4qu
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
-// Allow serving index.html directly from root if placed there
 app.use(express.static(__dirname));
 
 const server = http.createServer(app);
@@ -19,16 +18,16 @@ const wss = new WebSocketServer({ server });
 
 // Baseline universe with fallback anchors
 const DEFAULT_UNIVERSE = {
-  SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9927.72, score: 85, direction: 'STRONG BUY', cvd: 14.2, obi: 0.54, source: 'QUANT_ALGO', reasoning: 'High bid volume depth skew', verifiedAt: Date.now() },
-  SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 58, direction: 'NEUTRAL', cvd: -4.5, obi: 0.44, source: 'QUANT_ALGO', reasoning: 'Balanced bid/ask distribution', verifiedAt: Date.now() },
-  AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 11.10, priceINR: 1047.50, score: 72, direction: 'BUY', cvd: 6.4, obi: 0.51, source: 'QUANT_ALGO', reasoning: 'Spot baseline stabilization', verifiedAt: Date.now() },
-  BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 7974265.00, score: 84, direction: 'STRONG BUY', cvd: 12.3, obi: 0.53, source: 'QUANT_ALGO', reasoning: 'Institutional spot absorption', verifiedAt: Date.now() },
-  ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 222713.20, score: 82, direction: 'STRONG BUY', cvd: 8.1, obi: 0.54, source: 'QUANT_ALGO', reasoning: 'Layer-1 transaction fee baseline', verifiedAt: Date.now() },
-  NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 292.55, score: 80, direction: 'BUY', cvd: 10.4, obi: 0.55, source: 'QUANT_ALGO', reasoning: 'Compute narrative spot inflows', verifiedAt: Date.now() },
-  LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1108.85, score: 78, direction: 'BUY', cvd: 5.8, obi: 0.52, source: 'QUANT_ALGO', reasoning: 'Cross-chain protocol liquidity', verifiedAt: Date.now() },
-  BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 67946.40, score: 76, direction: 'BUY', cvd: 3.8, obi: 0.51, source: 'QUANT_ALGO', reasoning: 'Steady exchange utility baseline', verifiedAt: Date.now() },
-  ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0.35, priceINR: 33.03, score: 70, direction: 'BUY', cvd: 2.1, obi: 0.52, source: 'QUANT_ALGO', reasoning: 'Consolidation base', verifiedAt: Date.now() },
-  XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 1.28, priceINR: 120.79, score: 62, direction: 'NEUTRAL', cvd: -1.5, obi: 0.48, source: 'QUANT_ALGO', reasoning: 'Resistance retest', verifiedAt: Date.now() }
+  SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9927.72, score: 85, direction: 'STRONG BUY', cvd: 14.2, obi: 0.54, intradayRangePct: 6.2, source: 'QUANT_ALGO', reasoning: 'High bid volume depth skew', verifiedAt: Date.now() },
+  SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 58, direction: 'NEUTRAL', cvd: -4.5, obi: 0.44, intradayRangePct: 5.4, source: 'QUANT_ALGO', reasoning: 'Balanced bid/ask distribution', verifiedAt: Date.now() },
+  AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 11.10, priceINR: 1047.50, score: 72, direction: 'BUY', cvd: 6.4, obi: 0.51, intradayRangePct: 4.8, source: 'QUANT_ALGO', reasoning: 'Spot baseline stabilization', verifiedAt: Date.now() },
+  BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 7974265.00, score: 84, direction: 'STRONG BUY', cvd: 12.3, obi: 0.53, intradayRangePct: 3.1, source: 'QUANT_ALGO', reasoning: 'Institutional spot absorption', verifiedAt: Date.now() },
+  ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 222713.20, score: 82, direction: 'STRONG BUY', cvd: 8.1, obi: 0.54, intradayRangePct: 3.8, source: 'QUANT_ALGO', reasoning: 'Layer-1 transaction fee baseline', verifiedAt: Date.now() },
+  NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 292.55, score: 80, direction: 'BUY', cvd: 10.4, obi: 0.55, intradayRangePct: 5.9, source: 'QUANT_ALGO', reasoning: 'Compute narrative spot inflows', verifiedAt: Date.now() },
+  LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1108.85, score: 78, direction: 'BUY', cvd: 5.8, obi: 0.52, intradayRangePct: 4.2, source: 'QUANT_ALGO', reasoning: 'Cross-chain protocol liquidity', verifiedAt: Date.now() },
+  BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 67946.40, score: 76, direction: 'BUY', cvd: 3.8, obi: 0.51, intradayRangePct: 2.8, source: 'QUANT_ALGO', reasoning: 'Steady exchange utility baseline', verifiedAt: Date.now() },
+  ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0.35, priceINR: 33.03, score: 70, direction: 'BUY', cvd: 2.1, obi: 0.52, intradayRangePct: 4.5, source: 'QUANT_ALGO', reasoning: 'Consolidation base', verifiedAt: Date.now() },
+  XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 1.28, priceINR: 120.79, score: 62, direction: 'NEUTRAL', cvd: -1.5, obi: 0.48, intradayRangePct: 3.9, source: 'QUANT_ALGO', reasoning: 'Resistance retest', verifiedAt: Date.now() }
 };
 
 const State = {
@@ -38,6 +37,16 @@ const State = {
   warmupCycles: 0,
   cooldowns: {}, // Symbol -> timestamp (ms)
 
+  // Dynamic Regime Thresholds
+  activeThresholds: {
+    regime: 'BALANCED',
+    scoreThreshold: 85,
+    obiThreshold: 0.56,
+    maxSpread: 0.12,
+    cooldownMinutes: 30,
+    marketAvgRange: 5.5
+  },
+
   portfolio: {
     cashINR: 20000,
     holdings: {},
@@ -46,17 +55,66 @@ const State = {
 
   activePositions: {},
 
+  // Live Subsystem Telemetry Bus
+  subsystems: {
+    microstructure: {
+      status: 'ONLINE',
+      cyclesCompleted: 0,
+      lastCycleTime: '--:--:--',
+      intervalSec: 15,
+      activeBookDepth: 20,
+      evaluatedUniverseSize: 10
+    },
+    screener: {
+      status: 'IDLE',
+      lastRunTime: '--:--:--',
+      nextRunCountdownSec: 180,
+      scannedPairsCount: 0,
+      qualifiedCandidatesCount: 0,
+      liquidityFloorUSD: '15M'
+    },
+    regimeController: {
+      status: 'CALIBRATED',
+      currentRegime: 'BALANCED',
+      marketAvgVolatilityPct: 5.5,
+      liveScoreGate: 85,
+      liveObiGatePct: 56,
+      liveMaxSpreadPct: 0.12,
+      lastAdjustmentTime: '--:--:--'
+    },
+    predictiveSentry: {
+      status: 'WATCHING',
+      lastMonitorTick: '--:--:--',
+      intervalSec: 2.5,
+      activePositionsMonitored: 0,
+      trailingLocksActive: 0,
+      highDecayAlerts: 0
+    },
+    persistence: {
+      status: 'SYNCED',
+      totalDiskSaves: 0,
+      lastSaveTime: '--:--:--',
+      retainedTradesCount: 0,
+      storageEngine: 'Disk JSON + LocalStorage'
+    }
+  },
+
   quantTelemetry: {
     engine: 'Deterministic Microstructure Quant Engine',
     source: 'PURE_QUANT_ALGO',
     frequencySeconds: 15,
     lastAnalysisTime: '--:--:--',
+    screenerCadence: 'Every 3 Minutes (350+ Pairs)',
+    riskCadence: 'Every 2.5 Seconds',
+    persistenceStatus: 'ACTIVE (Non-Destructive)',
     regimeReasoning: 'Scoring active universe via 20-level OBI, momentum velocity, and turnover liquidity.'
   },
 
   universe: { ...DEFAULT_UNIVERSE },
   tradeLogs: []
 };
+
+let nextScreenerTargetTimestamp = Date.now() + (3 * 60 * 1000);
 
 // -------------------------------------------------------------
 // PERSISTENCE ENGINE (Non-Destructive)
@@ -71,7 +129,12 @@ function saveStateToDisk() {
       cooldowns: State.cooldowns
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(dataToSave, null, 2), 'utf-8');
+    State.subsystems.persistence.totalDiskSaves++;
+    State.subsystems.persistence.lastSaveTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    State.subsystems.persistence.retainedTradesCount = State.tradeLogs.length;
+    State.subsystems.persistence.status = 'SYNCED';
   } catch (err) {
+    State.subsystems.persistence.status = 'ERROR';
     console.error('[Persistence] Error saving state:', err.message);
   }
 }
@@ -88,7 +151,6 @@ function loadStateFromDisk() {
         State.activePositions = parsed.activePositions;
       }
       if (Array.isArray(parsed.tradeLogs)) {
-        // Union merge to protect trade history
         const map = new Map();
         parsed.tradeLogs.forEach(l => { if (l && l.id) map.set(l.id, l); });
         State.tradeLogs = Array.from(map.values()).sort((a, b) => b.id - a.id);
@@ -99,6 +161,8 @@ function loadStateFromDisk() {
       if (parsed.cooldowns && typeof parsed.cooldowns === 'object') {
         State.cooldowns = parsed.cooldowns;
       }
+      State.subsystems.persistence.retainedTradesCount = State.tradeLogs.length;
+      State.subsystems.persistence.lastSaveTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       console.log(`[Persistence] Loaded state successfully. (${State.tradeLogs.length} historical trades restored)`);
     }
   } catch (err) {
@@ -163,50 +227,78 @@ async function fetchRealOrderBookDepth(symbol) {
 }
 
 // -------------------------------------------------------------
-// VOLATILITY REGIME DETECTOR
+// VOLATILITY REGIME DETECTOR (Responsive & Adaptive)
 // -------------------------------------------------------------
 function calculateMarketVolatilityRegime() {
   const coins = Object.values(State.universe);
-  if (coins.length === 0) return { regime: 'NORMAL', scoreThreshold: 85, obiThreshold: 0.56, maxSpread: 0.12 };
+  if (coins.length === 0) {
+    return {
+      regime: 'BALANCED',
+      scoreThreshold: 85,
+      obiThreshold: 0.56,
+      maxSpread: 0.12,
+      cooldownMinutes: 30,
+      marketAvgRange: 5.0
+    };
+  }
 
   let totalRangePct = 0;
   let count = 0;
 
   coins.forEach(c => {
-    if (c.intradayRangePct) {
-      totalRangePct += c.intradayRangePct;
+    let range = 0;
+    if (typeof c.intradayRangePct === 'number' && c.intradayRangePct > 0) {
+      range = c.intradayRangePct;
+    } else if (typeof c.priceChangePct === 'number') {
+      range = Math.abs(c.priceChangePct) * 1.5;
+    }
+    if (range > 0) {
+      totalRangePct += range;
       count++;
     }
   });
 
-  const avgRange = count > 0 ? (totalRangePct / count) : 8.0;
+  const avgRange = count > 0 ? (totalRangePct / count) : 5.0;
+  const roundedRange = Math.round(avgRange * 10) / 10;
 
-  if (avgRange >= 14.0) {
-    return {
-      regime: 'TURBULENT',
-      scoreThreshold: 88,
-      obiThreshold: 0.58,
-      maxSpread: 0.10,
-      cooldownMinutes: 45
-    };
+  let computedRegime = 'BALANCED';
+  let scoreThreshold = 85;
+  let obiThreshold = 0.56;
+  let maxSpread = 0.12;
+  let cooldownMinutes = 30;
+
+  // Regime 1: High Market Turbulence (Volatile Whipsaws) -> Tighten gates
+  if (avgRange >= 9.5) {
+    computedRegime = 'TURBULENT';
+    scoreThreshold = 88;
+    obiThreshold = 0.58;
+    maxSpread = 0.10;
+    cooldownMinutes = 45;
+  }
+  // Regime 2: Calmed / Compression / Sideways Accumulation -> Ease gates to permit entries
+  else if (avgRange <= 6.0) {
+    computedRegime = 'COMPRESSION';
+    scoreThreshold = 82;
+    obiThreshold = 0.54;
+    maxSpread = 0.15;
+    cooldownMinutes = 20;
   }
 
-  if (avgRange <= 6.0) {
-    return {
-      regime: 'COMPRESSION',
-      scoreThreshold: 82,
-      obiThreshold: 0.54,
-      maxSpread: 0.15,
-      cooldownMinutes: 20
-    };
-  }
+  State.subsystems.regimeController.status = 'ACTIVE';
+  State.subsystems.regimeController.currentRegime = computedRegime;
+  State.subsystems.regimeController.marketAvgVolatilityPct = roundedRange;
+  State.subsystems.regimeController.liveScoreGate = scoreThreshold;
+  State.subsystems.regimeController.liveObiGatePct = Math.round(obiThreshold * 100);
+  State.subsystems.regimeController.liveMaxSpreadPct = maxSpread;
+  State.subsystems.regimeController.lastAdjustmentTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
   return {
-    regime: 'BALANCED',
-    scoreThreshold: 85,
-    obiThreshold: 0.56,
-    maxSpread: 0.12,
-    cooldownMinutes: 30
+    regime: computedRegime,
+    scoreThreshold,
+    obiThreshold,
+    maxSpread,
+    cooldownMinutes,
+    marketAvgRange: roundedRange
   };
 }
 
@@ -214,10 +306,15 @@ function calculateMarketVolatilityRegime() {
 // STAGE 1: DYNAMIC VOLATILITY SCREENER (Every 3 minutes)
 // -------------------------------------------------------------
 async function runDynamicMarketScreener() {
+  State.subsystems.screener.status = 'SCANNING';
   try {
     const tickers = await fetchFromBinance('/api/v3/ticker/24hr');
-    if (!Array.isArray(tickers) || tickers.length === 0) return;
+    if (!Array.isArray(tickers) || tickers.length === 0) {
+      State.subsystems.screener.status = 'IDLE';
+      return;
+    }
 
+    State.subsystems.screener.scannedPairsCount = tickers.length;
     const candidates = [];
     const activeSymbols = Object.keys(State.activePositions);
 
@@ -232,12 +329,11 @@ async function runDynamicMarketScreener() {
       const highPrice = parseFloat(t.highPrice) || 0;
       const lowPrice = parseFloat(t.lowPrice) || 0;
 
-      // Ensure asset has minimum institutional liquidity ($15M turnover)
+      // Minimum liquidity filter: $15M turnover
       if (quoteVol >= 15000000 && lastPrice > 0 && highPrice > lowPrice) {
         const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
         const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
 
-        // Directional momentum breakout formula: rewards positive velocity and liquidity density
         const directionalMomentum = Math.max(0, priceChangePct);
         const breakoutScore = (directionalMomentum * 3.0) + (Math.log10(quoteVol) * 2.0) + (pricePositionInRange * 5.0);
 
@@ -256,7 +352,8 @@ async function runDynamicMarketScreener() {
       }
     }
 
-    // Always keep active positions in the universe
+    State.subsystems.screener.qualifiedCandidatesCount = candidates.length;
+
     const activeCandidates = candidates.filter(c => c.isActive);
     const nonActiveSorted = candidates
       .filter(c => !c.isActive)
@@ -292,7 +389,12 @@ async function runDynamicMarketScreener() {
       console.log(`[Screener] Universe refreshed with ${selected.length} high-momentum assets.`);
       broadcastPricesOnly();
     }
+
+    State.subsystems.screener.status = 'ACTIVE';
+    State.subsystems.screener.lastRunTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    nextScreenerTargetTimestamp = Date.now() + (3 * 60 * 1000);
   } catch (err) {
+    State.subsystems.screener.status = 'ERROR';
     console.error('[Screener Error]', err.message);
   }
 }
@@ -306,6 +408,9 @@ async function runPureQuantScoring() {
 
   const regimeConfig = calculateMarketVolatilityRegime();
   State.marketRegime = regimeConfig.regime;
+  State.activeThresholds = regimeConfig;
+
+  State.subsystems.microstructure.status = 'CALCULATING';
 
   for (const sym of symbols) {
     const coin = State.universe[sym];
@@ -317,7 +422,6 @@ async function runPureQuantScoring() {
     coin.obi = book.obi;
     coin.spreadPct = book.spreadPct;
 
-    // Sub-score components
     const obiPts = Math.min(40, Math.max(0, Math.round((book.obi - 0.40) * 133)));
     const change = typeof coin.priceChangePct === 'number' ? coin.priceChangePct : 0;
     const momPts = Math.min(35, Math.max(0, Math.round((change + 3) * 3.5)));
@@ -330,7 +434,7 @@ async function runPureQuantScoring() {
     if (compositeScore >= regimeConfig.scoreThreshold && book.obi >= regimeConfig.obiThreshold) {
       coin.direction = 'STRONG BUY';
       coin.reasoning = `High bid depth skew (${(book.obi * 100).toFixed(0)}% Bids) with positive volume momentum`;
-    } else if (compositeScore >= 75) {
+    } else if (compositeScore >= (regimeConfig.scoreThreshold - 7)) {
       coin.direction = 'BUY';
       coin.reasoning = 'Steady baseline accumulation';
     } else if (compositeScore <= 60 || book.obi < 0.46) {
@@ -342,8 +446,13 @@ async function runPureQuantScoring() {
     }
   }
 
-  State.quantTelemetry.lastAnalysisTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  State.quantTelemetry.regimeReasoning = `Market regime: ${regimeConfig.regime}. Dynamic entry threshold: ${regimeConfig.scoreThreshold} pts (OBI >= ${(regimeConfig.obiThreshold * 100).toFixed(0)}%).`;
+  State.subsystems.microstructure.cyclesCompleted++;
+  State.subsystems.microstructure.lastCycleTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  State.subsystems.microstructure.evaluatedUniverseSize = symbols.length;
+  State.subsystems.microstructure.status = 'ACTIVE';
+
+  State.quantTelemetry.lastAnalysisTime = State.subsystems.microstructure.lastCycleTime;
+  State.quantTelemetry.regimeReasoning = `Market regime: ${regimeConfig.regime} (Avg Range: ${regimeConfig.marketAvgRange}%). Dynamic entry threshold: ${regimeConfig.scoreThreshold} pts (OBI >= ${(regimeConfig.obiThreshold * 100).toFixed(0)}%, Spread <= ${regimeConfig.maxSpread}%).`;
 
   evaluateAutopilotEntries(regimeConfig);
   broadcastPricesOnly();
@@ -377,14 +486,14 @@ async function evaluateAutopilotEntries(regimeConfig) {
       delete State.cooldowns[sym];
     }
 
-    // Gate 1: Adaptive Score Threshold
+    // Gate 1: Adaptive Score Threshold (Dynamically 82, 85, or 88 based on volatility)
     if (coin.score < config.scoreThreshold) continue;
 
     // Gate 2: Microstructure Order Book Inspection
     const book = await fetchRealOrderBookDepth(sym);
     if (!book) continue;
 
-    // Gate 3: Adaptive OBI Gate
+    // Gate 3: Adaptive OBI Gate (Dynamically 54%, 56%, or 58% based on volatility)
     if (book.obi < config.obiThreshold) continue;
 
     // Gate 4: Spread Ceiling Guard
@@ -394,7 +503,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 10000) continue;
 
     // Confluence Pass -> Execute Buy
-    executeSimulatedBuy(sym, coin.priceINR, `Adaptive Confluence (${config.regime})`);
+    executeSimulatedBuy(sym, coin.priceINR, `Adaptive Confluence (${config.regime}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%)`);
     break; // One entry per cycle
   }
 }
@@ -453,8 +562,8 @@ function settlePosition(pairKey, exitType, exitPrice, exitReason) {
   delete State.portfolio.holdings[pairKey];
   delete State.activePositions[pairKey];
 
-  // Set 30-minute cooldown on exited asset to prevent immediate churn
-  State.cooldowns[pairKey] = Date.now() + (30 * 60 * 1000);
+  const cooldownMinutes = State.activeThresholds?.cooldownMinutes || 30;
+  State.cooldowns[pairKey] = Date.now() + (cooldownMinutes * 60 * 1000);
 
   const logEntry = {
     id: Date.now(),
@@ -481,11 +590,26 @@ function settlePosition(pairKey, exitType, exitPrice, exitReason) {
 // -------------------------------------------------------------
 async function monitorOpenPositionsHealth() {
   const openKeys = Object.keys(State.activePositions);
-  if (openKeys.length === 0) return;
+  State.subsystems.predictiveSentry.lastMonitorTick = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  State.subsystems.predictiveSentry.activePositionsMonitored = openKeys.length;
+
+  let trailingCount = 0;
+  let highDecayCount = 0;
+
+  if (openKeys.length === 0) {
+    State.subsystems.predictiveSentry.trailingLocksActive = 0;
+    State.subsystems.predictiveSentry.highDecayAlerts = 0;
+    State.subsystems.predictiveSentry.status = 'WATCHING';
+    return;
+  }
+
+  State.subsystems.predictiveSentry.status = 'ACTIVE_MONITORING';
 
   for (const sym of openKeys) {
     const pos = State.activePositions[sym];
     if (!pos) continue;
+
+    if (pos.isTrailingActive) trailingCount++;
 
     const livePrice = State.universe[sym]?.priceINR || pos.entryPrice;
     const gainPct = ((livePrice - pos.entryPrice) / pos.entryPrice) * 100;
@@ -532,6 +656,8 @@ async function monitorOpenPositionsHealth() {
     pos.decayRisk = Math.min(100, decay);
     pos.predictiveStatus = pos.decayRisk >= 45 ? 'EXITING' : (pos.decayRisk >= 25 ? 'CAUTION' : 'SAFE');
 
+    if (pos.decayRisk >= 40) highDecayCount++;
+
     // Fast Micro-Cut: If trade slips to -0.20% and decay is elevated (>= 40%), cut early
     if (gainPct <= -0.20 && pos.decayRisk >= 40) {
       settlePosition(sym, 'PREDICTIVE SL', livePrice, `Early loss mitigation at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
@@ -544,6 +670,9 @@ async function monitorOpenPositionsHealth() {
       continue;
     }
   }
+
+  State.subsystems.predictiveSentry.trailingLocksActive = trailingCount;
+  State.subsystems.predictiveSentry.highDecayAlerts = highDecayCount;
 }
 
 // -------------------------------------------------------------
@@ -568,6 +697,11 @@ async function syncLiveBinancePrices() {
 
     State.warmupCycles++;
     await monitorOpenPositionsHealth();
+    
+    // Update live countdown to next screener pass
+    const remainingSec = Math.max(0, Math.round((nextScreenerTargetTimestamp - Date.now()) / 1000));
+    State.subsystems.screener.nextRunCountdownSec = remainingSec;
+
     broadcastPricesOnly();
   } catch (e) {
     console.error('[Price Sync Error]', e.message);
@@ -586,6 +720,8 @@ function broadcastState() {
     tradeLogs: State.tradeLogs.slice(0, 100),
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
+    activeThresholds: State.activeThresholds,
+    subsystems: State.subsystems,
     usdtToInrRate: State.usdtToInrRate
   });
 
@@ -616,6 +752,8 @@ function broadcastPricesOnly() {
     portfolio: State.portfolio,
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
+    activeThresholds: State.activeThresholds,
+    subsystems: State.subsystems,
     syncTime: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   });
 
@@ -635,6 +773,8 @@ wss.on('connection', ws => {
     tradeLogs: State.tradeLogs.slice(0, 100),
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
+    activeThresholds: State.activeThresholds,
+    subsystems: State.subsystems,
     usdtToInrRate: State.usdtToInrRate
   }));
 
@@ -664,19 +804,28 @@ app.get('/api/state', (req, res) => {
     tradeLogs: State.tradeLogs.slice(0, 100),
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
+    activeThresholds: State.activeThresholds,
+    subsystems: State.subsystems,
     usdtToInrRate: State.usdtToInrRate
   });
 });
 
 app.get('/api/screener/run', async (req, res) => {
   await runDynamicMarketScreener();
-  res.json({ success: true, universeCount: Object.keys(State.universe).length, universe: State.universe });
+  res.json({ 
+    success: true, 
+    universeCount: Object.keys(State.universe).length, 
+    subsystem: State.subsystems.screener,
+    universe: State.universe 
+  });
 });
 
 app.get('/api/quant/audit', (req, res) => {
   res.json({
     engine: State.quantTelemetry.engine,
     marketRegime: State.marketRegime,
+    activeThresholds: State.activeThresholds,
+    subsystems: State.subsystems,
     activePositionsCount: Object.keys(State.activePositions).length,
     cooldowns: State.cooldowns,
     sampleAsset: Object.values(State.universe)[0] || null
@@ -691,13 +840,9 @@ app.get('/healthz', (req, res) => res.status(200).send('OK'));
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Quant Server] Running on port ${PORT}`);
 
-  // 1. Dynamic Market Screener: runs 3s after boot, then every 3 minutes
   setTimeout(runDynamicMarketScreener, 3000);
   setInterval(runDynamicMarketScreener, 3 * 60 * 1000);
 
-  // 2. Pure Quant Scoring Engine: runs every 15 seconds
   setInterval(runPureQuantScoring, 15 * 1000);
-
-  // 3. Live Binance Price Polling & Position Risk Health: runs every 2.5 seconds
   setInterval(syncLiveBinancePrices, 2500);
 });
