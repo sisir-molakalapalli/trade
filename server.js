@@ -329,13 +329,14 @@ async function runDynamicMarketScreener() {
       const highPrice = parseFloat(t.highPrice) || 0;
       const lowPrice = parseFloat(t.lowPrice) || 0;
 
-      // Minimum liquidity filter: $15M turnover
-      if (quoteVol >= 15000000 && lastPrice > 0 && highPrice > lowPrice) {
+      // Calibrated liquidity floor: $8M (Allows ATOM, DASH, and dynamic alts while guarding slippage)
+      if (quoteVol >= 8000000 && lastPrice > 0 && highPrice > lowPrice) {
         const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
         const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
 
+        // Directional momentum with proximity boost for upper-range consolidations
         const directionalMomentum = Math.max(0, priceChangePct);
-        const breakoutScore = (directionalMomentum * 3.0) + (Math.log10(quoteVol) * 2.0) + (pricePositionInRange * 5.0);
+        const breakoutScore = (directionalMomentum * 3.5) + (Math.log10(quoteVol) * 1.8) + (pricePositionInRange * 6.0);
 
         candidates.push({
           symbol: t.symbol,
@@ -565,6 +566,21 @@ function settlePosition(pairKey, exitType, exitPrice, exitReason) {
   const cooldownMinutes = State.activeThresholds?.cooldownMinutes || 30;
   State.cooldowns[pairKey] = Date.now() + (cooldownMinutes * 60 * 1000);
 
+  // Accurate IST (Indian Standard Time, Asia/Kolkata) formatting
+  const istTime = new Date().toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true
+  });
+  const istDate = new Date().toLocaleDateString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric'
+  });
+
   const logEntry = {
     id: Date.now(),
     type: exitType,
@@ -573,14 +589,14 @@ function settlePosition(pairKey, exitType, exitPrice, exitReason) {
     exitPrice,
     pnlINR: pnl,
     reason: exitReason,
-    time: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    date: new Date().toLocaleDateString('en-IN')
+    time: istTime,
+    date: istDate
   };
 
   State.tradeLogs.unshift(logEntry);
   if (State.tradeLogs.length > 500) State.tradeLogs.pop();
 
-  console.log(`[POSITION EXIT] ${pairKey} via ${exitType} | PnL: ₹${Math.round(pnl)} | ${exitReason}`);
+  console.log(`[POSITION EXIT] ${pairKey} via ${exitType} | PnL: ₹${Math.round(pnl)} | ${exitReason} | Time: ${istTime}`);
   saveStateToDisk();
   broadcastState();
 }
@@ -590,7 +606,7 @@ function settlePosition(pairKey, exitType, exitPrice, exitReason) {
 // -------------------------------------------------------------
 async function monitorOpenPositionsHealth() {
   const openKeys = Object.keys(State.activePositions);
-  State.subsystems.predictiveSentry.lastMonitorTick = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  State.subsystems.predictiveSentry.lastMonitorTick = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
   State.subsystems.predictiveSentry.activePositionsMonitored = openKeys.length;
 
   let trailingCount = 0;
