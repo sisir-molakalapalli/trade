@@ -226,6 +226,15 @@ async function fetchRealOrderBookDepth(symbol) {
   return null;
 }
 
+// Precision helper for sub-cent meme tokens (PEPE, SHIB, FLOKI, BONK)
+function calculateAccurateINRPrice(usdtPrice, rate) {
+  const rawINR = usdtPrice * rate;
+  if (rawINR >= 100) return Math.round(rawINR * 100) / 100;
+  if (rawINR >= 1) return Math.round(rawINR * 10000) / 10000;
+  if (rawINR >= 0.001) return Math.round(rawINR * 1000000) / 1000000;
+  return Number(rawINR.toFixed(8));
+}
+
 // -------------------------------------------------------------
 // VOLATILITY REGIME DETECTOR (Responsive & Adaptive)
 // -------------------------------------------------------------
@@ -342,7 +351,7 @@ async function runDynamicMarketScreener() {
           symbol: t.symbol,
           baseAsset: base,
           priceUSDT: lastPrice,
-          priceINR: Math.round(lastPrice * State.usdtToInrRate * 100) / 100,
+          priceINR: calculateAccurateINRPrice(lastPrice, State.usdtToInrRate),
           priceChangePct,
           intradayRangePct,
           pricePositionInRange,
@@ -468,7 +477,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
   const currentCount = Object.keys(State.activePositions).length;
   if (currentCount >= 3) return; // Max 3 concurrent positions
   if (State.portfolio.cashINR < 3500) return; // Min cash buffer
-  if (State.warmupCycles < 2) return; // Guard against stale startup data
+  if (State.warmupCycles < 1) return; // Warmup pass
 
   const config = regimeConfig || calculateMarketVolatilityRegime();
 
@@ -483,25 +492,50 @@ async function evaluateAutopilotEntries(regimeConfig) {
     // Cooldown check
     if (State.cooldowns[sym]) {
       const remaining = State.cooldowns[sym] - Date.now();
-      if (remaining > 0) continue;
+      if (remaining > 0) {
+        continue;
+      }
       delete State.cooldowns[sym];
     }
 
-    // Gate 1: Adaptive Score Threshold (Dynamically 82, 85, or 88 based on volatility)
-    if (coin.score < config.scoreThreshold) continue;
+    // Gate 1: Adaptive Score Threshold
+    if (coin.score < config.scoreThreshold) {
+      continue;
+    }
 
     // Gate 2: Microstructure Order Book Inspection
     const book = await fetchRealOrderBookDepth(sym);
-    if (!book) continue;
+    if (!book) {
+      console.log(`[Autopilot Gate] ${sym} failed: orderbook depth unavailable.`);
+      continue;
+    }
 
-    // Gate 3: Adaptive OBI Gate (Dynamically 54%, 56%, or 58% based on volatility)
-    if (book.obi < config.obiThreshold) continue;
+    // Gate 3: Adaptive OBI Gate
+    if (book.obi < config.obiThreshold) {
+      console.log(`[Autopilot Gate] ${sym} failed OBI Gate: ${(book.obi * 100).toFixed(1)}% < ${(config.obiThreshold * 100).toFixed(0)}%`);
+      continue;
+    }
 
-    // Gate 4: Spread Ceiling Guard
-    if (book.spreadPct > config.maxSpread) continue;
+    // Gate 4: Spread Ceiling Guard (Adaptive for sub-penny micro assets like PEPE)
+    const isMicroAsset = (coin.priceUSDT && coin.priceUSDT < 0.01);
+    const allowedSpread = isMicroAsset ? Math.max(config.maxSpread, 0.22) : config.maxSpread;
+    
+    if (book.spreadPct > allowedSpread) {
+      console.log(`[Autopilot Gate] ${sym} failed Spread Guard: ${book.spreadPct.toFixed(3)}% > Max ${allowedSpread}%`);
+      continue;
+    }
 
-    // Gate 5: Price verification fresh within 10 seconds
-    if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 10000) continue;
+    // Gate 5: Price sanity & verification
+    if (!coin.priceINR || coin.priceINR <= 0) {
+      console.log(`[Autopilot Gate] ${sym} failed: Invalid priceINR (${coin.priceINR})`);
+      continue;
+    }
+
+    // Price verification freshness: 30 seconds buffer
+    if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) {
+      console.log(`[Autopilot Gate] ${sym} failed: Price tick stale (${Date.now() - (coin.verifiedAt || 0)}ms old)`);
+      continue;
+    }
 
     // Confluence Pass -> Execute Buy
     executeSimulatedBuy(sym, coin.priceINR, `Adaptive Confluence (${config.regime}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%)`);
@@ -706,7 +740,7 @@ async function syncLiveBinancePrices() {
       if (priceMap[sym]) {
         const usdt = priceMap[sym];
         State.universe[sym].priceUSDT = usdt;
-        State.universe[sym].priceINR = Math.round(usdt * State.usdtToInrRate * 100) / 100;
+        State.universe[sym].priceINR = calculateAccurateINRPrice(usdt, State.usdtToInrRate);
         State.universe[sym].verifiedAt = Date.now();
       }
     });
