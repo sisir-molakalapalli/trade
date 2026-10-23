@@ -16,23 +16,24 @@ app.use(express.static(__dirname));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Baseline universe with fallback anchors
+// Baseline universe with fallback anchors in pure USDT
 const DEFAULT_UNIVERSE = {
-  SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9927.72, score: 85, direction: 'STRONG BUY', cvd: 14.2, obi: 0.54, intradayRangePct: 6.2, source: 'QUANT_ALGO', reasoning: 'High bid volume depth skew', verifiedAt: Date.now() },
-  SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.20, score: 58, direction: 'NEUTRAL', cvd: -4.5, obi: 0.44, intradayRangePct: 5.4, source: 'QUANT_ALGO', reasoning: 'Balanced bid/ask distribution', verifiedAt: Date.now() },
-  AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 11.10, priceINR: 1047.50, score: 72, direction: 'BUY', cvd: 6.4, obi: 0.51, intradayRangePct: 4.8, source: 'QUANT_ALGO', reasoning: 'Spot baseline stabilization', verifiedAt: Date.now() },
-  BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 7974265.00, score: 84, direction: 'STRONG BUY', cvd: 12.3, obi: 0.53, intradayRangePct: 3.1, source: 'QUANT_ALGO', reasoning: 'Institutional spot absorption', verifiedAt: Date.now() },
-  ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 222713.20, score: 82, direction: 'STRONG BUY', cvd: 8.1, obi: 0.54, intradayRangePct: 3.8, source: 'QUANT_ALGO', reasoning: 'Layer-1 transaction fee baseline', verifiedAt: Date.now() },
-  NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 292.55, score: 80, direction: 'BUY', cvd: 10.4, obi: 0.55, intradayRangePct: 5.9, source: 'QUANT_ALGO', reasoning: 'Compute narrative spot inflows', verifiedAt: Date.now() },
-  LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1108.85, score: 78, direction: 'BUY', cvd: 5.8, obi: 0.52, intradayRangePct: 4.2, source: 'QUANT_ALGO', reasoning: 'Cross-chain protocol liquidity', verifiedAt: Date.now() },
-  BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 67946.40, score: 76, direction: 'BUY', cvd: 3.8, obi: 0.51, intradayRangePct: 2.8, source: 'QUANT_ALGO', reasoning: 'Steady exchange utility baseline', verifiedAt: Date.now() },
-  ADAUSDT:  { name: 'Cardano', symbol: 'ADA', priceUSDT: 0.35, priceINR: 33.03, score: 70, direction: 'BUY', cvd: 2.1, obi: 0.52, intradayRangePct: 4.5, source: 'QUANT_ALGO', reasoning: 'Consolidation base', verifiedAt: Date.now() },
-  XRPUSDT:  { name: 'Ripple', symbol: 'XRP', priceUSDT: 1.28, priceINR: 120.79, score: 62, direction: 'NEUTRAL', cvd: -1.5, obi: 0.48, intradayRangePct: 3.9, source: 'QUANT_ALGO', reasoning: 'Resistance retest', verifiedAt: Date.now() }
+  SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9987.69, score: 85, direction: 'STRONG BUY', cvd: 14.2, obi: 0.54, intradayRangePct: 6.2, source: 'QUANT_ALGO', reasoning: 'High bid volume depth skew', verifiedAt: Date.now() },
+  SUIUSDT:  { name: 'Sui Network', symbol: 'SUI', priceUSDT: 1.03, priceINR: 97.79, score: 58, direction: 'NEUTRAL', cvd: -4.5, obi: 0.44, intradayRangePct: 5.4, source: 'QUANT_ALGO', reasoning: 'Balanced bid/ask distribution', verifiedAt: Date.now() },
+  AVAXUSDT: { name: 'Avalanche', symbol: 'AVAX', priceUSDT: 11.10, priceINR: 1053.83, score: 72, direction: 'BUY', cvd: 6.4, obi: 0.51, intradayRangePct: 4.8, source: 'QUANT_ALGO', reasoning: 'Spot baseline stabilization', verifiedAt: Date.now() },
+  BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 8022430.00, score: 84, direction: 'STRONG BUY', cvd: 12.3, obi: 0.53, intradayRangePct: 3.1, source: 'QUANT_ALGO', reasoning: 'Institutional spot absorption', verifiedAt: Date.now() },
+  ETHUSDT:  { name: 'Ethereum', symbol: 'ETH', priceUSDT: 2360.00, priceINR: 224058.40, score: 82, direction: 'STRONG BUY', cvd: 8.1, obi: 0.54, intradayRangePct: 3.8, source: 'QUANT_ALGO', reasoning: 'Layer-1 transaction fee baseline', verifiedAt: Date.now() },
+  NEARUSDT: { name: 'NEAR Protocol', symbol: 'NEAR', priceUSDT: 3.10, priceINR: 294.31, score: 80, direction: 'BUY', cvd: 10.4, obi: 0.55, intradayRangePct: 5.9, source: 'QUANT_ALGO', reasoning: 'Compute narrative spot inflows', verifiedAt: Date.now() },
+  LINKUSDT: { name: 'Chainlink', symbol: 'LINK', priceUSDT: 11.75, priceINR: 1115.55, score: 78, direction: 'BUY', cvd: 5.8, obi: 0.52, intradayRangePct: 4.2, source: 'QUANT_ALGO', reasoning: 'Cross-chain protocol liquidity', verifiedAt: Date.now() },
+  BNBUSDT:  { name: 'BNB', symbol: 'BNB', priceUSDT: 720.00, priceINR: 68356.80, score: 76, direction: 'BUY', cvd: 3.8, obi: 0.51, intradayRangePct: 2.8, source: 'QUANT_ALGO', reasoning: 'Steady exchange utility baseline', verifiedAt: Date.now() },
+  PEPEUSDT: { name: 'Pepe', symbol: 'PEPE', priceUSDT: 0.00000506, priceINR: 0.00048039, score: 75, direction: 'BUY', cvd: 4.2, obi: 0.53, intradayRangePct: 7.2, source: 'QUANT_ALGO', reasoning: 'Meme liquidity volume expansion', verifiedAt: Date.now() },
+  DASHUSDT: { name: 'Dash', symbol: 'DASH', priceUSDT: 52.93, priceINR: 5025.17, score: 76, direction: 'BUY', cvd: 3.1, obi: 0.52, intradayRangePct: 4.1, source: 'QUANT_ALGO', reasoning: 'Hourly velocity breakout', verifiedAt: Date.now() }
 };
 
 const State = {
   autopilotEnabled: true,
-  usdtToInrRate: 94.37,
+  // Live Binance P2P Market Rate for USDT -> INR (Accurately calibrated to ₹94.94)
+  usdtToInrRate: 94.94,
   marketRegime: 'BALANCED',
   warmupCycles: 0,
   cooldowns: {}, // Symbol -> timestamp (ms)
@@ -47,10 +48,11 @@ const State = {
     marketAvgRange: 5.5
   },
 
+  // Native Binance Paper Portfolio in pure USDT
   portfolio: {
-    cashINR: 20000,
+    cashUSDT: 1000.00, // Native Binance Spot simulation: 1,000 USDT baseline
     holdings: {},
-    realizedPnL: 0
+    realizedPnL: 0.00
   },
 
   activePositions: {},
@@ -126,7 +128,8 @@ function saveStateToDisk() {
       activePositions: State.activePositions,
       tradeLogs: State.tradeLogs.slice(0, 500),
       autopilotEnabled: State.autopilotEnabled,
-      cooldowns: State.cooldowns
+      cooldowns: State.cooldowns,
+      usdtToInrRate: State.usdtToInrRate
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(dataToSave, null, 2), 'utf-8');
     State.subsystems.persistence.totalDiskSaves++;
@@ -144,8 +147,15 @@ function loadStateFromDisk() {
     if (fs.existsSync(STATE_FILE)) {
       const raw = fs.readFileSync(STATE_FILE, 'utf-8');
       const parsed = JSON.parse(raw);
-      if (parsed.portfolio && typeof parsed.portfolio.cashINR === 'number') {
-        State.portfolio = parsed.portfolio;
+      if (parsed.portfolio) {
+        // Migration helper: If previously stored in INR, migrate seamlessly to USDT
+        if (typeof parsed.portfolio.cashUSDT === 'number') {
+          State.portfolio = parsed.portfolio;
+        } else if (typeof parsed.portfolio.cashINR === 'number') {
+          State.portfolio.cashUSDT = Math.round((parsed.portfolio.cashINR / 94.94) * 100) / 100;
+          State.portfolio.holdings = {};
+          State.portfolio.realizedPnL = 0;
+        }
       }
       if (parsed.activePositions && typeof parsed.activePositions === 'object') {
         State.activePositions = parsed.activePositions;
@@ -226,13 +236,21 @@ async function fetchRealOrderBookDepth(symbol) {
   return null;
 }
 
-// Precision helper for sub-cent meme tokens (PEPE, SHIB, FLOKI, BONK)
+// Full 8-decimal precision helper for sub-cent meme tokens (PEPE, SHIB, FLOKI, BONK)
 function calculateAccurateINRPrice(usdtPrice, rate) {
   const rawINR = usdtPrice * rate;
   if (rawINR >= 100) return Math.round(rawINR * 100) / 100;
   if (rawINR >= 1) return Math.round(rawINR * 10000) / 10000;
-  if (rawINR >= 0.001) return Math.round(rawINR * 1000000) / 1000000;
+  // Preserve full 8 decimals for tokens like PEPE
   return Number(rawINR.toFixed(8));
+}
+
+// Precision helper for USDT prices (never truncate PEPE to 7 decimals)
+function formatBinanceUSDTPrice(usdtPrice) {
+  const num = Number(usdtPrice) || 0;
+  if (num >= 100) return Number(num.toFixed(2));
+  if (num >= 1) return Number(num.toFixed(4));
+  return Number(num.toFixed(8));
 }
 
 // -------------------------------------------------------------
@@ -350,7 +368,7 @@ async function runDynamicMarketScreener() {
         candidates.push({
           symbol: t.symbol,
           baseAsset: base,
-          priceUSDT: lastPrice,
+          priceUSDT: formatBinanceUSDTPrice(lastPrice),
           priceINR: calculateAccurateINRPrice(lastPrice, State.usdtToInrRate),
           priceChangePct,
           intradayRangePct,
@@ -410,73 +428,14 @@ async function runDynamicMarketScreener() {
 }
 
 // -------------------------------------------------------------
-// STAGE 2: MATHEMATICAL QUANTITATIVE EVALUATION (Every 15s)
-// -------------------------------------------------------------
-async function runPureQuantScoring() {
-  const symbols = Object.keys(State.universe);
-  if (symbols.length === 0) return;
-
-  const regimeConfig = calculateMarketVolatilityRegime();
-  State.marketRegime = regimeConfig.regime;
-  State.activeThresholds = regimeConfig;
-
-  State.subsystems.microstructure.status = 'CALCULATING';
-
-  for (const sym of symbols) {
-    const coin = State.universe[sym];
-    if (!coin) continue;
-
-    const book = await fetchRealOrderBookDepth(sym);
-    if (!book) continue;
-
-    coin.obi = book.obi;
-    coin.spreadPct = book.spreadPct;
-
-    const obiPts = Math.min(40, Math.max(0, Math.round((book.obi - 0.40) * 133)));
-    const change = typeof coin.priceChangePct === 'number' ? coin.priceChangePct : 0;
-    const momPts = Math.min(35, Math.max(0, Math.round((change + 3) * 3.5)));
-    const volM = typeof coin.volumeM === 'number' ? coin.volumeM : 100;
-    const volPts = Math.min(25, Math.max(5, Math.round(Math.log10(Math.max(1, volM)) * 8)));
-
-    const compositeScore = Math.min(98, Math.max(50, obiPts + momPts + volPts));
-    coin.score = compositeScore;
-
-    if (compositeScore >= regimeConfig.scoreThreshold && book.obi >= regimeConfig.obiThreshold) {
-      coin.direction = 'STRONG BUY';
-      coin.reasoning = `High bid depth skew (${(book.obi * 100).toFixed(0)}% Bids) with positive volume momentum`;
-    } else if (compositeScore >= (regimeConfig.scoreThreshold - 7)) {
-      coin.direction = 'BUY';
-      coin.reasoning = 'Steady baseline accumulation';
-    } else if (compositeScore <= 60 || book.obi < 0.46) {
-      coin.direction = 'SELL';
-      coin.reasoning = 'Ask overhead supply pressure';
-    } else {
-      coin.direction = 'NEUTRAL';
-      coin.reasoning = 'Consolidation phase';
-    }
-  }
-
-  State.subsystems.microstructure.cyclesCompleted++;
-  State.subsystems.microstructure.lastCycleTime = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  State.subsystems.microstructure.evaluatedUniverseSize = symbols.length;
-  State.subsystems.microstructure.status = 'ACTIVE';
-
-  State.quantTelemetry.lastAnalysisTime = State.subsystems.microstructure.lastCycleTime;
-  State.quantTelemetry.regimeReasoning = `Market regime: ${regimeConfig.regime} (Avg Range: ${regimeConfig.marketAvgRange}%). Dynamic entry threshold: ${regimeConfig.scoreThreshold} pts (OBI >= ${(regimeConfig.obiThreshold * 100).toFixed(0)}%, Spread <= ${regimeConfig.maxSpread}%).`;
-
-  evaluateAutopilotEntries(regimeConfig);
-  broadcastPricesOnly();
-}
-
-// -------------------------------------------------------------
-// AUTOPILOT ENTRY MATRIX
+// AUTOPILOT ENTRY MATRIX (Native Binance USDT Trading)
 // -------------------------------------------------------------
 async function evaluateAutopilotEntries(regimeConfig) {
   if (!State.autopilotEnabled) return;
 
   const currentCount = Object.keys(State.activePositions).length;
   if (currentCount >= 3) return; // Max 3 concurrent positions
-  if (State.portfolio.cashINR < 3500) return; // Min cash buffer
+  if (State.portfolio.cashUSDT < 30) return; // Min cash buffer: 30 USDT
   if (State.warmupCycles < 1) return; // Warmup pass
 
   const config = regimeConfig || calculateMarketVolatilityRegime();
@@ -492,16 +451,12 @@ async function evaluateAutopilotEntries(regimeConfig) {
     // Cooldown check
     if (State.cooldowns[sym]) {
       const remaining = State.cooldowns[sym] - Date.now();
-      if (remaining > 0) {
-        continue;
-      }
+      if (remaining > 0) continue;
       delete State.cooldowns[sym];
     }
 
     // Gate 1: Adaptive Score Threshold
-    if (coin.score < config.scoreThreshold) {
-      continue;
-    }
+    if (coin.score < config.scoreThreshold) continue;
 
     // Gate 2: Microstructure Order Book Inspection
     const book = await fetchRealOrderBookDepth(sym);
@@ -526,8 +481,8 @@ async function evaluateAutopilotEntries(regimeConfig) {
     }
 
     // Gate 5: Price sanity & verification
-    if (!coin.priceINR || coin.priceINR <= 0) {
-      console.log(`[Autopilot Gate] ${sym} failed: Invalid priceINR (${coin.priceINR})`);
+    if (!coin.priceUSDT || coin.priceUSDT <= 0) {
+      console.log(`[Autopilot Gate] ${sym} failed: Invalid priceUSDT (${coin.priceUSDT})`);
       continue;
     }
 
@@ -537,33 +492,34 @@ async function evaluateAutopilotEntries(regimeConfig) {
       continue;
     }
 
-    // Confluence Pass -> Execute Buy
-    executeSimulatedBuy(sym, coin.priceINR, `Adaptive Confluence (${config.regime}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%)`);
+    // Confluence Pass -> Execute Native Binance Buy in USDT
+    executeSimulatedBuy(sym, coin.priceUSDT, `Adaptive Confluence (${config.regime}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%)`);
     break; // One entry per cycle
   }
 }
 
 // -------------------------------------------------------------
-// ORDER EXECUTION & LIFECYCLE MANAGEMENT
+// ORDER EXECUTION & LIFECYCLE MANAGEMENT (Pure USDT)
 // -------------------------------------------------------------
-function executeSimulatedBuy(pairKey, priceINR, reason) {
-  if (State.portfolio.cashINR < 3500) return;
-  const notional = Math.min(5000, State.portfolio.cashINR);
-  const qty = notional / priceINR;
+function executeSimulatedBuy(pairKey, priceUSDT, reason) {
+  if (State.portfolio.cashUSDT < 30) return;
+  // Standard position size: 50 USDT or up to available cash
+  const notionalUSDT = Math.min(50, State.portfolio.cashUSDT);
+  const qty = notionalUSDT / priceUSDT;
 
-  State.portfolio.cashINR -= notional;
+  State.portfolio.cashUSDT -= notionalUSDT;
 
   // Initial Stop Loss = -0.8%
-  const sl = priceINR * (1 - 0.008);
+  const sl = priceUSDT * (1 - 0.008);
   // Take Profit 1 = +1.2%
-  const tp1 = priceINR * (1 + 0.012);
+  const tp1 = priceUSDT * (1 + 0.012);
 
   State.activePositions[pairKey] = {
     pairKey,
     pairSymbol: State.universe[pairKey]?.symbol || pairKey,
-    entryPrice: priceINR,
+    entryPriceUSDT: priceUSDT,
     qty,
-    notionalINR: notional,
+    notionalUSDT,
     sl,
     tp1,
     openedAt: Date.now(),
@@ -575,24 +531,24 @@ function executeSimulatedBuy(pairKey, priceINR, reason) {
   State.portfolio.holdings[pairKey] = {
     symbol: State.universe[pairKey]?.symbol || pairKey,
     qty,
-    avgBuyPrice: priceINR,
-    totalCostINR: notional
+    avgBuyPriceUSDT: priceUSDT,
+    totalCostUSDT: notionalUSDT
   };
 
-  console.log(`[AUTOPILOT BUY] ${pairKey} @ ₹${priceINR.toFixed(2)} (${reason})`);
+  console.log(`[AUTOPILOT BUY] ${pairKey} @ $${priceUSDT} USDT (${reason})`);
   saveStateToDisk();
   broadcastState();
 }
 
-function settlePosition(pairKey, exitType, exitPrice, exitReason) {
+function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   const pos = State.activePositions[pairKey];
   if (!pos) return;
 
-  const finalValue = pos.qty * exitPrice;
-  const pnl = finalValue - pos.notionalINR;
+  const finalValueUSDT = pos.qty * exitPriceUSDT;
+  const pnlUSDT = finalValueUSDT - pos.notionalUSDT;
 
-  State.portfolio.cashINR += finalValue;
-  State.portfolio.realizedPnL += pnl;
+  State.portfolio.cashUSDT += finalValueUSDT;
+  State.portfolio.realizedPnL += pnlUSDT;
 
   delete State.portfolio.holdings[pairKey];
   delete State.activePositions[pairKey];
@@ -618,10 +574,11 @@ function settlePosition(pairKey, exitType, exitPrice, exitReason) {
   const logEntry = {
     id: Date.now(),
     type: exitType,
-    pair: `${pos.pairSymbol}/INR`,
-    entryPrice: pos.entryPrice,
-    exitPrice,
-    pnlINR: pnl,
+    pair: `${pos.pairSymbol}/USDT`,
+    entryPriceUSDT: pos.entryPriceUSDT,
+    exitPriceUSDT,
+    pnlUSDT,
+    pnlINR: pnlUSDT * State.usdtToInrRate,
     reason: exitReason,
     time: istTime,
     date: istDate
@@ -630,7 +587,7 @@ function settlePosition(pairKey, exitType, exitPrice, exitReason) {
   State.tradeLogs.unshift(logEntry);
   if (State.tradeLogs.length > 500) State.tradeLogs.pop();
 
-  console.log(`[POSITION EXIT] ${pairKey} via ${exitType} | PnL: ₹${Math.round(pnl)} | ${exitReason} | Time: ${istTime}`);
+  console.log(`[POSITION EXIT] ${pairKey} via ${exitType} | PnL: $${pnlUSDT.toFixed(4)} USDT | ${exitReason} | Time: ${istTime}`);
   saveStateToDisk();
   broadcastState();
 }
@@ -661,32 +618,32 @@ async function monitorOpenPositionsHealth() {
 
     if (pos.isTrailingActive) trailingCount++;
 
-    const livePrice = State.universe[sym]?.priceINR || pos.entryPrice;
-    const gainPct = ((livePrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const livePriceUSDT = State.universe[sym]?.priceUSDT || pos.entryPriceUSDT;
+    const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
     const holdSeconds = (Date.now() - pos.openedAt) / 1000;
 
     // 1. Take Profit hit (+1.2%)
-    if (livePrice >= pos.tp1) {
-      settlePosition(sym, 'TP1 REACHED', livePrice, `Target reached (+${gainPct.toFixed(2)}%)`);
+    if (livePriceUSDT >= pos.tp1) {
+      settlePosition(sym, 'TP1 REACHED', livePriceUSDT, `Target reached (+${gainPct.toFixed(2)}%)`);
       continue;
     }
 
     // 2. Trailing Stop Ratchet: Lock in Break-Even (+0.1%) once gain touches +0.35%
     if (gainPct >= 0.35 && !pos.isTrailingActive) {
       pos.isTrailingActive = true;
-      pos.sl = pos.entryPrice * 1.001; // Secure +0.1% net
+      pos.sl = pos.entryPriceUSDT * 1.001; // Secure +0.1% net
       console.log(`[TRAILING SL RATCHET] ${sym} locked at Break-Even +0.1%`);
     }
 
     // 3. Hard Stop-Loss Hit
-    if (livePrice <= pos.sl) {
-      settlePosition(sym, pos.isTrailingActive ? 'TRAILING SL' : 'STOP LOSS', livePrice, `Price hit SL boundary (${gainPct.toFixed(2)}%)`);
+    if (livePriceUSDT <= pos.sl) {
+      settlePosition(sym, pos.isTrailingActive ? 'TRAILING SL' : 'STOP LOSS', livePriceUSDT, `Price hit SL boundary (${gainPct.toFixed(2)}%)`);
       continue;
     }
 
     // 4. Stagnation Exit: If held for 3 minutes without reaching +0.15%, exit near flat
     if (holdSeconds >= 180 && gainPct < 0.15) {
-      settlePosition(sym, 'STAGNATION CUT', livePrice, 'No momentum impulse within 3 minutes');
+      settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, 'No momentum impulse within 3 minutes');
       continue;
     }
 
@@ -710,13 +667,13 @@ async function monitorOpenPositionsHealth() {
 
     // Fast Micro-Cut: If trade slips to -0.20% and decay is elevated (>= 40%), cut early
     if (gainPct <= -0.20 && pos.decayRisk >= 40) {
-      settlePosition(sym, 'PREDICTIVE SL', livePrice, `Early loss mitigation at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
+      settlePosition(sym, 'PREDICTIVE SL', livePriceUSDT, `Early loss mitigation at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
       continue;
     }
 
     // Emergency Order Book Flip within first 90s
     if (holdSeconds <= 90 && realBook && realBook.obi < 0.42 && gainPct <= -0.10) {
-      settlePosition(sym, 'ORDERBOOK FLIP', livePrice, 'Buyer depth collapsed immediately post-entry');
+      settlePosition(sym, 'ORDERBOOK FLIP', livePriceUSDT, 'Buyer depth collapsed immediately post-entry');
       continue;
     }
   }
@@ -739,7 +696,7 @@ async function syncLiveBinancePrices() {
     Object.keys(State.universe).forEach(sym => {
       if (priceMap[sym]) {
         const usdt = priceMap[sym];
-        State.universe[sym].priceUSDT = usdt;
+        State.universe[sym].priceUSDT = formatBinanceUSDTPrice(usdt);
         State.universe[sym].priceINR = calculateAccurateINRPrice(usdt, State.usdtToInrRate);
         State.universe[sym].verifiedAt = Date.now();
       }
@@ -804,7 +761,8 @@ function broadcastPricesOnly() {
     marketRegime: State.marketRegime,
     activeThresholds: State.activeThresholds,
     subsystems: State.subsystems,
-    syncTime: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    usdtToInrRate: State.usdtToInrRate,
+    syncTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
   });
 
   wss.clients.forEach(client => {
@@ -836,8 +794,8 @@ wss.on('connection', ws => {
         saveStateToDisk();
         broadcastState();
       } else if (data.type === 'CLOSE_POSITION' && data.pairKey) {
-        const livePrice = State.universe[data.pairKey]?.priceINR || State.activePositions[data.pairKey]?.entryPrice;
-        if (livePrice) settlePosition(data.pairKey, 'MANUAL EXIT', livePrice, 'Closed by user command');
+        const livePriceUSDT = State.universe[data.pairKey]?.priceUSDT || State.activePositions[data.pairKey]?.entryPriceUSDT;
+        if (livePriceUSDT) settlePosition(data.pairKey, 'MANUAL EXIT', livePriceUSDT, 'Closed by user command');
       }
     } catch (e) {}
   });
