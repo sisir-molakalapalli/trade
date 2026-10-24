@@ -558,6 +558,9 @@ async function runDynamicMarketScreener() {
     const candidates = [];
     const activeSymbols = Object.keys(State.activePositions);
 
+    // Current regime determines the volume floor
+    const isCompression = (State.marketRegime === 'COMPRESSION');
+
     for (const t of tickers) {
       if (!t.symbol.endsWith('USDT')) continue;
       const base = t.symbol.replace('USDT', '');
@@ -569,15 +572,19 @@ async function runDynamicMarketScreener() {
       const highPrice = parseFloat(t.highPrice) || 0;
       const lowPrice = parseFloat(t.lowPrice) || 0;
 
-      let requiredFloor = 18000000;
-      if (priceChangePct >= 5.0) requiredFloor = 8000000;
-      else if (priceChangePct >= 2.0) requiredFloor = 12000000;
+      // Dynamic floor adapts to market regime and velocity
+      let requiredFloor = 14000000;
+      if (priceChangePct >= 4.0) requiredFloor = 6000000;
+      else if (priceChangePct >= 1.5) requiredFloor = 9000000;
+      else if (isCompression) requiredFloor = 8000000;
 
       if (quoteVol >= requiredFloor && lastPrice > 0 && highPrice > lowPrice) {
         const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
         const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
 
-        if (pricePositionInRange < 0.60) continue;
+        // In compression regimes, allow coins trading in upper 50% of range
+        const minPositionRatio = isCompression ? 0.50 : 0.58;
+        if (pricePositionInRange < minPositionRatio) continue;
 
         const liquidityDensityScore = Math.min(30, Math.log10(quoteVol) * 3.8);
         const rangeProximityBoost = pricePositionInRange * 15;
@@ -615,8 +622,8 @@ async function runDynamicMarketScreener() {
       p.change1hPct = shortTerm.change1hPct;
       p.change4hPct = shortTerm.change4hPct;
 
-      if (p.change1hPct > 1.5) p.breakoutScore += (p.change1hPct * 1.8);
-      if (p.change4hPct > 4.0) p.breakoutScore += (p.change4hPct * 1.2);
+      if (p.change1hPct > 1.0) p.breakoutScore += (p.change1hPct * 2.0);
+      if (p.change4hPct > 3.0) p.breakoutScore += (p.change4hPct * 1.3);
     }
 
     topPicks.sort((a, b) => b.breakoutScore - a.breakoutScore);
