@@ -427,10 +427,39 @@ function syncRollingTradeQuota() {
   const remaining = Math.max(0, maxAllowed - count);
 
   let resetTimeMin = 0;
+  let formattedReset = 'None Pending';
   if (count > 0) {
     const oldest = Math.min(...State.tradeFrequencyController.rollingTrades24h);
-    resetTimeMin = Math.max(0, Math.round(((oldest + (24 * 60 * 60 * 1000)) - now) / 60000));
+    const msRemaining = Math.max(0, (oldest + (24 * 60 * 60 * 1000)) - now);
+    resetTimeMin = Math.round(msRemaining / 60000);
+    const hrs = Math.floor(resetTimeMin / 60);
+    const mins = resetTimeMin % 60;
+    formattedReset = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
   }
+
+  let circuitBreakerRemainingSec = 0;
+  if (State.tradeFrequencyController.globalCircuitBreakerUntil > now) {
+    circuitBreakerRemainingSec = Math.round((State.tradeFrequencyController.globalCircuitBreakerUntil - now) / 1000);
+    State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
+    State.subsystems.quotaManager.status = 'PAUSED_LOSS_COOLDOWN';
+  } else if (State.marketRegime === 'TURBULENT') {
+    State.tradeFrequencyController.circuitBreakerReason = 'TURBULENT_FREEZE';
+    State.subsystems.quotaManager.status = 'PAUSED_TURBULENCE';
+  } else if (remaining === 0) {
+    State.tradeFrequencyController.circuitBreakerReason = 'QUOTA_EXHAUSTED';
+    State.subsystems.quotaManager.status = 'QUOTA_FILLED';
+  } else {
+    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
+    State.subsystems.quotaManager.status = 'NORMAL';
+  }
+
+  State.subsystems.quotaManager.executed24hCount = count;
+  State.subsystems.quotaManager.maxAllowed = maxAllowed;
+  State.subsystems.quotaManager.quotaRemaining = remaining;
+  State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
+  State.subsystems.quotaManager.formattedReset = formattedReset;
+  State.subsystems.quotaManager.circuitBreakerRemainingSec = circuitBreakerRemainingSec;
+}
 
   if (State.tradeFrequencyController.globalCircuitBreakerUntil > now) {
     State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
@@ -829,52 +858,56 @@ async function monitorOpenPositionsHealth() {
     const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
     const holdSeconds = (Date.now() - pos.openedAt) / 1000;
 
+    // 1. Take Profit 1 Target (+1.60%)
     if (livePriceUSDT >= pos.tp1) {
       settlePosition(sym, 'TP1 REACHED', livePriceUSDT, `Target reached (+${gainPct.toFixed(2)}%)`);
       continue;
     }
 
+    // 2. Trailing Breakeven Lock (+0.60% Trigger -> Locks +0.25% Net)
     if (gainPct >= 0.60 && !pos.isTrailingActive) {
       pos.isTrailingActive = true;
       pos.sl = pos.entryPriceUSDT * 1.0025;
-      console.log(`[FEE-PROOF TRAILING ACTIVE] ${sym} locked at +0.25% (Covers 0.20% fee)`);
+      console.log(`[FEE-PROOF TRAILING ACTIVE] ${sym} locked at +0.25%`);
     }
 
+    // 3. Stop Loss or Trailing Stop Boundary
     if (livePriceUSDT <= pos.sl) {
       settlePosition(sym, pos.isTrailingActive ? 'TRAILING SL' : 'STOP LOSS', livePriceUSDT, `Hit boundary (${gainPct.toFixed(2)}%)`);
       continue;
     }
 
+    // 4. Stagnation Cut (8-Minute Window)
     if (holdSeconds >= 480 && gainPct < 0.25) {
       settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, 'No momentum impulse within 8 minutes');
       continue;
     }
 
+    // 5. Predictive Risk Decay Scoring (Calibrated to prevent premature noise shakeouts)
     let decay = 5;
     const realBook = await fetchRealOrderBookDepth(sym);
 
     if (realBook) {
-      if (realBook.obi < 0.44) decay += 35;
-      if (realBook.obi < 0.50) decay += 15;
-      if (realBook.spreadPct > 0.08) decay += 15;
+      if (realBook.obi < 0.40) decay += 25;
+      else if (realBook.obi < 0.48) decay += 10;
+      if (realBook.spreadPct > 0.12) decay += 15;
     }
 
-    if (gainPct <= -0.15) decay += 20;
-    if (gainPct <= -0.30) decay += 25;
+    if (gainPct <= -0.30) decay += 15;
+    if (gainPct <= -0.45) decay += 25;
 
     pos.decayRisk = Math.min(100, decay);
-    pos.predictiveStatus = pos.decayRisk >= 45 ? 'EXITING' : (pos.decayRisk >= 25 ? 'CAUTION' : 'SAFE');
+    pos.predictiveStatus = pos.decayRisk >= 55 ? 'EXITING' : (pos.decayRisk >= 30 ? 'CAUTION' : 'SAFE');
 
-    if (pos.decayRisk >= 40) highDecayCount++;
+    if (pos.decayRisk >= 50) highDecayCount++;
 
-    if (gainPct <= -0.20 && pos.decayRisk >= 40) {
-      settlePosition(sym, 'PREDICTIVE SL', livePriceUSDT, `Loss mitigated at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
-      continue;
-    }
-
-    if (holdSeconds <= 90 && realBook && realBook.obi < 0.40 && gainPct <= -0.10) {
-      settlePosition(sym, 'ORDERBOOK FLIP', livePriceUSDT, 'Buyer depth vanished immediately post-entry');
-      continue;
+    // Guard: Allow 90 seconds of post-entry breathing room before permitting predictive micro-cuts
+    if (holdSeconds >= 90) {
+      // Calibrated from -0.20% to -0.50% with persistent decay >= 55%
+      if (gainPct <= -0.50 && pos.decayRisk >= 55) {
+        settlePosition(sym, 'PREDICTIVE SL', livePriceUSDT, `Loss mitigated at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
+        continue;
+      }
     }
   }
 
