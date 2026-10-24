@@ -291,7 +291,14 @@ async function syncWithGoogleDrive() {
   if (!targetUrl) return;
 
   try {
-    const res = await fetch(targetUrl);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(targetUrl, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
     if (res.ok) {
       const data = await res.json();
       if (data && Array.isArray(data.trades) && data.trades.length > 0) {
@@ -301,30 +308,44 @@ async function syncWithGoogleDrive() {
         State.subsystems.persistence.googleSheetSync = 'ACTIVE';
         saveStateToDisk();
         broadcastState();
+        console.log(`[GoogleSheet Sync] Successfully restored ${data.trades.length} trades from Google Drive`);
       }
+    } else {
+      console.warn(`[GoogleSheet Sync] HTTP status: ${res.status}`);
     }
   } catch (err) {
-    // Non-blocking on network failure
+    console.error('[GoogleSheet Sync Error]', err.message);
   }
 }
 
 async function appendTradeToGoogleDrive(tradeLog) {
   const targetUrl = State.googleSheetUrl;
-  if (!targetUrl) return;
+  if (!targetUrl) {
+    console.warn('[GoogleSheet Append] No GOOGLE_SHEET_URL configured, skipping sheet sync.');
+    return;
+  }
 
   try {
+    console.log(`[GoogleSheet Append] Sending trade ${tradeLog.pair} (${tradeLog.type}) to Google Sheet...`);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
-    await fetch(targetUrl, {
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(targetUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(tradeLog),
       signal: controller.signal
     });
     clearTimeout(timeout);
-    State.subsystems.persistence.googleSheetSync = 'SYNCED';
+    
+    if (res.ok) {
+      State.subsystems.persistence.googleSheetSync = 'SYNCED';
+      console.log(`[GoogleSheet Append] Trade ${tradeLog.pair} recorded in Google Sheet.`);
+    } else {
+      console.warn(`[GoogleSheet Append] Received status ${res.status}`);
+    }
   } catch (err) {
-    // Non-blocking
+    console.error('[GoogleSheet Append Error]', err.message);
   }
 }
 
@@ -1058,6 +1079,50 @@ app.post('/api/settings/googlesheet', (req, res) => {
     res.json({ success: true, googleSheetUrl: url });
   } else {
     res.status(400).json({ success: false, message: 'Invalid URL' });
+  }
+});
+
+// Diagnostic endpoint: Sends a test trade directly to verify sheet access
+app.get('/api/settings/googlesheet/test', async (req, res) => {
+  const targetUrl = State.googleSheetUrl;
+  if (!targetUrl) {
+    return res.status(400).json({ success: false, message: 'GOOGLE_SHEET_URL is not set.' });
+  }
+
+  const testPayload = {
+    id: Date.now(),
+    date: new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    pair: 'TEST/USDT',
+    type: 'SYNC TEST',
+    entryPriceUSDT: 100.00,
+    exitPriceUSDT: 101.60,
+    pnlUSDT: 0.80,
+    pnlINR: Number((0.80 * State.usdtToInrRate).toFixed(2)),
+    reason: 'Manual diagnostic test from Render'
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const response = await fetch(targetUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(testPayload),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    const bodyText = await response.text();
+    res.json({
+      success: response.ok,
+      status: response.status,
+      response: bodyText,
+      message: response.ok ? 'Test row posted to Google Sheet!' : 'Google Sheet returned an error.'
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
