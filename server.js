@@ -1088,6 +1088,48 @@ app.post('/api/settings/googlesheet', (req, res) => {
   }
 });
 
+// Proxy endpoint to sync trades from Google Sheet without browser CORS blocks
+app.get('/api/settings/googlesheet/sync', async (req, res) => {
+  const targetUrl = State.googleSheetUrl;
+  if (!targetUrl) {
+    return res.status(400).json({ success: false, message: 'GOOGLE_SHEET_URL not configured' });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const response = await fetch(targetUrl, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    if (response.ok) {
+      const data = await response.json();
+      if (data && Array.isArray(data.trades)) {
+        const merged = sanitizeAndAuditTradeHistory([...data.trades, ...State.tradeLogs]);
+        State.tradeLogs = merged;
+        recalculateTrueRealizedPnL();
+        State.subsystems.persistence.googleSheetSync = 'ACTIVE';
+        saveStateToDisk();
+        broadcastState();
+        return res.json({
+          success: true,
+          count: data.trades.length,
+          totalRetained: State.tradeLogs.length,
+          trades: State.tradeLogs
+        });
+      }
+      return res.json({ success: true, count: 0, trades: State.tradeLogs });
+    } else {
+      return res.status(response.status).json({ success: false, message: `Google Sheet returned HTTP ${response.status}` });
+    }
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Diagnostic endpoint: Sends a test trade directly to verify sheet access
 app.get('/api/settings/googlesheet/test', async (req, res) => {
   const targetUrl = State.googleSheetUrl;
