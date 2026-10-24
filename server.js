@@ -918,7 +918,10 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason) {
 
   State.portfolio.cashUSDT -= notionalUSDT;
 
-  const sl = priceUSDT * (1 - 0.008);
+  // Adaptive hard SL: Allow 0.95% for micro/sub-cent assets, 0.80% for standard assets
+  const isMicroAsset = (priceUSDT < 0.10);
+  const slPct = isMicroAsset ? 0.0095 : 0.0080;
+  const sl = priceUSDT * (1 - slPct);
   const tp1 = priceUSDT * (1 + 0.016);
 
   State.activePositions[pairKey] = {
@@ -936,6 +939,7 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason) {
     tp1Secured: false,
     highWatermarkUSDT: priceUSDT,
     decayRisk: 5,
+    consecutiveDecayTicks: 0,
     predictiveStatus: 'SAFE'
   };
 
@@ -1100,16 +1104,19 @@ async function monitorOpenPositionsHealth() {
     const livePriceUSDT = State.universe[sym]?.priceUSDT || pos.entryPriceUSDT;
     const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
     const holdSeconds = (Date.now() - pos.openedAt) / 1000;
+    const isMicroAsset = (pos.entryPriceUSDT < 0.10);
 
     if (!pos.highWatermarkUSDT || livePriceUSDT > pos.highWatermarkUSDT) {
       pos.highWatermarkUSDT = livePriceUSDT;
     }
 
+    // 1. Partial TP1 Take-Profit (+1.60% Gross)
     if (livePriceUSDT >= pos.tp1 && !pos.tp1Secured) {
       settlePartialPosition(sym, livePriceUSDT, `TP1 Banked (+${gainPct.toFixed(2)}%), runner active`);
       continue;
     }
 
+    // 2. High Watermark Runner Trail Logic
     if (pos.tp1Secured) {
       const runnerTrailPrice = pos.highWatermarkUSDT * (1 - 0.012);
       pos.sl = Math.max(pos.entryPriceUSDT * 1.0025, runnerTrailPrice);
@@ -1119,42 +1126,65 @@ async function monitorOpenPositionsHealth() {
         continue;
       }
     } else {
+      // 3. Early Trailing Lock (Activates after +1.20% gain, avoiding spread traps)
       if (gainPct >= 1.20 && !pos.isTrailingActive) {
         pos.isTrailingActive = true;
         pos.sl = pos.entryPriceUSDT * 1.0025;
       }
 
+      // 4. Hard Stop Loss Boundary
       if (livePriceUSDT <= pos.sl) {
         settlePosition(sym, pos.isTrailingActive ? 'TRAILING SL' : 'STOP LOSS', livePriceUSDT, `Hit boundary (${gainPct.toFixed(2)}%)`);
         continue;
       }
 
-      if (holdSeconds >= 480 && gainPct < 0.25) {
-        settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, 'No momentum impulse within 8 minutes');
+      // 5. Stagnation Exit: Extended to 12 minutes (720s) for high-momentum assets to allow the secondary leg to form
+      const maxStagnationSeconds = (State.universe[sym]?.priceChangePct >= 5.0) ? 720 : 540;
+      if (holdSeconds >= maxStagnationSeconds && gainPct < 0.25) {
+        settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, `No momentum continuation within ${Math.round(maxStagnationSeconds/60)} minutes`);
         continue;
       }
     }
 
+    // 6. Intelligent Order Book Decay Metric with Multi-Tick Confirmation
     let decay = 5;
     const realBook = await fetchRealOrderBookDepth(sym);
 
     if (realBook) {
-      if (realBook.obi < 0.40) decay += 25;
-      else if (realBook.obi < 0.48) decay += 10;
-      if (realBook.spreadPct > 0.12) decay += 15;
+      if (realBook.obi < 0.38) decay += 25;
+      else if (realBook.obi < 0.46) decay += 10;
+      
+      // Avoid penalizing natural discrete tick spreads on sub-cent coins
+      const spreadPenaltyThreshold = isMicroAsset ? 0.30 : 0.12;
+      if (realBook.spreadPct > spreadPenaltyThreshold) decay += 15;
     }
 
-    if (gainPct <= -0.30) decay += 15;
-    if (gainPct <= -0.45) decay += 25;
+    // Scaled price drop penalties
+    const dipThreshold1 = isMicroAsset ? -0.45 : -0.30;
+    const dipThreshold2 = isMicroAsset ? -0.65 : -0.45;
+    if (gainPct <= dipThreshold1) decay += 15;
+    if (gainPct <= dipThreshold2) decay += 25;
 
     pos.decayRisk = Math.min(100, decay);
     pos.predictiveStatus = pos.decayRisk >= 55 ? 'EXITING' : (pos.decayRisk >= 30 ? 'CAUTION' : 'SAFE');
 
-    if (pos.decayRisk >= 50) highDecayCount++;
+    // Multi-tick persistent confirmation guard (requires 3 consecutive ticks of decay)
+    if (pos.decayRisk >= 55) {
+      pos.consecutiveDecayTicks = (pos.consecutiveDecayTicks || 0) + 1;
+      highDecayCount++;
+    } else {
+      pos.consecutiveDecayTicks = 0;
+    }
 
-    if (holdSeconds >= 90 && !pos.tp1Secured) {
-      if (gainPct <= -0.50 && pos.decayRisk >= 55) {
-        settlePosition(sym, 'PREDICTIVE SL', livePriceUSDT, `Loss mitigated at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
+    // 7. Predictive Cut Protection Window:
+    // Requires: 
+    // a) At least 150 seconds (2.5m) passed (allowing breakout retest)
+    // b) Position dip exceeds threshold (-0.75% for micro, -0.55% for standard)
+    // c) Book decay confirmed across 3 consecutive cycles (>= 7.5 seconds)
+    const predictiveDipGate = isMicroAsset ? -0.75 : -0.55;
+    if (holdSeconds >= 150 && !pos.tp1Secured) {
+      if (gainPct <= predictiveDipGate && (pos.consecutiveDecayTicks >= 3)) {
+        settlePosition(sym, 'PREDICTIVE SL', livePriceUSDT, `Persistent decay confirmed over 3 ticks at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
         continue;
       }
     }
