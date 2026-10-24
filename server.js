@@ -18,6 +18,20 @@ const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4qu
 const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL || '';
 
 const app = express();
+
+// -------------------------------------------------------------
+// CORS & PRE-FLIGHT HEADERS (Allows mobile webviews & cross-origin browsers)
+// -------------------------------------------------------------
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.static(__dirname));
