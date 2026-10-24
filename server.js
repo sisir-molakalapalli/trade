@@ -66,16 +66,19 @@ const State = {
     maxConcurrentPositions: 2,
     rollingTrades24h: [],
     globalCircuitBreakerUntil: 0,
-    circuitBreakerReason: 'NORMAL'
+    circuitBreakerReason: 'NORMAL',
+    pacingMode: 'BALANCED',
+    targetCadenceHours: 3.0
   },
 
   activeThresholds: {
     regime: 'BALANCED',
-    scoreThreshold: 81,
-    obiThreshold: 0.56,
+    scoreThreshold: 80,
+    obiThreshold: 0.55,
     maxSpread: 0.08,
     cooldownMinutes: 90,
-    marketAvgRange: 4.5
+    marketAvgRange: 4.5,
+    pacingGateOffset: 0
   },
 
   portfolio: {
@@ -98,17 +101,18 @@ const State = {
     screener: {
       status: 'IDLE',
       lastRunTime: '--:--:--',
-      nextRunCountdownSec: 180,
+      nextRunCountdownSec: 90,
       scannedPairsCount: 0,
       qualifiedCandidatesCount: 0,
-      liquidityFloorUSD: 'Dynamic ($8M-$18M)'
+      liquidityFloorUSD: 'Dynamic ($3.5M-$14M)',
+      cadenceSec: 90
     },
     regimeController: {
       status: 'CALIBRATED',
       currentRegime: 'BALANCED',
       marketAvgVolatilityPct: 4.5,
-      liveScoreGate: 81,
-      liveObiGatePct: 56,
+      liveScoreGate: 80,
+      liveObiGatePct: 55,
       liveMaxSpreadPct: 0.08,
       lastAdjustmentTime: '--:--:--'
     },
@@ -127,7 +131,8 @@ const State = {
       quotaRemaining: 8,
       resetOldestSlotInMin: 0,
       formattedReset: 'None Pending',
-      circuitBreakerRemainingSec: 0
+      circuitBreakerRemainingSec: 0,
+      pacingMode: 'STARVED'
     },
     persistence: {
       status: 'SYNCED',
@@ -140,21 +145,23 @@ const State = {
   },
 
   quantTelemetry: {
-    engine: 'Institutional 3-Stage Discovery & Low-Frequency Execution Engine',
+    engine: 'Institutional 3-Stage Discovery & Active Quota Pacing Engine',
     source: 'PURE_QUANT_ALGO',
     frequencySeconds: 15,
     lastAnalysisTime: '--:--:--',
-    screenerCadence: 'Every 3 Mins ($8M-$18M Dynamic Floor)',
+    screenerCadence: 'Dynamic 90s-180s (Active Pacing)',
     riskCadence: 'Every 2.5 Seconds',
     persistenceStatus: 'ACTIVE (Non-Destructive)',
-    regimeReasoning: 'Enforcing 4-8 trades/24h ceiling with dynamic liquidity floor and recalibrated score gate.'
+    regimeReasoning: 'Actively pacing trades to consistently utilize 4-8 slots/24h while maintaining positive statistical expectancy.'
   },
 
   universe: { ...DEFAULT_UNIVERSE },
   tradeLogs: []
 };
 
-let nextScreenerTargetTimestamp = Date.now() + (3 * 60 * 1000);
+let screenerIntervalMs = 90 * 1000;
+let nextScreenerTargetTimestamp = Date.now() + screenerIntervalMs;
+let screenerTimerHandle = null;
 
 // Helper for Binance HTTP queries
 async function fetchFromBinance(endpoint) {
@@ -411,24 +418,23 @@ loadStateFromDisk();
 syncWithGoogleDrive();
 
 // -------------------------------------------------------------
-// RECALIBRATED VOLATILITY REGIME DETECTOR
+// RECALIBRATED VOLATILITY REGIME & ACTIVE PACING DETECTOR
 // -------------------------------------------------------------
 function calculateMarketVolatilityRegime() {
   const coins = Object.values(State.universe);
   if (coins.length === 0) {
     return {
       regime: 'BALANCED',
-      scoreThreshold: 81,
-      obiThreshold: 0.56,
+      scoreThreshold: 80,
+      obiThreshold: 0.55,
       maxSpread: 0.08,
       cooldownMinutes: 90,
       marketAvgRange: 4.5
     };
   }
 
-  let totalRangePct = 0;
-  let count = 0;
-
+  // Calculate Median Volatility to prevent 1 single pump coin from triggering TURBULENT
+  const ranges = [];
   coins.forEach(c => {
     let range = 0;
     if (typeof c.intradayRangePct === 'number' && c.intradayRangePct > 0) {
@@ -436,58 +442,81 @@ function calculateMarketVolatilityRegime() {
     } else if (typeof c.priceChangePct === 'number') {
       range = Math.abs(c.priceChangePct) * 1.4;
     }
-    if (range > 0) {
-      totalRangePct += range;
-      count++;
-    }
+    if (range > 0) ranges.push(range);
   });
 
-  const avgRange = count > 0 ? (totalRangePct / count) : 4.5;
-  const roundedRange = Math.round(avgRange * 10) / 10;
+  ranges.sort((a, b) => a - b);
+  const medianRange = ranges.length > 0 ? ranges[Math.floor(ranges.length / 2)] : 4.5;
+  const roundedRange = Math.round(medianRange * 10) / 10;
 
   let computedRegime = 'BALANCED';
-  let scoreThreshold = 81;
-  let obiThreshold = 0.56;
+  let scoreThreshold = 80;
+  let obiThreshold = 0.55;
   let maxSpread = 0.08;
   let cooldownMinutes = 90;
 
-  if (avgRange >= 9.5) {
+  if (medianRange >= 9.5) {
     computedRegime = 'TURBULENT';
-    scoreThreshold = 86;
-    obiThreshold = 0.59;
-    maxSpread = 0.06;
+    scoreThreshold = 85;
+    obiThreshold = 0.58;
+    maxSpread = 0.07;
     cooldownMinutes = 120;
-    State.tradeFrequencyController.circuitBreakerReason = 'TURBULENT_FREEZE';
-  } else if (avgRange <= 4.0) {
+  } else if (medianRange <= 4.0) {
     computedRegime = 'COMPRESSION';
-    scoreThreshold = 79;
-    obiThreshold = 0.55;
+    scoreThreshold = 77;
+    obiThreshold = 0.54;
     maxSpread = 0.09;
     cooldownMinutes = 60;
-    if (State.tradeFrequencyController.circuitBreakerReason === 'TURBULENT_FREEZE') {
-      State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
-    }
-  } else {
-    if (State.tradeFrequencyController.circuitBreakerReason === 'TURBULENT_FREEZE') {
-      State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
-    }
   }
+
+  // ACTIVE QUOTA PACING ENGINE (AQPE) OFFSET:
+  // If we have executed very few trades recently, dynamically ease the score requirement
+  // so the portfolio doesn't sit idle for 12 hours while 8 slots go to waste.
+  const now = Date.now();
+  const sixHoursAgo = now - (6 * 60 * 60 * 1000);
+  const recentTradesCount = (State.tradeFrequencyController.rollingTrades24h || []).filter(ts => ts > sixHoursAgo).length;
+  const remaining = Math.max(0, State.tradeFrequencyController.maxTradesPer24h - (State.tradeFrequencyController.rollingTrades24h || []).length);
+
+  let pacingMode = 'BALANCED';
+  let pacingOffset = 0;
+
+  if (remaining >= 6 && recentTradesCount === 0) {
+    pacingMode = 'STARVED';
+    pacingOffset = -2; // Slightly softer entry gate (e.g. 80 -> 78 in Balanced, 77 -> 75 in Compression)
+    screenerIntervalMs = 90 * 1000; // Scan fast every 90s to catch new momentum
+  } else if (remaining <= 2 || recentTradesCount >= 4) {
+    pacingMode = 'SATURATED';
+    pacingOffset = +2; // Tighten entry gate to preserve final slots for highest conviction
+    screenerIntervalMs = 180 * 1000;
+  } else {
+    pacingMode = 'BALANCED';
+    pacingOffset = 0;
+    screenerIntervalMs = 120 * 1000;
+  }
+
+  State.tradeFrequencyController.pacingMode = pacingMode;
+  State.subsystems.quotaManager.pacingMode = pacingMode;
+  State.subsystems.screener.cadenceSec = Math.round(screenerIntervalMs / 1000);
+
+  const finalScoreGate = Math.max(74, scoreThreshold + pacingOffset);
 
   State.subsystems.regimeController.status = 'ACTIVE';
   State.subsystems.regimeController.currentRegime = computedRegime;
   State.subsystems.regimeController.marketAvgVolatilityPct = roundedRange;
-  State.subsystems.regimeController.liveScoreGate = scoreThreshold;
+  State.subsystems.regimeController.liveScoreGate = finalScoreGate;
   State.subsystems.regimeController.liveObiGatePct = Math.round(obiThreshold * 100);
   State.subsystems.regimeController.liveMaxSpreadPct = maxSpread;
   State.subsystems.regimeController.lastAdjustmentTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
   State.activeThresholds = {
     regime: computedRegime,
-    scoreThreshold,
+    scoreThreshold: finalScoreGate,
     obiThreshold,
     maxSpread,
     cooldownMinutes,
-    marketAvgRange: roundedRange
+    marketAvgRange: roundedRange,
+    pacingMode,
+    pacingGateOffset: pacingOffset
   };
 
   return State.activeThresholds;
@@ -523,9 +552,6 @@ function syncRollingTradeQuota() {
     circuitBreakerRemainingSec = Math.round((State.tradeFrequencyController.globalCircuitBreakerUntil - now) / 1000);
     State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
     State.subsystems.quotaManager.status = 'PAUSED_LOSS_COOLDOWN';
-  } else if (State.marketRegime === 'TURBULENT') {
-    State.tradeFrequencyController.circuitBreakerReason = 'TURBULENT_FREEZE';
-    State.subsystems.quotaManager.status = 'PAUSED_TURBULENCE';
   } else if (remaining === 0) {
     State.tradeFrequencyController.circuitBreakerReason = 'QUOTA_EXHAUSTED';
     State.subsystems.quotaManager.status = 'QUOTA_FILLED';
@@ -543,7 +569,7 @@ function syncRollingTradeQuota() {
 }
 
 // -------------------------------------------------------------
-// STAGE 1 & 2: DISCOVERY SCREENER
+// STAGE 1 & 2: DISCOVERY SCREENER (PACED RUN)
 // -------------------------------------------------------------
 async function runDynamicMarketScreener() {
   State.subsystems.screener.status = 'SCANNING';
@@ -551,6 +577,7 @@ async function runDynamicMarketScreener() {
     const tickers = await fetchFromBinance('/api/v3/ticker/24hr');
     if (!Array.isArray(tickers) || tickers.length === 0) {
       State.subsystems.screener.status = 'IDLE';
+      scheduleNextScreenerRun();
       return;
     }
 
@@ -558,8 +585,8 @@ async function runDynamicMarketScreener() {
     const candidates = [];
     const activeSymbols = Object.keys(State.activePositions);
 
-    // Current regime determines the volume floor
     const isCompression = (State.marketRegime === 'COMPRESSION');
+    const isStarved = (State.tradeFrequencyController.pacingMode === 'STARVED');
 
     for (const t of tickers) {
       if (!t.symbol.endsWith('USDT')) continue;
@@ -572,18 +599,19 @@ async function runDynamicMarketScreener() {
       const highPrice = parseFloat(t.highPrice) || 0;
       const lowPrice = parseFloat(t.lowPrice) || 0;
 
-      // Dynamic floor adapts to market regime and velocity
+      // Dynamic floor adapts to velocity and pacing mode:
+      // High-velocity breakout runners (ANIME pattern) need only $3.5M
       let requiredFloor = 14000000;
-      if (priceChangePct >= 4.0) requiredFloor = 6000000;
-      else if (priceChangePct >= 1.5) requiredFloor = 9000000;
-      else if (isCompression) requiredFloor = 8000000;
+      if (priceChangePct >= 7.5) requiredFloor = 3500000;
+      else if (priceChangePct >= 4.0) requiredFloor = 5000000;
+      else if (priceChangePct >= 1.5) requiredFloor = 8000000;
+      else if (isCompression || isStarved) requiredFloor = 6000000;
 
       if (quoteVol >= requiredFloor && lastPrice > 0 && highPrice > lowPrice) {
         const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
         const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
 
-        // In compression regimes, allow coins trading in upper 50% of range
-        const minPositionRatio = isCompression ? 0.50 : 0.58;
+        const minPositionRatio = (isCompression || isStarved) ? 0.48 : 0.55;
         if (pricePositionInRange < minPositionRatio) continue;
 
         const liquidityDensityScore = Math.min(30, Math.log10(quoteVol) * 3.8);
@@ -622,8 +650,8 @@ async function runDynamicMarketScreener() {
       p.change1hPct = shortTerm.change1hPct;
       p.change4hPct = shortTerm.change4hPct;
 
-      if (p.change1hPct > 1.0) p.breakoutScore += (p.change1hPct * 2.0);
-      if (p.change4hPct > 3.0) p.breakoutScore += (p.change4hPct * 1.3);
+      if (p.change1hPct > 0.8) p.breakoutScore += (p.change1hPct * 2.2);
+      if (p.change4hPct > 2.5) p.breakoutScore += (p.change4hPct * 1.4);
     }
 
     topPicks.sort((a, b) => b.breakoutScore - a.breakoutScore);
@@ -659,10 +687,17 @@ async function runDynamicMarketScreener() {
 
     State.subsystems.screener.status = 'ACTIVE';
     State.subsystems.screener.lastRunTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-    nextScreenerTargetTimestamp = Date.now() + (3 * 60 * 1000);
   } catch (err) {
     State.subsystems.screener.status = 'ERROR';
+  } finally {
+    scheduleNextScreenerRun();
   }
+}
+
+function scheduleNextScreenerRun() {
+  if (screenerTimerHandle) clearTimeout(screenerTimerHandle);
+  nextScreenerTargetTimestamp = Date.now() + screenerIntervalMs;
+  screenerTimerHandle = setTimeout(runDynamicMarketScreener, screenerIntervalMs);
 }
 
 // -------------------------------------------------------------
@@ -761,7 +796,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (book.obi < config.obiThreshold) continue;
 
     const isMicroAsset = (coin.priceUSDT && coin.priceUSDT < 0.01);
-    const allowedSpread = isMicroAsset ? 0.20 : config.maxSpread;
+    const allowedSpread = isMicroAsset ? 0.35 : config.maxSpread;
     if (book.spreadPct > allowedSpread) continue;
 
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
@@ -770,7 +805,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
     executeSimulatedBuy(
       sym, 
       coin.priceUSDT, 
-      `High-Conviction Confluence (${config.regime}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%, Spread ${book.spreadPct.toFixed(2)}%)`
+      `AQPE High-Conviction Confluence (${config.regime}|${config.pacingMode}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%, Spread ${book.spreadPct.toFixed(2)}%)`
     );
     break;
   }
@@ -1315,9 +1350,7 @@ app.get('/healthz', (req, res) => res.status(200).send('OK'));
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Quant Server] Running on port ${PORT}`);
 
-  setTimeout(runDynamicMarketScreener, 3000);
-  setInterval(runDynamicMarketScreener, 3 * 60 * 1000);
-
+  setTimeout(runDynamicMarketScreener, 2000);
   setInterval(runPureQuantScoring, 15 * 1000);
   setInterval(syncLiveBinancePrices, 2500);
 });
