@@ -394,6 +394,33 @@ function recalculateTrueRealizedPnL() {
   State.portfolio.realizedPnL = Number(trueSumUSDT.toFixed(4));
 }
 
+// Reconstruct 24h rolling trade timestamps from trade logs and active positions
+function reconcileRollingTradeQuotaFromHistory() {
+  const now = Date.now();
+  const dayAgo = now - (24 * 60 * 60 * 1000);
+  const timestamps = new Set(State.tradeFrequencyController.rollingTrades24h || []);
+
+  // 1. Add timestamps from all executed trade logs within last 24h
+  State.tradeLogs.forEach(l => {
+    if (l && l.id && l.id > dayAgo && l.id <= now) {
+      timestamps.add(l.id);
+    }
+  });
+
+  // 2. Add timestamps from currently open active positions
+  Object.values(State.activePositions || {}).forEach(pos => {
+    if (pos && pos.openedAt && pos.openedAt > dayAgo) {
+      timestamps.add(pos.openedAt);
+    }
+  });
+
+  State.tradeFrequencyController.rollingTrades24h = Array.from(timestamps)
+    .filter(ts => ts > dayAgo)
+    .sort((a, b) => a - b);
+
+  syncRollingTradeQuota();
+}
+
 function saveStateToDisk() {
   try {
     const dataToSave = {
@@ -436,6 +463,7 @@ async function syncWithGoogleDrive() {
         const merged = sanitizeAndAuditTradeHistory([...data.trades, ...State.tradeLogs]);
         State.tradeLogs = merged;
         recalculateTrueRealizedPnL();
+        reconcileRollingTradeQuotaFromHistory();
         State.subsystems.persistence.googleSheetSync = 'ACTIVE';
         saveStateToDisk();
         broadcastState();
@@ -512,6 +540,8 @@ function loadStateFromDisk() {
         State.googleSheetUrl = parsed.googleSheetUrl;
       }
     }
+    // Always reconcile 24h rolling quota so no app reload or server reboot resets it
+    reconcileRollingTradeQuotaFromHistory();
   } catch (err) {}
 }
 
