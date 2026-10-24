@@ -7,6 +7,7 @@ const { WebSocketServer, WebSocket } = require('ws');
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
+const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL || '';
 
 const app = express();
 app.use(express.json());
@@ -108,7 +109,8 @@ const State = {
       totalDiskSaves: 0,
       lastSaveTime: '--:--:--',
       retainedTradesCount: 0,
-      storageEngine: 'Disk JSON + Sanitized Ledger'
+      storageEngine: 'Disk JSON + Google Drive Ledger',
+      googleSheetSync: GOOGLE_SHEET_URL ? 'CONNECTED' : 'STANDBY'
     }
   },
 
@@ -189,7 +191,8 @@ function saveStateToDisk() {
       autopilotEnabled: State.autopilotEnabled,
       cooldowns: State.cooldowns,
       tradeFrequencyController: State.tradeFrequencyController,
-      usdtToInrRate: State.usdtToInrRate
+      usdtToInrRate: State.usdtToInrRate,
+      googleSheetUrl: GOOGLE_SHEET_URL || State.googleSheetUrl
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(dataToSave, null, 2), 'utf-8');
     State.subsystems.persistence.totalDiskSaves++;
@@ -199,6 +202,52 @@ function saveStateToDisk() {
   } catch (err) {
     State.subsystems.persistence.status = 'ERROR';
     console.error('[Persistence] Error saving state:', err.message);
+  }
+}
+
+async function syncWithGoogleDrive() {
+  const targetUrl = GOOGLE_SHEET_URL || State.googleSheetUrl;
+  if (!targetUrl) return;
+
+  try {
+    const res = await fetch(targetUrl);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && Array.isArray(data.trades) && data.trades.length > 0) {
+        console.log(`[Google Drive] Restored ${data.trades.length} historical trades from Google Sheet.`);
+        const merged = sanitizeAndAuditTradeHistory([...data.trades, ...State.tradeLogs]);
+        State.tradeLogs = merged;
+        recalculateTrueRealizedPnL();
+        State.subsystems.persistence.googleSheetSync = 'ACTIVE';
+        saveStateToDisk();
+        broadcastState();
+      }
+    }
+  } catch (err) {
+    console.warn('[Google Drive] Could not fetch trades from Google Sheet on boot:', err.message);
+  }
+}
+
+async function appendTradeToGoogleDrive(tradeLog) {
+  const targetUrl = GOOGLE_SHEET_URL || State.googleSheetUrl;
+  if (!targetUrl) return;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tradeLog),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (res.ok) {
+      console.log(`[Google Drive] Successfully saved trade #${tradeLog.id} (${tradeLog.pair}) to Google Sheet.`);
+      State.subsystems.persistence.googleSheetSync = 'SYNCED';
+    }
+  } catch (err) {
+    console.warn('[Google Drive] Non-critical write error appending trade to Google Sheet:', err.message);
   }
 }
 
@@ -233,6 +282,9 @@ function loadStateFromDisk() {
       if (parsed.tradeFrequencyController && Array.isArray(parsed.tradeFrequencyController.rollingTrades24h)) {
         State.tradeFrequencyController = parsed.tradeFrequencyController;
       }
+      if (parsed.googleSheetUrl) {
+        State.googleSheetUrl = parsed.googleSheetUrl;
+      }
 
       console.log(`[Persistence] Loaded & audited state successfully. True Realized PnL: $${State.portfolio.realizedPnL} USDT (${State.tradeLogs.length} trades)`);
     }
@@ -242,57 +294,7 @@ function loadStateFromDisk() {
 }
 
 loadStateFromDisk();
-
-// -------------------------------------------------------------
-// BINANCE MULTI-MIRROR API FETCHER (Geoblock-Resilient)
-// -------------------------------------------------------------
-const BINANCE_HOSTS = [
-  'https://data-api.binance.vision',
-  'https://api1.binance.com',
-  'https://api3.binance.com',
-  'https://api.binance.com'
-];
-
-async function fetchFromBinance(pathStr) {
-  for (const host of BINANCE_HOSTS) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3500);
-      const res = await fetch(`${host}${pathStr}`, {
-        headers: { 'X-MBX-APIKEY': BINANCE_API_KEY },
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      if (res.ok) return await res.json();
-    } catch (e) {}
-  }
-  return null;
-}
-
-// -------------------------------------------------------------
-// 1H & 4H MOMENTUM ACCELERATION DETECTOR
-// -------------------------------------------------------------
-async function fetchShortTermMomentum(symbol) {
-  try {
-    // 5 candles of 1h = covers past 4 hours + live 1h
-    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=1h&limit=5`);
-    if (Array.isArray(klines) && klines.length >= 2) {
-      const currentClose = parseFloat(klines[klines.length - 1][4]);
-      const oneHourAgoOpen = parseFloat(klines[klines.length - 1][1]);
-      const fourHoursAgoOpen = parseFloat(klines[0][1]);
-
-      const change1hPct = oneHourAgoOpen > 0 ? ((currentClose - oneHourAgoOpen) / oneHourAgoOpen) * 100 : 0;
-      const change4hPct = fourHoursAgoOpen > 0 ? ((currentClose - fourHoursAgoOpen) / fourHoursAgoOpen) * 100 : 0;
-
-      return { change1hPct, change4hPct };
-    }
-  } catch (e) {}
-  return { change1hPct: 0, change4hPct: 0 };
-}
-
-// -------------------------------------------------------------
-// ORDER BOOK DEPTH & SPREAD INSPECTION
-// -------------------------------------------------------------
+syncWithGoogleDrive();
 async function fetchRealOrderBookDepth(symbol) {
   try {
     const data = await fetchFromBinance(`/api/v3/depth?symbol=${symbol}&limit=20`);
@@ -824,6 +826,10 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   syncRollingTradeQuota();
 
   console.log(`[POSITION EXIT] ${pairKey} via ${exitType} | PnL: $${pnlUSDT} USDT (≈ ₹${logEntry.pnlINR} INR) | ${exitReason} | Realized PnL: $${State.portfolio.realizedPnL}`);
+  
+  // Non-blocking persistent write directly to Google Drive spreadsheet
+  appendTradeToGoogleDrive(logEntry);
+
   saveStateToDisk();
   broadcastState();
 }
@@ -1028,9 +1034,47 @@ wss.on('connection', ws => {
       } else if (data.type === 'CLOSE_POSITION' && data.pairKey) {
         const livePriceUSDT = State.universe[data.pairKey]?.priceUSDT || State.activePositions[data.pairKey]?.entryPriceUSDT;
         if (livePriceUSDT) settlePosition(data.pairKey, 'MANUAL EXIT', livePriceUSDT, 'Closed by user command');
+      } else if (data.type === 'SET_GOOGLE_SHEET_URL' && data.url) {
+        State.googleSheetUrl = data.url.trim();
+        State.subsystems.persistence.googleSheetSync = 'CONNECTED';
+        saveStateToDisk();
+        syncWithGoogleDrive();
       }
     } catch (e) {}
   });
+});
+
+// -------------------------------------------------------------
+// REST API ENDPOINTS
+// -------------------------------------------------------------
+app.get('/api/state', (req, res) => {
+  res.json({
+    portfolio: State.portfolio,
+    activePositions: State.activePositions,
+    universe: State.universe,
+    tradeLogs: State.tradeLogs.slice(0, 100),
+    quantTelemetry: State.quantTelemetry,
+    marketRegime: State.marketRegime,
+    activeThresholds: State.activeThresholds,
+    tradeFrequencyController: State.tradeFrequencyController,
+    subsystems: State.subsystems,
+    usdtToInrRate: State.usdtToInrRate,
+    googleSheetUrl: GOOGLE_SHEET_URL || State.googleSheetUrl
+  });
+});
+
+app.post('/api/settings/googlesheet', (req, res) => {
+  const url = req.body && req.body.url ? req.body.url.trim() : '';
+  if (url) {
+    State.googleSheetUrl = url;
+    State.subsystems.persistence.googleSheetSync = 'CONNECTED';
+    saveStateToDisk();
+    syncWithGoogleDrive();
+    res.json({ success: true, googleSheetUrl: url });
+  } else {
+    res.status(400).json({ success: false, message: 'Invalid URL' });
+  }
+});
 });
 
 // -------------------------------------------------------------
