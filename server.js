@@ -788,11 +788,15 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason) {
     pairSymbol: State.universe[pairKey]?.symbol || pairKey,
     entryPriceUSDT: priceUSDT,
     qty,
+    originalQty: qty,
     notionalUSDT,
+    originalNotionalUSDT: notionalUSDT,
     sl,
     tp1,
     openedAt: Date.now(),
     isTrailingActive: false,
+    tp1Secured: false,
+    highWatermarkUSDT: priceUSDT,
     decayRisk: 5,
     predictiveStatus: 'SAFE'
   };
@@ -811,6 +815,68 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason) {
   broadcastState();
 }
 
+function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
+  const pos = State.activePositions[pairKey];
+  if (!pos || pos.tp1Secured) return;
+
+  const halfQty = pos.qty / 2;
+  const halfNotional = pos.notionalUSDT / 2;
+  const halfValUSDT = halfQty * exitPriceUSDT;
+  const pnlUSDT = Number((halfValUSDT - halfNotional).toFixed(4));
+
+  // Bank half of notional plus profit back to free cash
+  State.portfolio.cashUSDT += halfValUSDT;
+  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + pnlUSDT).toFixed(4));
+
+  pos.qty = halfQty;
+  pos.notionalUSDT = halfNotional;
+  pos.tp1Secured = true;
+  pos.isTrailingActive = true;
+  // Move stop to breakeven + fee buffer (+0.25%)
+  pos.sl = pos.entryPriceUSDT * 1.0025;
+  pos.highWatermarkUSDT = Math.max(pos.highWatermarkUSDT || exitPriceUSDT, exitPriceUSDT);
+
+  if (State.portfolio.holdings[pairKey]) {
+    State.portfolio.holdings[pairKey].qty = halfQty;
+    State.portfolio.holdings[pairKey].totalCostUSDT = halfNotional;
+  }
+
+  const istTime = new Date().toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true
+  });
+  const istDate = new Date().toLocaleDateString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric'
+  });
+
+  const logEntry = {
+    id: Date.now(),
+    type: 'TP1 (50% BANKED)',
+    pair: `${pos.pairSymbol}/USDT`,
+    entryPriceUSDT: formatBinanceUSDTPrice(pos.entryPriceUSDT),
+    exitPriceUSDT: formatBinanceUSDTPrice(exitPriceUSDT),
+    pnlUSDT,
+    pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2)),
+    reason: exitReason,
+    time: istTime,
+    date: istDate
+  };
+
+  State.tradeLogs.unshift(logEntry);
+  if (State.tradeLogs.length > 500) State.tradeLogs.pop();
+
+  recalculateTrueRealizedPnL();
+  appendTradeToGoogleDrive(logEntry);
+  saveStateToDisk();
+  broadcastState();
+}
+
 function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   const pos = State.activePositions[pairKey];
   if (!pos) return;
@@ -824,10 +890,10 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   delete State.portfolio.holdings[pairKey];
   delete State.activePositions[pairKey];
 
-  const cooldownMinutes = State.activeThresholds?.cooldownMinutes || 90;
-  State.cooldowns[pairKey] = Date.now() + (cooldownMinutes * 60 * 1000);
-
+  // If trade ended in profit, do NOT quarantine the coin so we can ride continuation setups
   if (pnlUSDT < 0) {
+    const cooldownMinutes = State.activeThresholds?.cooldownMinutes || 90;
+    State.cooldowns[pairKey] = Date.now() + (cooldownMinutes * 60 * 1000);
     State.tradeFrequencyController.globalCircuitBreakerUntil = Date.now() + (20 * 60 * 1000);
     State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
   }
@@ -900,26 +966,48 @@ async function monitorOpenPositionsHealth() {
     const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
     const holdSeconds = (Date.now() - pos.openedAt) / 1000;
 
-    if (livePriceUSDT >= pos.tp1) {
-      settlePosition(sym, 'TP1 REACHED', livePriceUSDT, `Target reached (+${gainPct.toFixed(2)}%)`);
+    // Track High Watermark for dynamic trailing runners
+    if (!pos.highWatermarkUSDT || livePriceUSDT > pos.highWatermarkUSDT) {
+      pos.highWatermarkUSDT = livePriceUSDT;
+    }
+
+    // STAGE 1 TAKE PROFIT: Bank 50% at +1.60%
+    if (livePriceUSDT >= pos.tp1 && !pos.tp1Secured) {
+      settlePartialPosition(sym, livePriceUSDT, `TP1 Banked (+${gainPct.toFixed(2)}%), runner active`);
       continue;
     }
 
-    if (gainPct >= 0.60 && !pos.isTrailingActive) {
-      pos.isTrailingActive = true;
-      pos.sl = pos.entryPriceUSDT * 1.0025;
+    // RUNNER STAGE (After TP1): Dynamic Trailing Stop (-1.20% from high watermark)
+    if (pos.tp1Secured) {
+      const runnerTrailPrice = pos.highWatermarkUSDT * (1 - 0.012);
+      // Stop is always at least entry + 0.25%
+      pos.sl = Math.max(pos.entryPriceUSDT * 1.0025, runnerTrailPrice);
+
+      if (livePriceUSDT <= pos.sl) {
+        settlePosition(sym, 'RUNNER EXIT', livePriceUSDT, `Runner trailed from peak ${formatBinanceUSDTPrice(pos.highWatermarkUSDT)} (+${gainPct.toFixed(2)}%)`);
+        continue;
+      }
+    } else {
+      // PRE-TP1 TRAILING LOCK: Only activate when price has comfortable +1.20% cushion
+      if (gainPct >= 1.20 && !pos.isTrailingActive) {
+        pos.isTrailingActive = true;
+        pos.sl = pos.entryPriceUSDT * 1.0025; // Lock breakeven + fees
+      }
+
+      // Hard or trailing stop triggered
+      if (livePriceUSDT <= pos.sl) {
+        settlePosition(sym, pos.isTrailingActive ? 'TRAILING SL' : 'STOP LOSS', livePriceUSDT, `Hit boundary (${gainPct.toFixed(2)}%)`);
+        continue;
+      }
+
+      // Stagnation Cut: Only if trade remains dead after 8 minutes
+      if (holdSeconds >= 480 && gainPct < 0.25) {
+        settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, 'No momentum impulse within 8 minutes');
+        continue;
+      }
     }
 
-    if (livePriceUSDT <= pos.sl) {
-      settlePosition(sym, pos.isTrailingActive ? 'TRAILING SL' : 'STOP LOSS', livePriceUSDT, `Hit boundary (${gainPct.toFixed(2)}%)`);
-      continue;
-    }
-
-    if (holdSeconds >= 480 && gainPct < 0.25) {
-      settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, 'No momentum impulse within 8 minutes');
-      continue;
-    }
-
+    // PREDICTIVE ORDERBOOK INTEGRITY MONITOR
     let decay = 5;
     const realBook = await fetchRealOrderBookDepth(sym);
 
@@ -937,7 +1025,8 @@ async function monitorOpenPositionsHealth() {
 
     if (pos.decayRisk >= 50) highDecayCount++;
 
-    if (holdSeconds >= 90) {
+    // 90-Second Retest Window: Never trigger premature predictive micro-cuts during initial entry retests
+    if (holdSeconds >= 90 && !pos.tp1Secured) {
       if (gainPct <= -0.50 && pos.decayRisk >= 55) {
         settlePosition(sym, 'PREDICTIVE SL', livePriceUSDT, `Loss mitigated at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
         continue;
