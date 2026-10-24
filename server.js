@@ -36,22 +36,23 @@ const State = {
   usdtToInrRate: 94.94,
   marketRegime: 'BALANCED',
   warmupCycles: 0,
-  cooldowns: {}, // Symbol -> expiry timestamp (ms)
+  cooldowns: {},
+  googleSheetUrl: GOOGLE_SHEET_URL,
 
   tradeFrequencyController: {
-    maxTradesPer24h: 8,             // Strict hard ceiling (4-8 target)
-    maxConcurrentPositions: 2,      // Max 2 positions to concentrate capital
-    rollingTrades24h: [],           // Array of timestamps for trades opened in past 24h
-    globalCircuitBreakerUntil: 0,   // Timestamp for 20m post-loss pause
-    circuitBreakerReason: 'NORMAL'  // 'NORMAL', 'POST_LOSS_FREEZE', 'TURBULENT_FREEZE'
+    maxTradesPer24h: 8,
+    maxConcurrentPositions: 2,
+    rollingTrades24h: [],
+    globalCircuitBreakerUntil: 0,
+    circuitBreakerReason: 'NORMAL'
   },
 
   activeThresholds: {
     regime: 'BALANCED',
-    scoreThreshold: 81,             // Recalibrated sweet-spot gate
-    obiThreshold: 0.56,             // 56% minimum buyer dominance
-    maxSpread: 0.08,                // Strict spread ceiling (0.08%)
-    cooldownMinutes: 90,            // 90m asset cooldown post-exit
+    scoreThreshold: 81,
+    obiThreshold: 0.56,
+    maxSpread: 0.08,
+    cooldownMinutes: 90,
     marketAvgRange: 4.5
   },
 
@@ -102,7 +103,9 @@ const State = {
       executed24hCount: 0,
       maxAllowed: 8,
       quotaRemaining: 8,
-      resetOldestSlotInMin: 0
+      resetOldestSlotInMin: 0,
+      formattedReset: 'None Pending',
+      circuitBreakerRemainingSec: 0
     },
     persistence: {
       status: 'SYNCED',
@@ -131,6 +134,80 @@ const State = {
 
 let nextScreenerTargetTimestamp = Date.now() + (3 * 60 * 1000);
 
+// Helper for Binance HTTP queries
+async function fetchFromBinance(endpoint) {
+  const base = 'https://data-api.binance.vision';
+  const url = `${base}${endpoint}`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    return null;
+  }
+}
+
+async function fetchRealOrderBookDepth(symbol) {
+  try {
+    const data = await fetchFromBinance(`/api/v3/depth?symbol=${symbol}&limit=20`);
+    if (data && data.bids && data.asks && data.bids.length > 0 && data.asks.length > 0) {
+      let bidVol = 0;
+      let askVol = 0;
+      data.bids.forEach(b => { bidVol += parseFloat(b[1]) || 0; });
+      data.asks.forEach(a => { askVol += parseFloat(a[1]) || 0; });
+      const total = bidVol + askVol;
+      const obi = total > 0 ? bidVol / total : 0.50;
+
+      const bestBid = parseFloat(data.bids[0][0]);
+      const bestAsk = parseFloat(data.asks[0][0]);
+      const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0;
+
+      return { obi, spreadPct, bestBid, bestAsk, bidVol, askVol };
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function fetchShortTermMomentum(symbol) {
+  try {
+    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=1h&limit=5`);
+    if (Array.isArray(klines) && klines.length >= 4) {
+      const latest = klines[klines.length - 1];
+      const prev1h = klines[klines.length - 2];
+      const prev4h = klines[0];
+
+      const currentClose = parseFloat(latest[4]) || 0;
+      const open1h = parseFloat(prev1h[1]) || currentClose;
+      const open4h = parseFloat(prev4h[1]) || currentClose;
+
+      const change1hPct = open1h > 0 ? ((currentClose - open1h) / open1h) * 100 : 0;
+      const change4hPct = open4h > 0 ? ((currentClose - open4h) / open4h) * 100 : 0;
+
+      return {
+        change1hPct: Number(change1hPct.toFixed(2)),
+        change4hPct: Number(change4hPct.toFixed(2))
+      };
+    }
+  } catch (e) {}
+  return { change1hPct: 0, change4hPct: 0 };
+}
+
+function calculateAccurateINRPrice(usdtPrice, rate) {
+  const rawINR = usdtPrice * rate;
+  if (rawINR >= 100) return Math.round(rawINR * 100) / 100;
+  if (rawINR >= 1) return Math.round(rawINR * 10000) / 10000;
+  return Number(rawINR.toFixed(8));
+}
+
+function formatBinanceUSDTPrice(usdtPrice) {
+  const num = Number(usdtPrice) || 0;
+  if (num >= 100) return Number(num.toFixed(2));
+  if (num >= 1) return Number(num.toFixed(4));
+  return Number(num.toFixed(8));
+}
+
 // -------------------------------------------------------------
 // PNL INTEGRITY AUDITOR & STATE PERSISTENCE
 // -------------------------------------------------------------
@@ -149,7 +226,6 @@ function sanitizeAndAuditTradeHistory(logs) {
     }
 
     if (Math.abs(pnlUSDT) > 5.0) {
-      console.warn(`[PnL Audit] Correcting anomalous trade PnL for trade #${l.id}: was $${pnlUSDT}, converting to true USDT.`);
       pnlUSDT = pnlUSDT / State.usdtToInrRate;
     }
 
@@ -192,7 +268,7 @@ function saveStateToDisk() {
       cooldowns: State.cooldowns,
       tradeFrequencyController: State.tradeFrequencyController,
       usdtToInrRate: State.usdtToInrRate,
-      googleSheetUrl: GOOGLE_SHEET_URL || State.googleSheetUrl
+      googleSheetUrl: State.googleSheetUrl
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(dataToSave, null, 2), 'utf-8');
     State.subsystems.persistence.totalDiskSaves++;
@@ -201,12 +277,11 @@ function saveStateToDisk() {
     State.subsystems.persistence.status = 'SYNCED';
   } catch (err) {
     State.subsystems.persistence.status = 'ERROR';
-    console.error('[Persistence] Error saving state:', err.message);
   }
 }
 
 async function syncWithGoogleDrive() {
-  const targetUrl = GOOGLE_SHEET_URL || State.googleSheetUrl;
+  const targetUrl = State.googleSheetUrl;
   if (!targetUrl) return;
 
   try {
@@ -214,7 +289,6 @@ async function syncWithGoogleDrive() {
     if (res.ok) {
       const data = await res.json();
       if (data && Array.isArray(data.trades) && data.trades.length > 0) {
-        console.log(`[Google Drive] Restored ${data.trades.length} historical trades from Google Sheet.`);
         const merged = sanitizeAndAuditTradeHistory([...data.trades, ...State.tradeLogs]);
         State.tradeLogs = merged;
         recalculateTrueRealizedPnL();
@@ -224,30 +298,27 @@ async function syncWithGoogleDrive() {
       }
     }
   } catch (err) {
-    console.warn('[Google Drive] Could not fetch trades from Google Sheet on boot:', err.message);
+    // Non-blocking on network failure
   }
 }
 
 async function appendTradeToGoogleDrive(tradeLog) {
-  const targetUrl = GOOGLE_SHEET_URL || State.googleSheetUrl;
+  const targetUrl = State.googleSheetUrl;
   if (!targetUrl) return;
 
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 6000);
-    const res = await fetch(targetUrl, {
+    await fetch(targetUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(tradeLog),
       signal: controller.signal
     });
     clearTimeout(timeout);
-    if (res.ok) {
-      console.log(`[Google Drive] Successfully saved trade #${tradeLog.id} (${tradeLog.pair}) to Google Sheet.`);
-      State.subsystems.persistence.googleSheetSync = 'SYNCED';
-    }
+    State.subsystems.persistence.googleSheetSync = 'SYNCED';
   } catch (err) {
-    console.warn('[Google Drive] Non-critical write error appending trade to Google Sheet:', err.message);
+    // Non-blocking
   }
 }
 
@@ -285,50 +356,12 @@ function loadStateFromDisk() {
       if (parsed.googleSheetUrl) {
         State.googleSheetUrl = parsed.googleSheetUrl;
       }
-
-      console.log(`[Persistence] Loaded & audited state successfully. True Realized PnL: $${State.portfolio.realizedPnL} USDT (${State.tradeLogs.length} trades)`);
     }
-  } catch (err) {
-    console.warn('[Persistence] Could not load state from disk:', err.message);
-  }
+  } catch (err) {}
 }
 
 loadStateFromDisk();
 syncWithGoogleDrive();
-async function fetchRealOrderBookDepth(symbol) {
-  try {
-    const data = await fetchFromBinance(`/api/v3/depth?symbol=${symbol}&limit=20`);
-    if (data && data.bids && data.asks && data.bids.length > 0 && data.asks.length > 0) {
-      let bidVol = 0;
-      let askVol = 0;
-      data.bids.forEach(b => { bidVol += parseFloat(b[1]) || 0; });
-      data.asks.forEach(a => { askVol += parseFloat(a[1]) || 0; });
-      const total = bidVol + askVol;
-      const obi = total > 0 ? bidVol / total : 0.50;
-
-      const bestBid = parseFloat(data.bids[0][0]);
-      const bestAsk = parseFloat(data.asks[0][0]);
-      const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0;
-
-      return { obi, spreadPct, bestBid, bestAsk, bidVol, askVol };
-    }
-  } catch (e) {}
-  return null;
-}
-
-function calculateAccurateINRPrice(usdtPrice, rate) {
-  const rawINR = usdtPrice * rate;
-  if (rawINR >= 100) return Math.round(rawINR * 100) / 100;
-  if (rawINR >= 1) return Math.round(rawINR * 10000) / 10000;
-  return Number(rawINR.toFixed(8));
-}
-
-function formatBinanceUSDTPrice(usdtPrice) {
-  const num = Number(usdtPrice) || 0;
-  if (num >= 100) return Number(num.toFixed(2));
-  if (num >= 1) return Number(num.toFixed(4));
-  return Number(num.toFixed(8));
-}
 
 // -------------------------------------------------------------
 // RECALIBRATED VOLATILITY REGIME DETECTOR
@@ -366,22 +399,21 @@ function calculateMarketVolatilityRegime() {
   const roundedRange = Math.round(avgRange * 10) / 10;
 
   let computedRegime = 'BALANCED';
-  let scoreThreshold = 81; // Recalibrated normal sweet spot
-  let obiThreshold = 0.56;   // 56% buyer dominance
+  let scoreThreshold = 81;
+  let obiThreshold = 0.56;
   let maxSpread = 0.08;
   let cooldownMinutes = 90;
 
-  // Turbulence Trigger: Whipsaw Protection
   if (avgRange >= 9.5) {
     computedRegime = 'TURBULENT';
-    scoreThreshold = 86; // Stricter confirmation during storms
+    scoreThreshold = 86;
     obiThreshold = 0.59;
     maxSpread = 0.06;
     cooldownMinutes = 120;
     State.tradeFrequencyController.circuitBreakerReason = 'TURBULENT_FREEZE';
   } else if (avgRange <= 4.0) {
     computedRegime = 'COMPRESSION';
-    scoreThreshold = 79; // Eased gate to catch quiet accumulation
+    scoreThreshold = 79;
     obiThreshold = 0.55;
     maxSpread = 0.09;
     cooldownMinutes = 60;
@@ -415,7 +447,7 @@ function calculateMarketVolatilityRegime() {
 }
 
 // -------------------------------------------------------------
-// 24-HOUR ROLLING TRADE QUOTA MANAGER (4-8 Trades Limit)
+// 24-HOUR ROLLING TRADE QUOTA MANAGER
 // -------------------------------------------------------------
 function syncRollingTradeQuota() {
   const now = Date.now();
@@ -463,28 +495,8 @@ function syncRollingTradeQuota() {
   State.subsystems.quotaManager.circuitBreakerRemainingSec = circuitBreakerRemainingSec;
 }
 
-  if (State.tradeFrequencyController.globalCircuitBreakerUntil > now) {
-    State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
-    State.subsystems.quotaManager.status = 'PAUSED_LOSS_COOLDOWN';
-  } else if (State.marketRegime === 'TURBULENT') {
-    State.tradeFrequencyController.circuitBreakerReason = 'TURBULENT_FREEZE';
-    State.subsystems.quotaManager.status = 'PAUSED_TURBULENCE';
-  } else if (remaining === 0) {
-    State.tradeFrequencyController.circuitBreakerReason = 'QUOTA_EXHAUSTED';
-    State.subsystems.quotaManager.status = 'QUOTA_FILLED';
-  } else {
-    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
-    State.subsystems.quotaManager.status = 'NORMAL';
-  }
-
-  State.subsystems.quotaManager.executed24hCount = count;
-  State.subsystems.quotaManager.maxAllowed = maxAllowed;
-  State.subsystems.quotaManager.quotaRemaining = remaining;
-  State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
-}
-
 // -------------------------------------------------------------
-// STAGE 1: DISCOVERY SCREENER (Dynamic $8M-$18M Floor + 1h/4h Surge)
+// STAGE 1 & 2: DISCOVERY SCREENER
 // -------------------------------------------------------------
 async function runDynamicMarketScreener() {
   State.subsystems.screener.status = 'SCANNING';
@@ -510,9 +522,6 @@ async function runDynamicMarketScreener() {
       const highPrice = parseFloat(t.highPrice) || 0;
       const lowPrice = parseFloat(t.lowPrice) || 0;
 
-      // Dynamic Liquidity Floor:
-      // If price change is surging (>= +5%), floor eases to $8M USDT.
-      // If moderate (>= +2%), floor is $12M. Otherwise, standard floor is $18M.
       let requiredFloor = 18000000;
       if (priceChangePct >= 5.0) requiredFloor = 8000000;
       else if (priceChangePct >= 2.0) requiredFloor = 12000000;
@@ -521,10 +530,8 @@ async function runDynamicMarketScreener() {
         const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
         const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
 
-        // Upper 60% of daily range (Bullish accumulation base)
         if (pricePositionInRange < 0.60) continue;
 
-        // Mathematical Discovery Scoring with RVOL & Range Proximity
         const liquidityDensityScore = Math.min(30, Math.log10(quoteVol) * 3.8);
         const rangeProximityBoost = pricePositionInRange * 15;
         const directionalMomentum = Math.max(0, priceChangePct) * 2.2;
@@ -556,13 +563,11 @@ async function runDynamicMarketScreener() {
     const neededSlots = Math.max(0, 10 - activeCandidates.length);
     const topPicks = [...activeCandidates, ...nonActiveSorted.slice(0, neededSlots)];
 
-    // Fetch 1h and 4h momentum velocity for top picks
     for (const p of topPicks) {
       const shortTerm = await fetchShortTermMomentum(p.symbol);
       p.change1hPct = shortTerm.change1hPct;
       p.change4hPct = shortTerm.change4hPct;
 
-      // Extra boost for fresh 1h and 4h acceleration
       if (p.change1hPct > 1.5) p.breakoutScore += (p.change1hPct * 1.8);
       if (p.change4hPct > 4.0) p.breakoutScore += (p.change4hPct * 1.2);
     }
@@ -595,7 +600,6 @@ async function runDynamicMarketScreener() {
       });
 
       State.universe = updatedUniverse;
-      console.log(`[Institutional Screener] Selected ${topPicks.length} candidates with dynamic floor and 1h/4h velocity.`);
       broadcastPricesOnly();
     }
 
@@ -604,12 +608,11 @@ async function runDynamicMarketScreener() {
     nextScreenerTargetTimestamp = Date.now() + (3 * 60 * 1000);
   } catch (err) {
     State.subsystems.screener.status = 'ERROR';
-    console.error('[Screener Error]', err.message);
   }
 }
 
 // -------------------------------------------------------------
-// STAGE 2: 20-LEVEL MICROSTRUCTURE QUANT EVALUATOR (15s Loop)
+// STAGE 3: 20-LEVEL MICROSTRUCTURE QUANT EVALUATOR
 // -------------------------------------------------------------
 async function runPureQuantScoring() {
   State.subsystems.microstructure.status = 'CALCULATING';
@@ -626,12 +629,10 @@ async function runPureQuantScoring() {
     coin.obi = book.obi;
     coin.spreadPct = book.spreadPct;
 
-    // Sub-score calculations with 1h & 24h momentum integration
     const s_obi = Math.min(40, Math.max(0, Math.round((book.obi - 0.40) * 140)));
     const changePct = typeof coin.priceChangePct === 'number' ? coin.priceChangePct : 2.0;
     const change1h = typeof coin.change1hPct === 'number' ? coin.change1hPct : 0;
     
-    // Blended momentum: 60% 24h + 40% 1h velocity
     const effectiveMom = (changePct * 0.6) + (change1h * 1.5);
     const s_mom = Math.min(35, Math.max(0, Math.round((effectiveMom + 2.5) * 3.6)));
     
@@ -666,7 +667,7 @@ async function runPureQuantScoring() {
 }
 
 // -------------------------------------------------------------
-// STAGE 3: LOW-FREQUENCY AUTOPILOT ENTRY MATRIX (4-8 Trades Limit)
+// AUTOPILOT ENTRY MATRIX
 // -------------------------------------------------------------
 async function evaluateAutopilotEntries(regimeConfig) {
   if (!State.autopilotEnabled) return;
@@ -698,26 +699,20 @@ async function evaluateAutopilotEntries(regimeConfig) {
       delete State.cooldowns[sym];
     }
 
-    // Gate 1: Recalibrated Score Threshold (>= 81 in Balanced)
     if (coin.score < config.scoreThreshold) continue;
 
-    // Gate 2: Live 20-Level Depth Inspection
     const book = await fetchRealOrderBookDepth(sym);
     if (!book) continue;
 
-    // Gate 3: Minimum Buyer Dominance (>= 56% Bids)
     if (book.obi < config.obiThreshold) continue;
 
-    // Gate 4: Strict Spread Ceiling (<= 0.08% for majors, <= 0.20% for micro-cents)
     const isMicroAsset = (coin.priceUSDT && coin.priceUSDT < 0.01);
     const allowedSpread = isMicroAsset ? 0.20 : config.maxSpread;
     if (book.spreadPct > allowedSpread) continue;
 
-    // Gate 5: Price Freshness & Sanity Check
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
 
-    // All Institutional Gates Passed -> Execute High-Conviction Order
     executeSimulatedBuy(
       sym, 
       coin.priceUSDT, 
@@ -728,7 +723,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
 }
 
 // -------------------------------------------------------------
-// ORDER EXECUTION & FEE-PROOF RISK MANAGEMENT
+// ORDER EXECUTION & RISK MANAGEMENT
 // -------------------------------------------------------------
 function executeSimulatedBuy(pairKey, priceUSDT, reason) {
   if (State.portfolio.cashUSDT < 30) return;
@@ -765,7 +760,6 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason) {
   State.tradeFrequencyController.rollingTrades24h.push(Date.now());
   syncRollingTradeQuota();
 
-  console.log(`[AUTOPILOT BUY] ${pairKey} @ $${priceUSDT} USDT (Qty: ${qty >= 1000 ? Math.round(qty).toLocaleString() : qty.toFixed(4)}) | Allocation: $${notionalUSDT} USDT | Quota: ${State.subsystems.quotaManager.executed24hCount}/${State.subsystems.quotaManager.maxAllowed}`);
   saveStateToDisk();
   broadcastState();
 }
@@ -789,7 +783,6 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   if (pnlUSDT < 0) {
     State.tradeFrequencyController.globalCircuitBreakerUntil = Date.now() + (20 * 60 * 1000);
     State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
-    console.warn(`[CIRCUIT BREAKER ACTIVATED] Loss incurred ($${pnlUSDT} USDT). Freezing all new entries for 20 minutes.`);
   }
 
   const istTime = new Date().toLocaleTimeString('en-IN', {
@@ -825,17 +818,13 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   recalculateTrueRealizedPnL();
   syncRollingTradeQuota();
 
-  console.log(`[POSITION EXIT] ${pairKey} via ${exitType} | PnL: $${pnlUSDT} USDT (≈ ₹${logEntry.pnlINR} INR) | ${exitReason} | Realized PnL: $${State.portfolio.realizedPnL}`);
-  
-  // Non-blocking persistent write directly to Google Drive spreadsheet
   appendTradeToGoogleDrive(logEntry);
-
   saveStateToDisk();
   broadcastState();
 }
 
 // -------------------------------------------------------------
-// SENTRY RISK MONITOR (Every 2.5s)
+// SENTRY RISK MONITOR
 // -------------------------------------------------------------
 async function monitorOpenPositionsHealth() {
   const openKeys = Object.keys(State.activePositions);
@@ -864,32 +853,26 @@ async function monitorOpenPositionsHealth() {
     const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
     const holdSeconds = (Date.now() - pos.openedAt) / 1000;
 
-    // 1. Take Profit 1 Target (+1.60%)
     if (livePriceUSDT >= pos.tp1) {
       settlePosition(sym, 'TP1 REACHED', livePriceUSDT, `Target reached (+${gainPct.toFixed(2)}%)`);
       continue;
     }
 
-    // 2. Trailing Breakeven Lock (+0.60% Trigger -> Locks +0.25% Net)
     if (gainPct >= 0.60 && !pos.isTrailingActive) {
       pos.isTrailingActive = true;
       pos.sl = pos.entryPriceUSDT * 1.0025;
-      console.log(`[FEE-PROOF TRAILING ACTIVE] ${sym} locked at +0.25%`);
     }
 
-    // 3. Stop Loss or Trailing Stop Boundary
     if (livePriceUSDT <= pos.sl) {
       settlePosition(sym, pos.isTrailingActive ? 'TRAILING SL' : 'STOP LOSS', livePriceUSDT, `Hit boundary (${gainPct.toFixed(2)}%)`);
       continue;
     }
 
-    // 4. Stagnation Cut (8-Minute Window)
     if (holdSeconds >= 480 && gainPct < 0.25) {
       settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, 'No momentum impulse within 8 minutes');
       continue;
     }
 
-    // 5. Predictive Risk Decay Scoring (Calibrated to prevent premature noise shakeouts)
     let decay = 5;
     const realBook = await fetchRealOrderBookDepth(sym);
 
@@ -907,9 +890,7 @@ async function monitorOpenPositionsHealth() {
 
     if (pos.decayRisk >= 50) highDecayCount++;
 
-    // Guard: Allow 90 seconds of post-entry breathing room before permitting predictive micro-cuts
     if (holdSeconds >= 90) {
-      // Calibrated from -0.20% to -0.50% with persistent decay >= 55%
       if (gainPct <= -0.50 && pos.decayRisk >= 55) {
         settlePosition(sym, 'PREDICTIVE SL', livePriceUSDT, `Loss mitigated at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
         continue;
@@ -922,7 +903,7 @@ async function monitorOpenPositionsHealth() {
 }
 
 // -------------------------------------------------------------
-// LIVE BINANCE PRICE FEED (Every 2.5s)
+// LIVE BINANCE PRICE FEED
 // -------------------------------------------------------------
 async function syncLiveBinancePrices() {
   try {
@@ -949,9 +930,7 @@ async function syncLiveBinancePrices() {
     State.subsystems.screener.nextRunCountdownSec = remainingSec;
 
     broadcastPricesOnly();
-  } catch (e) {
-    console.error('[Price Sync Error]', e.message);
-  }
+  } catch (e) {}
 }
 
 // -------------------------------------------------------------
@@ -1059,7 +1038,7 @@ app.get('/api/state', (req, res) => {
     tradeFrequencyController: State.tradeFrequencyController,
     subsystems: State.subsystems,
     usdtToInrRate: State.usdtToInrRate,
-    googleSheetUrl: GOOGLE_SHEET_URL || State.googleSheetUrl
+    googleSheetUrl: State.googleSheetUrl
   });
 });
 
@@ -1074,25 +1053,6 @@ app.post('/api/settings/googlesheet', (req, res) => {
   } else {
     res.status(400).json({ success: false, message: 'Invalid URL' });
   }
-});
-});
-
-// -------------------------------------------------------------
-// REST API ENDPOINTS
-// -------------------------------------------------------------
-app.get('/api/state', (req, res) => {
-  res.json({
-    portfolio: State.portfolio,
-    activePositions: State.activePositions,
-    universe: State.universe,
-    tradeLogs: State.tradeLogs.slice(0, 100),
-    quantTelemetry: State.quantTelemetry,
-    marketRegime: State.marketRegime,
-    activeThresholds: State.activeThresholds,
-    tradeFrequencyController: State.tradeFrequencyController,
-    subsystems: State.subsystems,
-    usdtToInrRate: State.usdtToInrRate
-  });
 });
 
 app.get('/api/screener/run', async (req, res) => {
