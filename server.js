@@ -1,8 +1,10 @@
-const express = require('express');
-const http = require('http');
-const path = require('path');
-const fs = require('fs');
-const { WebSocketServer, WebSocket } = require('ws');
+process.on('uncaughtException', (err) => {
+  console.error('[Process UncaughtException]', err.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Process UnhandledRejection]', reason);
+});
 
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
@@ -139,9 +141,13 @@ async function fetchFromBinance(endpoint) {
   const base = 'https://data-api.binance.vision';
   const url = `${base}${endpoint}`;
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
     const res = await fetch(url, {
-      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY },
+      signal: controller.signal
     });
+    clearTimeout(timeout);
     if (!res.ok) return null;
     return await res.json();
   } catch (err) {
@@ -152,7 +158,7 @@ async function fetchFromBinance(endpoint) {
 async function fetchRealOrderBookDepth(symbol) {
   try {
     const data = await fetchFromBinance(`/api/v3/depth?symbol=${symbol}&limit=20`);
-    if (data && data.bids && data.asks && data.bids.length > 0 && data.asks.length > 0) {
+    if (data && Array.isArray(data.bids) && Array.isArray(data.asks) && data.bids.length > 0 && data.asks.length > 0) {
       let bidVol = 0;
       let askVol = 0;
       data.bids.forEach(b => { bidVol += parseFloat(b[1]) || 0; });
