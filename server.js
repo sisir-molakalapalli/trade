@@ -64,6 +64,7 @@ const State = {
   googleSheetUrl: GOOGLE_SHEET_URL,
 
   tradeFrequencyController: {
+    quotaBypassEnabled: false, // Set to true to disable the 8-trade cap for full 48h stress-testing
     baseMaxTradesPer24h: 8,
     maxTradesPer24h: 8,
     vipAlphaSlotsAllowed: 2,
@@ -138,6 +139,7 @@ const State = {
     },
     quotaManager: {
       status: 'NORMAL',
+      quotaBypassEnabled: false,
       executed24hCount: 0,
       maxAllowed: 8,
       baseMaxAllowed: 8,
@@ -654,6 +656,8 @@ function syncRollingTradeQuota() {
     .filter(ts => typeof ts === 'number' && !isNaN(ts) && ts > dayAgo && ts <= now)
     .sort((a, b) => a - b);
 
+  const isBypassActive = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
+
   // 1. Calculate consecutive winning streak from recent settled trades in 24h
   let currentStreak = 0;
   let rollingNetGainUSDT = 0;
@@ -685,7 +689,7 @@ function syncRollingTradeQuota() {
   }
 
   const baseMax = State.tradeFrequencyController.baseMaxTradesPer24h || 8;
-  const dynamicMaxAllowed = baseMax + bonusSlots;
+  const dynamicMaxAllowed = isBypassActive ? 9999 : (baseMax + bonusSlots);
 
   State.tradeFrequencyController.bonusSlotsEarned = bonusSlots;
   State.tradeFrequencyController.consecutiveWinStreak = currentStreak;
@@ -693,20 +697,20 @@ function syncRollingTradeQuota() {
   State.tradeFrequencyController.maxTradesPer24h = dynamicMaxAllowed;
 
   const count = State.tradeFrequencyController.rollingTrades24h.length;
-  const remaining = Math.max(0, dynamicMaxAllowed - count);
+  const remaining = isBypassActive ? 999 : Math.max(0, dynamicMaxAllowed - count);
 
   // VIP Alpha Slots (Max 2 Reserve Overrides per 24h)
   const vipUsed = State.tradeFrequencyController.vipTrades24h.length;
   const vipMax = State.tradeFrequencyController.vipAlphaSlotsAllowed || 2;
-  const vipRemaining = Math.max(0, vipMax - vipUsed);
+  const vipRemaining = isBypassActive ? 999 : Math.max(0, vipMax - vipUsed);
   State.tradeFrequencyController.vipAlphaSlotsUsed24h = vipUsed;
 
   // Accurate Slot Expiration Tracking
   let resetTimeMin = 0;
   let nextReleaseTimestamp = 0;
-  let formattedReset = 'All Slots Open';
+  let formattedReset = isBypassActive ? 'UNLIMITED TRADES ACTIVE' : 'All Slots Open';
 
-  if (count > 0) {
+  if (count > 0 && !isBypassActive) {
     const oldest = Math.min(...State.tradeFrequencyController.rollingTrades24h);
     nextReleaseTimestamp = oldest + (24 * 60 * 60 * 1000);
     const msRemaining = Math.max(0, nextReleaseTimestamp - now);
@@ -730,6 +734,9 @@ function syncRollingTradeQuota() {
     circuitBreakerRemainingSec = Math.round((State.tradeFrequencyController.globalCircuitBreakerUntil - now) / 1000);
     State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
     State.subsystems.quotaManager.status = 'PAUSED_LOSS_COOLDOWN';
+  } else if (isBypassActive) {
+    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
+    State.subsystems.quotaManager.status = 'UNLIMITED_BYPASS_ACTIVE';
   } else if (remaining === 0 && vipRemaining > 0) {
     State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
     State.subsystems.quotaManager.status = 'VIP_ALPHA_SNIPER_ACTIVE';
@@ -741,14 +748,15 @@ function syncRollingTradeQuota() {
     State.subsystems.quotaManager.status = 'NORMAL';
   }
 
+  State.subsystems.quotaManager.quotaBypassEnabled = isBypassActive;
   State.subsystems.quotaManager.executed24hCount = count;
-  State.subsystems.quotaManager.maxAllowed = dynamicMaxAllowed;
+  State.subsystems.quotaManager.maxAllowed = isBypassActive ? 'UNLIMITED' : dynamicMaxAllowed;
   State.subsystems.quotaManager.baseMaxAllowed = baseMax;
   State.subsystems.quotaManager.bonusSlotsEarned = bonusSlots;
   State.subsystems.quotaManager.consecutiveWinStreak = currentStreak;
   State.subsystems.quotaManager.streakBonusReason = streakReason;
-  State.subsystems.quotaManager.quotaRemaining = remaining;
-  State.subsystems.quotaManager.vipSlotsRemaining = vipRemaining;
+  State.subsystems.quotaManager.quotaRemaining = isBypassActive ? '∞' : remaining;
+  State.subsystems.quotaManager.vipSlotsRemaining = isBypassActive ? '∞' : vipRemaining;
   State.subsystems.quotaManager.vipSlotsUsed = vipUsed;
   State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
   State.subsystems.quotaManager.nextSlotReleaseTimestamp = nextReleaseTimestamp;
@@ -904,8 +912,9 @@ async function evaluateAutopilotEntries(regimeConfig) {
   if (State.warmupCycles < 1) return;
 
   const config = regimeConfig || State.activeThresholds;
-  const standardQuotaAvailable = State.subsystems.quotaManager.quotaRemaining > 0;
-  const vipSlotsRemaining = State.subsystems.quotaManager.vipSlotsRemaining || 0;
+  const isBypassActive = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
+  const standardQuotaAvailable = isBypassActive || (State.subsystems.quotaManager.quotaRemaining > 0);
+  const vipSlotsRemaining = isBypassActive ? 999 : (State.subsystems.quotaManager.vipSlotsRemaining || 0);
 
   // If neither standard quota nor VIP reserve is available, abort
   if (!standardQuotaAvailable && vipSlotsRemaining <= 0) return;
@@ -934,12 +943,12 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
 
-    // Check Case A: Standard Quota Available
+    // Check Case A: Standard Quota Available (or Quota Bypass is Active)
     if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold) {
       executeSimulatedBuy(
         sym, 
         coin.priceUSDT, 
-        `AQPE High-Conviction Confluence (${config.regime}|${config.pacingMode}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%, Spread ${book.spreadPct.toFixed(2)}%)`,
+        `AQPE High-Conviction Confluence (${config.regime}|${config.pacingMode}${isBypassActive ? '|UNLIMITED' : ''}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%, Spread ${book.spreadPct.toFixed(2)}%)`,
         false
       );
       break;
@@ -1370,6 +1379,11 @@ wss.on('connection', ws => {
         State.autopilotEnabled = Boolean(data.enabled);
         saveStateToDisk();
         broadcastState();
+      } else if (data.type === 'TOGGLE_QUOTA_BYPASS') {
+        State.tradeFrequencyController.quotaBypassEnabled = Boolean(data.bypass);
+        syncRollingTradeQuota();
+        saveStateToDisk();
+        broadcastState();
       } else if (data.type === 'CLOSE_POSITION' && data.pairKey) {
         const livePriceUSDT = State.universe[data.pairKey]?.priceUSDT || State.activePositions[data.pairKey]?.entryPriceUSDT;
         if (livePriceUSDT) settlePosition(data.pairKey, 'MANUAL EXIT', livePriceUSDT, 'Closed by user command');
@@ -1388,6 +1402,33 @@ wss.on('connection', ws => {
 // -------------------------------------------------------------
 // REST API ENDPOINTS
 // -------------------------------------------------------------
+app.get('/api/quota/toggle-bypass', (req, res) => {
+  const current = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
+  State.tradeFrequencyController.quotaBypassEnabled = !current;
+  syncRollingTradeQuota();
+  saveStateToDisk();
+  broadcastState();
+  res.json({
+    success: true,
+    quotaBypassEnabled: State.tradeFrequencyController.quotaBypassEnabled,
+    status: State.subsystems.quotaManager.status,
+    maxAllowed: State.subsystems.quotaManager.maxAllowed
+  });
+});
+
+app.post('/api/quota/set-bypass', (req, res) => {
+  const enabled = Boolean(req.body && req.body.enabled);
+  State.tradeFrequencyController.quotaBypassEnabled = enabled;
+  syncRollingTradeQuota();
+  saveStateToDisk();
+  broadcastState();
+  res.json({
+    success: true,
+    quotaBypassEnabled: State.tradeFrequencyController.quotaBypassEnabled,
+    status: State.subsystems.quotaManager.status
+  });
+});
+
 app.get('/api/state', (req, res) => {
   res.json({
     portfolio: State.portfolio,
