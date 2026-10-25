@@ -74,6 +74,7 @@ const State = {
     streakBonusReason: 'BASELINE',
     maxConcurrentPositions: 2,
     rollingTrades24h: [],
+    nextSlotReleaseTimestamp: 0,
     globalCircuitBreakerUntil: 0,
     circuitBreakerReason: 'NORMAL',
     pacingMode: 'BALANCED',
@@ -90,16 +91,6 @@ const State = {
     pacingGateOffset: 0,
     vipScoreThreshold: 88,
     vipObiThreshold: 0.60
-  },
-
-  activeThresholds: {
-    regime: 'BALANCED',
-    scoreThreshold: 80,
-    obiThreshold: 0.55,
-    maxSpread: 0.08,
-    cooldownMinutes: 90,
-    marketAvgRange: 4.5,
-    pacingGateOffset: 0
   },
 
   portfolio: {
@@ -154,7 +145,8 @@ const State = {
       vipSlotsUsed: 0,
       quotaRemaining: 8,
       resetOldestSlotInMin: 0,
-      formattedReset: 'None Pending',
+      nextSlotReleaseTimestamp: 0,
+      formattedReset: 'All Slots Open',
       circuitBreakerRemainingSec: 0,
       pacingMode: 'BALANCED'
     },
@@ -485,35 +477,36 @@ function recalculateTrueRealizedPnL() {
 function reconcileRollingTradeQuotaFromHistory() {
   const now = Date.now();
   const dayAgo = now - (24 * 60 * 60 * 1000);
-  const timestamps = new Set(State.tradeFrequencyController.rollingTrades24h || []);
-  const vipTimestamps = new Set(State.tradeFrequencyController.vipTrades24h || []);
+  const timestamps = new Set();
+  const vipTimestamps = new Set();
 
   // 1. Add timestamps from all executed trade logs within last 24h
   State.tradeLogs.forEach(l => {
-    if (l && l.id && l.id > dayAgo && l.id <= now) {
-      timestamps.add(l.id);
+    const tradeTs = Number(l.id);
+    // Only accept valid timestamps strictly within the past 24 hours up to right now
+    if (!isNaN(tradeTs) && tradeTs > dayAgo && tradeTs <= now) {
+      timestamps.add(tradeTs);
       if (l.type && l.type.includes('VIP')) {
-        vipTimestamps.add(l.id);
+        vipTimestamps.add(tradeTs);
       }
     }
   });
 
   // 2. Add timestamps from currently open active positions
   Object.values(State.activePositions || {}).forEach(pos => {
-    if (pos && pos.openedAt && pos.openedAt > dayAgo) {
-      timestamps.add(pos.openedAt);
+    const openTs = Number(pos.openedAt);
+    if (!isNaN(openTs) && openTs > dayAgo && openTs <= now) {
+      timestamps.add(openTs);
       if (pos.isVipAlpha) {
-        vipTimestamps.add(pos.openedAt);
+        vipTimestamps.add(openTs);
       }
     }
   });
 
   State.tradeFrequencyController.rollingTrades24h = Array.from(timestamps)
-    .filter(ts => ts > dayAgo)
     .sort((a, b) => a - b);
 
   State.tradeFrequencyController.vipTrades24h = Array.from(vipTimestamps)
-    .filter(ts => ts > dayAgo)
     .sort((a, b) => a - b);
 
   syncRollingTradeQuota();
@@ -654,10 +647,12 @@ function syncRollingTradeQuota() {
   const dayAgo = now - (24 * 60 * 60 * 1000);
   
   State.tradeFrequencyController.rollingTrades24h = (State.tradeFrequencyController.rollingTrades24h || [])
-    .filter(ts => ts > dayAgo);
+    .filter(ts => typeof ts === 'number' && !isNaN(ts) && ts > dayAgo && ts <= now)
+    .sort((a, b) => a - b);
 
   State.tradeFrequencyController.vipTrades24h = (State.tradeFrequencyController.vipTrades24h || [])
-    .filter(ts => ts > dayAgo);
+    .filter(ts => typeof ts === 'number' && !isNaN(ts) && ts > dayAgo && ts <= now)
+    .sort((a, b) => a - b);
 
   // 1. Calculate consecutive winning streak from recent settled trades in 24h
   let currentStreak = 0;
@@ -706,16 +701,29 @@ function syncRollingTradeQuota() {
   const vipRemaining = Math.max(0, vipMax - vipUsed);
   State.tradeFrequencyController.vipAlphaSlotsUsed24h = vipUsed;
 
+  // Accurate Slot Expiration Tracking
   let resetTimeMin = 0;
-  let formattedReset = 'None Pending';
+  let nextReleaseTimestamp = 0;
+  let formattedReset = 'All Slots Open';
+
   if (count > 0) {
     const oldest = Math.min(...State.tradeFrequencyController.rollingTrades24h);
-    const msRemaining = Math.max(0, (oldest + (24 * 60 * 60 * 1000)) - now);
-    resetTimeMin = Math.round(msRemaining / 60000);
+    nextReleaseTimestamp = oldest + (24 * 60 * 60 * 1000);
+    const msRemaining = Math.max(0, nextReleaseTimestamp - now);
+    resetTimeMin = Math.ceil(msRemaining / 60000);
     const hrs = Math.floor(resetTimeMin / 60);
     const mins = resetTimeMin % 60;
-    formattedReset = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
+    
+    if (msRemaining <= 0) {
+      formattedReset = 'Slot Freeing Up...';
+    } else if (remaining === 0) {
+      formattedReset = hrs > 0 ? `Next Slot in ${hrs}h ${mins}m` : `Next Slot in ${mins}m`;
+    } else {
+      formattedReset = hrs > 0 ? `+1 Slot in ${hrs}h ${mins}m (${remaining} open)` : `+1 Slot in ${mins}m (${remaining} open)`;
+    }
   }
+
+  State.tradeFrequencyController.nextSlotReleaseTimestamp = nextReleaseTimestamp;
 
   let circuitBreakerRemainingSec = 0;
   if (State.tradeFrequencyController.globalCircuitBreakerUntil > now) {
@@ -743,6 +751,7 @@ function syncRollingTradeQuota() {
   State.subsystems.quotaManager.vipSlotsRemaining = vipRemaining;
   State.subsystems.quotaManager.vipSlotsUsed = vipUsed;
   State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
+  State.subsystems.quotaManager.nextSlotReleaseTimestamp = nextReleaseTimestamp;
   State.subsystems.quotaManager.formattedReset = formattedReset;
   State.subsystems.quotaManager.circuitBreakerRemainingSec = circuitBreakerRemainingSec;
 }
