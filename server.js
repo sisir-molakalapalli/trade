@@ -64,7 +64,11 @@ const State = {
   googleSheetUrl: GOOGLE_SHEET_URL,
 
   tradeFrequencyController: {
+    baseMaxTradesPer24h: 8,
     maxTradesPer24h: 8,
+    bonusSlotsEarned: 0,
+    consecutiveWinStreak: 0,
+    streakBonusReason: 'BASELINE',
     maxConcurrentPositions: 2,
     rollingTrades24h: [],
     globalCircuitBreakerUntil: 0,
@@ -440,6 +444,8 @@ function sanitizeAndAuditTradeHistory(logs) {
     l.pnlINR = Number((pnlUSDT * State.usdtToInrRate).toFixed(2));
     l.entryPriceUSDT = formatBinanceUSDTPrice(entryUSDT);
     l.exitPriceUSDT = formatBinanceUSDTPrice(exitUSDT);
+    l.regime = l.regime || 'BALANCED';
+    l.volatilityPct = typeof l.volatilityPct === 'number' ? l.volatilityPct : 4.5;
 
     map.set(l.id, l);
   });
@@ -612,108 +618,7 @@ syncWithGoogleDrive();
 syncBinanceP2PUsdtInrRate();
 
 // -------------------------------------------------------------
-// RECALIBRATED VOLATILITY REGIME & ACTIVE PACING DETECTOR
-// -------------------------------------------------------------
-function calculateMarketVolatilityRegime() {
-  const coins = Object.values(State.universe);
-  if (coins.length === 0) {
-    return {
-      regime: 'BALANCED',
-      scoreThreshold: 80,
-      obiThreshold: 0.55,
-      maxSpread: 0.08,
-      cooldownMinutes: 90,
-      marketAvgRange: 4.5
-    };
-  }
-
-  const ranges = [];
-  coins.forEach(c => {
-    let range = 0;
-    if (typeof c.intradayRangePct === 'number' && c.intradayRangePct > 0) {
-      range = c.intradayRangePct;
-    } else if (typeof c.priceChangePct === 'number') {
-      range = Math.abs(c.priceChangePct) * 1.4;
-    }
-    if (range > 0) ranges.push(range);
-  });
-
-  ranges.sort((a, b) => a - b);
-  const medianRange = ranges.length > 0 ? ranges[Math.floor(ranges.length / 2)] : 4.5;
-  const roundedRange = Math.round(medianRange * 10) / 10;
-
-  let computedRegime = 'BALANCED';
-  let scoreThreshold = 80;
-  let obiThreshold = 0.55;
-  let maxSpread = 0.08;
-  let cooldownMinutes = 90;
-
-  if (medianRange >= 9.5) {
-    computedRegime = 'TURBULENT';
-    scoreThreshold = 85;
-    obiThreshold = 0.58;
-    maxSpread = 0.07;
-    cooldownMinutes = 120;
-  } else if (medianRange <= 4.0) {
-    computedRegime = 'COMPRESSION';
-    scoreThreshold = 77;
-    obiThreshold = 0.54;
-    maxSpread = 0.09;
-    cooldownMinutes = 60;
-  }
-
-  const now = Date.now();
-  const sixHoursAgo = now - (6 * 60 * 60 * 1000);
-  const recentTradesCount = (State.tradeFrequencyController.rollingTrades24h || []).filter(ts => ts > sixHoursAgo).length;
-  const remaining = Math.max(0, State.tradeFrequencyController.maxTradesPer24h - (State.tradeFrequencyController.rollingTrades24h || []).length);
-
-  let pacingMode = 'BALANCED';
-  let pacingOffset = 0;
-
-  if (remaining >= 6 && recentTradesCount === 0) {
-    pacingMode = 'STARVED';
-    pacingOffset = -2;
-    screenerIntervalMs = 90 * 1000;
-  } else if (remaining <= 2 || recentTradesCount >= 4) {
-    pacingMode = 'SATURATED';
-    pacingOffset = +2;
-    screenerIntervalMs = 180 * 1000;
-  } else {
-    pacingMode = 'BALANCED';
-    pacingOffset = 0;
-    screenerIntervalMs = 120 * 1000;
-  }
-
-  State.tradeFrequencyController.pacingMode = pacingMode;
-  State.subsystems.quotaManager.pacingMode = pacingMode;
-  State.subsystems.screener.cadenceSec = Math.round(screenerIntervalMs / 1000);
-
-  const finalScoreGate = Math.max(74, scoreThreshold + pacingOffset);
-
-  State.subsystems.regimeController.status = 'ACTIVE';
-  State.subsystems.regimeController.currentRegime = computedRegime;
-  State.subsystems.regimeController.marketAvgVolatilityPct = roundedRange;
-  State.subsystems.regimeController.liveScoreGate = finalScoreGate;
-  State.subsystems.regimeController.liveObiGatePct = Math.round(obiThreshold * 100);
-  State.subsystems.regimeController.liveMaxSpreadPct = maxSpread;
-  State.subsystems.regimeController.lastAdjustmentTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-
-  State.activeThresholds = {
-    regime: computedRegime,
-    scoreThreshold: finalScoreGate,
-    obiThreshold,
-    maxSpread,
-    cooldownMinutes,
-    marketAvgRange: roundedRange,
-    pacingMode,
-    pacingGateOffset: pacingOffset
-  };
-
-  return State.activeThresholds;
-}
-
-// -------------------------------------------------------------
-// 24-HOUR ROLLING TRADE QUOTA MANAGER
+// 24-HOUR ROLLING TRADE QUOTA MANAGER WITH DYNAMIC RATCHET
 // -------------------------------------------------------------
 function syncRollingTradeQuota() {
   const now = Date.now();
@@ -722,9 +627,49 @@ function syncRollingTradeQuota() {
   State.tradeFrequencyController.rollingTrades24h = (State.tradeFrequencyController.rollingTrades24h || [])
     .filter(ts => ts > dayAgo);
 
+  // 1. Calculate consecutive winning streak from recent settled trades in 24h
+  let currentStreak = 0;
+  let rollingNetGainUSDT = 0;
+  const recentLogs24h = State.tradeLogs.filter(l => l && l.id && l.id > dayAgo);
+
+  for (const log of recentLogs24h) {
+    const pnl = Number(log.pnlUSDT || 0);
+    rollingNetGainUSDT += pnl;
+    if (pnl > 0.10) {
+      currentStreak++;
+    } else if (pnl < -0.05) {
+      break; // Streak terminates at first net loss
+    }
+  }
+
+  // 2. Dynamic Earned Quota Ratchet:
+  // Base: 8 trades/24h.
+  // 3+ consecutive wins + positive net gain => +2 bonus slots (max 10)
+  // 5+ consecutive wins + >= $2.00 net gain => +4 bonus slots (max 12)
+  let bonusSlots = 0;
+  let streakReason = 'BASELINE';
+
+  if (currentStreak >= 5 && rollingNetGainUSDT >= 2.00) {
+    bonusSlots = 4;
+    streakReason = 'SUPER_STREAK (+4 SLOTS)';
+  } else if (currentStreak >= 3 && rollingNetGainUSDT >= 0.80) {
+    bonusSlots = 2;
+    streakReason = 'HOT_STREAK (+2 SLOTS)';
+  } else {
+    bonusSlots = 0;
+    streakReason = 'BASELINE';
+  }
+
+  const baseMax = State.tradeFrequencyController.baseMaxTradesPer24h || 8;
+  const dynamicMaxAllowed = baseMax + bonusSlots;
+
+  State.tradeFrequencyController.bonusSlotsEarned = bonusSlots;
+  State.tradeFrequencyController.consecutiveWinStreak = currentStreak;
+  State.tradeFrequencyController.streakBonusReason = streakReason;
+  State.tradeFrequencyController.maxTradesPer24h = dynamicMaxAllowed;
+
   const count = State.tradeFrequencyController.rollingTrades24h.length;
-  const maxAllowed = State.tradeFrequencyController.maxTradesPer24h;
-  const remaining = Math.max(0, maxAllowed - count);
+  const remaining = Math.max(0, dynamicMaxAllowed - count);
 
   let resetTimeMin = 0;
   let formattedReset = 'None Pending';
@@ -751,7 +696,11 @@ function syncRollingTradeQuota() {
   }
 
   State.subsystems.quotaManager.executed24hCount = count;
-  State.subsystems.quotaManager.maxAllowed = maxAllowed;
+  State.subsystems.quotaManager.maxAllowed = dynamicMaxAllowed;
+  State.subsystems.quotaManager.baseMaxAllowed = baseMax;
+  State.subsystems.quotaManager.bonusSlotsEarned = bonusSlots;
+  State.subsystems.quotaManager.consecutiveWinStreak = currentStreak;
+  State.subsystems.quotaManager.streakBonusReason = streakReason;
   State.subsystems.quotaManager.quotaRemaining = remaining;
   State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
   State.subsystems.quotaManager.formattedReset = formattedReset;
@@ -1097,7 +1046,9 @@ function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
     pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2)),
     reason: exitReason,
     time: istTime,
-    date: istDate
+    date: istDate,
+    regime: State.activeThresholds?.regime || State.marketRegime || 'BALANCED',
+    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
   };
 
   State.tradeLogs.unshift(logEntry);
@@ -1105,6 +1056,7 @@ function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
 
   recalculateTrueRealizedPnL();
   appendTradeToGoogleDrive(logEntry);
+  syncRollingTradeQuota();
   saveStateToDisk();
   broadcastState();
 }
@@ -1127,6 +1079,9 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
     State.cooldowns[pairKey] = Date.now() + (cooldownMinutes * 60 * 1000);
     State.tradeFrequencyController.globalCircuitBreakerUntil = Date.now() + (20 * 60 * 1000);
     State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
+    // Instant Retract Guard: Any single loss collapses bonus quota slots back to baseline
+    State.tradeFrequencyController.consecutiveWinStreak = 0;
+    State.tradeFrequencyController.bonusSlotsEarned = 0;
   }
 
   const now = new Date();
@@ -1154,7 +1109,9 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
     pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2)),
     reason: exitReason,
     time: istTime,
-    date: istDate
+    date: istDate,
+    regime: State.activeThresholds?.regime || State.marketRegime || 'BALANCED',
+    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
   };
 
   State.tradeLogs.unshift(logEntry);
@@ -1508,7 +1465,9 @@ app.get('/api/settings/googlesheet/test', async (req, res) => {
     exitPriceUSDT: 101.60,
     pnlUSDT: 0.80,
     pnlINR: Number((0.80 * State.usdtToInrRate).toFixed(2)),
-    reason: 'Manual diagnostic test from Render'
+    reason: 'Manual diagnostic test from Render',
+    regime: State.activeThresholds?.regime || 'BALANCED',
+    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
   };
 
   try {
