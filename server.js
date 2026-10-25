@@ -256,7 +256,6 @@ async function syncBinanceP2PUsdtInrRate() {
           const fx = await fxRes.json();
           const inr = fx?.rates?.INR;
           if (inr && inr > 75) {
-            // Add historical Binance P2P premium over official RBI FX (~6-7% average)
             rateFound = Math.round((inr * 1.065) * 100) / 100;
           }
         }
@@ -269,7 +268,6 @@ async function syncBinanceP2PUsdtInrRate() {
       State.p2pLastUpdated = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
       State.quantTelemetry.p2pRateStatus = `Live Binance P2P: ₹${roundedRate} (Synced at ${State.p2pLastUpdated})`;
 
-      // Recalculate priceINR across all universe coins
       Object.keys(State.universe).forEach(k => {
         if (State.universe[k].priceUSDT) {
           State.universe[k].priceINR = calculateAccurateINRPrice(State.universe[k].priceUSDT, roundedRate);
@@ -345,14 +343,79 @@ function formatBinanceUSDTPrice(usdtPrice) {
 }
 
 // -------------------------------------------------------------
-// PNL INTEGRITY AUDITOR & STATE PERSISTENCE
+// PNL INTEGRITY AUDITOR & INTELLIGENT DATE SANITIZATION
 // -------------------------------------------------------------
+function cleanAndNormalizeDateString(rawDate, rawTime, timestampId) {
+  const dateStr = String(rawDate || '').trim();
+  const timeStr = String(rawTime || '').trim();
+
+  // If date contains 1899, 1970, or is empty/corrupted, reconstruct from timestamp
+  const isCorrupted = !dateStr || 
+    dateStr.includes('1899') || 
+    dateStr.includes('1970') || 
+    dateStr.includes('GMT') || 
+    dateStr.length > 25;
+
+  let validTimestamp = Number(timestampId);
+  // Valid timestamp between years 2024 and 2035 (approx 1.7e12 to 2.1e12 ms)
+  const isProperEpochMs = !isNaN(validTimestamp) && validTimestamp > 1700000000000 && validTimestamp < 2100000000000;
+
+  if (isCorrupted || !isProperEpochMs) {
+    const fallbackDate = isProperEpochMs ? new Date(validTimestamp) : new Date();
+    
+    const formattedDate = fallbackDate.toLocaleDateString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    });
+
+    const formattedTime = timeStr && !timeStr.includes('1899') && !timeStr.includes('GMT') 
+      ? timeStr 
+      : fallbackDate.toLocaleTimeString('en-IN', {
+          timeZone: 'Asia/Kolkata',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: true
+        });
+
+    return { date: formattedDate, time: formattedTime };
+  }
+
+  // If date was a formatted date object like "2026-10-25T..." or similar
+  if (dateStr.includes('T') || dateStr.includes('-')) {
+    const parsed = new Date(dateStr);
+    if (!isNaN(parsed.getTime()) && parsed.getFullYear() > 2020) {
+      const cleanDate = parsed.toLocaleDateString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric'
+      });
+      return { date: cleanDate, time: timeStr || parsed.toLocaleTimeString('en-IN') };
+    }
+  }
+
+  return { date: dateStr, time: timeStr };
+}
+
 function sanitizeAndAuditTradeHistory(logs) {
   if (!Array.isArray(logs)) return [];
   
   const map = new Map();
   logs.forEach(l => {
-    if (!l || !l.id) return;
+    if (!l) return;
+    
+    let id = Number(l.id);
+    if (!id || isNaN(id) || id < 1000000) {
+      id = Date.now() - Math.floor(Math.random() * 50000);
+      l.id = id;
+    }
+
+    const { date, time } = cleanAndNormalizeDateString(l.date, l.time, id);
+    l.date = date;
+    l.time = time;
     
     let pnlUSDT = 0;
     if (typeof l.pnlUSDT === 'number' && !isNaN(l.pnlUSDT)) {
@@ -467,7 +530,7 @@ async function syncWithGoogleDrive() {
         State.subsystems.persistence.googleSheetSync = 'ACTIVE';
         saveStateToDisk();
         broadcastState();
-        console.log(`[GoogleSheet Sync] Successfully restored ${data.trades.length} trades from Google Drive`);
+        console.log(`[GoogleSheet Sync] Successfully restored ${data.trades.length} trades from Google Drive with clean dates.`);
       }
     }
   } catch (err) {
@@ -540,7 +603,6 @@ function loadStateFromDisk() {
         State.googleSheetUrl = parsed.googleSheetUrl;
       }
     }
-    // Always reconcile 24h rolling quota so no app reload or server reboot resets it
     reconcileRollingTradeQuotaFromHistory();
   } catch (err) {}
 }
@@ -948,7 +1010,6 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason) {
 
   State.portfolio.cashUSDT -= notionalUSDT;
 
-  // Adaptive hard SL: Allow 0.95% for micro/sub-cent assets, 0.80% for standard assets
   const isMicroAsset = (priceUSDT < 0.10);
   const slPct = isMicroAsset ? 0.0095 : 0.0080;
   const sl = priceUSDT * (1 - slPct);
@@ -1011,14 +1072,15 @@ function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
     State.portfolio.holdings[pairKey].totalCostUSDT = halfNotional;
   }
 
-  const istTime = new Date().toLocaleTimeString('en-IN', {
+  const now = new Date();
+  const istTime = now.toLocaleTimeString('en-IN', {
     timeZone: 'Asia/Kolkata',
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
     hour12: true
   });
-  const istDate = new Date().toLocaleDateString('en-IN', {
+  const istDate = now.toLocaleDateString('en-IN', {
     timeZone: 'Asia/Kolkata',
     day: '2-digit',
     month: 'short',
@@ -1067,14 +1129,15 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
     State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
   }
 
-  const istTime = new Date().toLocaleTimeString('en-IN', {
+  const now = new Date();
+  const istTime = now.toLocaleTimeString('en-IN', {
     timeZone: 'Asia/Kolkata',
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
     hour12: true
   });
-  const istDate = new Date().toLocaleDateString('en-IN', {
+  const istDate = now.toLocaleDateString('en-IN', {
     timeZone: 'Asia/Kolkata',
     day: '2-digit',
     month: 'short',
@@ -1168,7 +1231,7 @@ async function monitorOpenPositionsHealth() {
         continue;
       }
 
-      // 5. Stagnation Exit: Extended to 12 minutes (720s) for high-momentum assets to allow the secondary leg to form
+      // 5. Stagnation Exit: Extended to 12 minutes (720s) for high-momentum assets
       const maxStagnationSeconds = (State.universe[sym]?.priceChangePct >= 5.0) ? 720 : 540;
       if (holdSeconds >= maxStagnationSeconds && gainPct < 0.25) {
         settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, `No momentum continuation within ${Math.round(maxStagnationSeconds/60)} minutes`);
@@ -1184,12 +1247,10 @@ async function monitorOpenPositionsHealth() {
       if (realBook.obi < 0.38) decay += 25;
       else if (realBook.obi < 0.46) decay += 10;
       
-      // Avoid penalizing natural discrete tick spreads on sub-cent coins
       const spreadPenaltyThreshold = isMicroAsset ? 0.30 : 0.12;
       if (realBook.spreadPct > spreadPenaltyThreshold) decay += 15;
     }
 
-    // Scaled price drop penalties
     const dipThreshold1 = isMicroAsset ? -0.45 : -0.30;
     const dipThreshold2 = isMicroAsset ? -0.65 : -0.45;
     if (gainPct <= dipThreshold1) decay += 15;
@@ -1198,7 +1259,6 @@ async function monitorOpenPositionsHealth() {
     pos.decayRisk = Math.min(100, decay);
     pos.predictiveStatus = pos.decayRisk >= 55 ? 'EXITING' : (pos.decayRisk >= 30 ? 'CAUTION' : 'SAFE');
 
-    // Multi-tick persistent confirmation guard (requires 3 consecutive ticks of decay)
     if (pos.decayRisk >= 55) {
       pos.consecutiveDecayTicks = (pos.consecutiveDecayTicks || 0) + 1;
       highDecayCount++;
@@ -1206,11 +1266,7 @@ async function monitorOpenPositionsHealth() {
       pos.consecutiveDecayTicks = 0;
     }
 
-    // 7. Predictive Cut Protection Window:
-    // Requires: 
-    // a) At least 150 seconds (2.5m) passed (allowing breakout retest)
-    // b) Position dip exceeds threshold (-0.75% for micro, -0.55% for standard)
-    // c) Book decay confirmed across 3 consecutive cycles (>= 7.5 seconds)
+    // 7. Predictive Cut Protection Window (Requires 150s grace + 3-tick decay)
     const predictiveDipGate = isMicroAsset ? -0.75 : -0.55;
     if (holdSeconds >= 150 && !pos.tp1Secured) {
       if (gainPct <= predictiveDipGate && (pos.consecutiveDecayTicks >= 3)) {
@@ -1441,10 +1497,11 @@ app.get('/api/settings/googlesheet/test', async (req, res) => {
     return res.status(400).json({ success: false, message: 'GOOGLE_SHEET_URL is not set.' });
   }
 
+  const now = new Date();
   const testPayload = {
     id: Date.now(),
-    date: new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }),
-    time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    date: now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' }),
+    time: now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
     pair: 'TEST/USDT',
     type: 'SYNC TEST',
     entryPriceUSDT: 100.00,
@@ -1514,7 +1571,5 @@ server.listen(PORT, '0.0.0.0', () => {
   setTimeout(runDynamicMarketScreener, 2000);
   setInterval(runPureQuantScoring, 15 * 1000);
   setInterval(syncLiveBinancePrices, 2500);
-
-  // Sync Binance P2P Rate every 1 hour & at midnight (daily guarantee)
   setInterval(syncBinanceP2PUsdtInrRate, 60 * 60 * 1000);
 });
