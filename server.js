@@ -66,6 +66,9 @@ const State = {
   tradeFrequencyController: {
     baseMaxTradesPer24h: 8,
     maxTradesPer24h: 8,
+    vipAlphaSlotsAllowed: 2,
+    vipAlphaSlotsUsed24h: 0,
+    vipTrades24h: [],
     bonusSlotsEarned: 0,
     consecutiveWinStreak: 0,
     streakBonusReason: 'BASELINE',
@@ -75,6 +78,18 @@ const State = {
     circuitBreakerReason: 'NORMAL',
     pacingMode: 'BALANCED',
     targetCadenceHours: 3.0
+  },
+
+  activeThresholds: {
+    regime: 'BALANCED',
+    scoreThreshold: 80,
+    obiThreshold: 0.55,
+    maxSpread: 0.08,
+    cooldownMinutes: 90,
+    marketAvgRange: 4.5,
+    pacingGateOffset: 0,
+    vipScoreThreshold: 88,
+    vipObiThreshold: 0.60
   },
 
   activeThresholds: {
@@ -134,11 +149,14 @@ const State = {
       status: 'NORMAL',
       executed24hCount: 0,
       maxAllowed: 8,
+      baseMaxAllowed: 8,
+      vipSlotsRemaining: 2,
+      vipSlotsUsed: 0,
       quotaRemaining: 8,
       resetOldestSlotInMin: 0,
       formattedReset: 'None Pending',
       circuitBreakerRemainingSec: 0,
-      pacingMode: 'STARVED'
+      pacingMode: 'BALANCED'
     },
     persistence: {
       status: 'SYNCED',
@@ -468,11 +486,15 @@ function reconcileRollingTradeQuotaFromHistory() {
   const now = Date.now();
   const dayAgo = now - (24 * 60 * 60 * 1000);
   const timestamps = new Set(State.tradeFrequencyController.rollingTrades24h || []);
+  const vipTimestamps = new Set(State.tradeFrequencyController.vipTrades24h || []);
 
   // 1. Add timestamps from all executed trade logs within last 24h
   State.tradeLogs.forEach(l => {
     if (l && l.id && l.id > dayAgo && l.id <= now) {
       timestamps.add(l.id);
+      if (l.type && l.type.includes('VIP')) {
+        vipTimestamps.add(l.id);
+      }
     }
   });
 
@@ -480,10 +502,17 @@ function reconcileRollingTradeQuotaFromHistory() {
   Object.values(State.activePositions || {}).forEach(pos => {
     if (pos && pos.openedAt && pos.openedAt > dayAgo) {
       timestamps.add(pos.openedAt);
+      if (pos.isVipAlpha) {
+        vipTimestamps.add(pos.openedAt);
+      }
     }
   });
 
   State.tradeFrequencyController.rollingTrades24h = Array.from(timestamps)
+    .filter(ts => ts > dayAgo)
+    .sort((a, b) => a - b);
+
+  State.tradeFrequencyController.vipTrades24h = Array.from(vipTimestamps)
     .filter(ts => ts > dayAgo)
     .sort((a, b) => a - b);
 
@@ -618,13 +647,16 @@ syncWithGoogleDrive();
 syncBinanceP2PUsdtInrRate();
 
 // -------------------------------------------------------------
-// 24-HOUR ROLLING TRADE QUOTA MANAGER WITH DYNAMIC RATCHET
+// 24-HOUR ROLLING TRADE QUOTA MANAGER WITH DYNAMIC RATCHET & VIP ALPHA
 // -------------------------------------------------------------
 function syncRollingTradeQuota() {
   const now = Date.now();
   const dayAgo = now - (24 * 60 * 60 * 1000);
   
   State.tradeFrequencyController.rollingTrades24h = (State.tradeFrequencyController.rollingTrades24h || [])
+    .filter(ts => ts > dayAgo);
+
+  State.tradeFrequencyController.vipTrades24h = (State.tradeFrequencyController.vipTrades24h || [])
     .filter(ts => ts > dayAgo);
 
   // 1. Calculate consecutive winning streak from recent settled trades in 24h
@@ -643,9 +675,6 @@ function syncRollingTradeQuota() {
   }
 
   // 2. Dynamic Earned Quota Ratchet:
-  // Base: 8 trades/24h.
-  // 3+ consecutive wins + positive net gain => +2 bonus slots (max 10)
-  // 5+ consecutive wins + >= $2.00 net gain => +4 bonus slots (max 12)
   let bonusSlots = 0;
   let streakReason = 'BASELINE';
 
@@ -671,6 +700,12 @@ function syncRollingTradeQuota() {
   const count = State.tradeFrequencyController.rollingTrades24h.length;
   const remaining = Math.max(0, dynamicMaxAllowed - count);
 
+  // VIP Alpha Slots (Max 2 Reserve Overrides per 24h)
+  const vipUsed = State.tradeFrequencyController.vipTrades24h.length;
+  const vipMax = State.tradeFrequencyController.vipAlphaSlotsAllowed || 2;
+  const vipRemaining = Math.max(0, vipMax - vipUsed);
+  State.tradeFrequencyController.vipAlphaSlotsUsed24h = vipUsed;
+
   let resetTimeMin = 0;
   let formattedReset = 'None Pending';
   if (count > 0) {
@@ -687,7 +722,10 @@ function syncRollingTradeQuota() {
     circuitBreakerRemainingSec = Math.round((State.tradeFrequencyController.globalCircuitBreakerUntil - now) / 1000);
     State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
     State.subsystems.quotaManager.status = 'PAUSED_LOSS_COOLDOWN';
-  } else if (remaining === 0) {
+  } else if (remaining === 0 && vipRemaining > 0) {
+    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
+    State.subsystems.quotaManager.status = 'VIP_ALPHA_SNIPER_ACTIVE';
+  } else if (remaining === 0 && vipRemaining === 0) {
     State.tradeFrequencyController.circuitBreakerReason = 'QUOTA_EXHAUSTED';
     State.subsystems.quotaManager.status = 'QUOTA_FILLED';
   } else {
@@ -702,6 +740,8 @@ function syncRollingTradeQuota() {
   State.subsystems.quotaManager.consecutiveWinStreak = currentStreak;
   State.subsystems.quotaManager.streakBonusReason = streakReason;
   State.subsystems.quotaManager.quotaRemaining = remaining;
+  State.subsystems.quotaManager.vipSlotsRemaining = vipRemaining;
+  State.subsystems.quotaManager.vipSlotsUsed = vipUsed;
   State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
   State.subsystems.quotaManager.formattedReset = formattedReset;
   State.subsystems.quotaManager.circuitBreakerRemainingSec = circuitBreakerRemainingSec;
@@ -729,8 +769,9 @@ async function runDynamicMarketScreener() {
 
     for (const t of tickers) {
       if (!t.symbol.endsWith('USDT')) continue;
-      const base = t.symbol.replace('USDT', '');
-      if (['UP', 'DOWN', 'BEAR', 'BULL', 'USDC', 'FDUSD', 'TUSD', 'EUR', 'DAI'].some(x => base.endsWith(x))) continue;
+      const base = t.symbol.slice(0, -4);
+      // Strictly guard single-letter tickers (like TUSDT) from matching pegged tokens
+      if (['UP', 'DOWN', 'BEAR', 'BULL', 'USDC', 'FDUSD', 'TUSD', 'EUR', 'DAI', 'USDP', 'BUSD'].includes(base)) continue;
 
       const quoteVol = parseFloat(t.quoteVolume) || 0;
       const lastPrice = parseFloat(t.lastPrice) || 0;
@@ -838,62 +879,7 @@ function scheduleNextScreenerRun() {
 }
 
 // -------------------------------------------------------------
-// STAGE 3: 20-LEVEL MICROSTRUCTURE QUANT EVALUATOR
-// -------------------------------------------------------------
-async function runPureQuantScoring() {
-  State.subsystems.microstructure.status = 'CALCULATING';
-  const symbols = Object.keys(State.universe);
-  const now = Date.now();
-
-  for (const sym of symbols) {
-    const coin = State.universe[sym];
-    if (!coin) continue;
-
-    const book = await fetchRealOrderBookDepth(sym);
-    if (!book) continue;
-
-    coin.obi = book.obi;
-    coin.spreadPct = book.spreadPct;
-
-    const s_obi = Math.min(40, Math.max(0, Math.round((book.obi - 0.40) * 140)));
-    const changePct = typeof coin.priceChangePct === 'number' ? coin.priceChangePct : 2.0;
-    const change1h = typeof coin.change1hPct === 'number' ? coin.change1hPct : 0;
-    
-    const effectiveMom = (changePct * 0.6) + (change1h * 1.5);
-    const s_mom = Math.min(35, Math.max(0, Math.round((effectiveMom + 2.5) * 3.6)));
-    
-    const volM = coin.volumeM || 25;
-    const s_vol = Math.min(25, Math.max(5, Math.round(Math.log10(Math.max(1, volM)) * 8.5)));
-
-    const compositeScore = Math.min(98, Math.max(45, s_obi + s_mom + s_vol));
-    coin.score = compositeScore;
-
-    if (compositeScore >= 81 && book.obi >= 0.56) {
-      coin.direction = 'STRONG BUY';
-      coin.reasoning = `High Conviction Confluence: OBI ${(book.obi * 100).toFixed(0)}% Bids, Score ${compositeScore}/100`;
-    } else if (compositeScore >= 75) {
-      coin.direction = 'BUY';
-      coin.reasoning = `Moderate Bid Inflow: Score ${compositeScore}, OBI ${(book.obi * 100).toFixed(0)}%`;
-    } else {
-      coin.direction = 'NEUTRAL';
-      coin.reasoning = `Consolidation Base: OBI ${(book.obi * 100).toFixed(0)}%`;
-    }
-
-    coin.verifiedAt = now;
-  }
-
-  State.subsystems.microstructure.cyclesCompleted++;
-  State.subsystems.microstructure.lastCycleTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-  State.subsystems.microstructure.status = 'ONLINE';
-  State.quantTelemetry.lastAnalysisTime = State.subsystems.microstructure.lastCycleTime;
-
-  const regimeConfig = calculateMarketVolatilityRegime();
-  syncRollingTradeQuota();
-  await evaluateAutopilotEntries(regimeConfig);
-}
-
-// -------------------------------------------------------------
-// AUTOPILOT ENTRY MATRIX
+// AUTOPILOT ENTRY MATRIX WITH VIP ALPHA OVERRIDE
 // -------------------------------------------------------------
 async function evaluateAutopilotEntries(regimeConfig) {
   if (!State.autopilotEnabled) return;
@@ -901,7 +887,6 @@ async function evaluateAutopilotEntries(regimeConfig) {
   syncRollingTradeQuota();
 
   if (State.tradeFrequencyController.circuitBreakerReason !== 'NORMAL') return;
-  if (State.subsystems.quotaManager.quotaRemaining <= 0) return;
 
   const currentCount = Object.keys(State.activePositions).length;
   if (currentCount >= State.tradeFrequencyController.maxConcurrentPositions) return;
@@ -910,6 +895,11 @@ async function evaluateAutopilotEntries(regimeConfig) {
   if (State.warmupCycles < 1) return;
 
   const config = regimeConfig || State.activeThresholds;
+  const standardQuotaAvailable = State.subsystems.quotaManager.quotaRemaining > 0;
+  const vipSlotsRemaining = State.subsystems.quotaManager.vipSlotsRemaining || 0;
+
+  // If neither standard quota nor VIP reserve is available, abort
+  if (!standardQuotaAvailable && vipSlotsRemaining <= 0) return;
 
   const sortedCandidates = Object.keys(State.universe)
     .filter(k => !State.activePositions[k])
@@ -925,12 +915,8 @@ async function evaluateAutopilotEntries(regimeConfig) {
       delete State.cooldowns[sym];
     }
 
-    if (coin.score < config.scoreThreshold) continue;
-
     const book = await fetchRealOrderBookDepth(sym);
     if (!book) continue;
-
-    if (book.obi < config.obiThreshold) continue;
 
     const isMicroAsset = (coin.priceUSDT && coin.priceUSDT < 0.01);
     const allowedSpread = isMicroAsset ? 0.35 : config.maxSpread;
@@ -939,19 +925,40 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
 
-    executeSimulatedBuy(
-      sym, 
-      coin.priceUSDT, 
-      `AQPE High-Conviction Confluence (${config.regime}|${config.pacingMode}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%, Spread ${book.spreadPct.toFixed(2)}%)`
-    );
-    break;
+    // Check Case A: Standard Quota Available
+    if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold) {
+      executeSimulatedBuy(
+        sym, 
+        coin.priceUSDT, 
+        `AQPE High-Conviction Confluence (${config.regime}|${config.pacingMode}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%, Spread ${book.spreadPct.toFixed(2)}%)`,
+        false
+      );
+      break;
+    }
+
+    // Check Case B: VIP Alpha Override Gate (When standard quota exhausted)
+    // Catches God-candle surges like T/USDT (+22%) or ANIME (+20%)
+    if (!standardQuotaAvailable && vipSlotsRemaining > 0) {
+      const isExtremeMomentum = (coin.change1hPct >= 5.0 || coin.priceChangePct >= 12.0);
+      const isExtremeConfluence = (coin.score >= 88 && book.obi >= 0.60);
+
+      if (isExtremeMomentum && isExtremeConfluence) {
+        executeSimulatedBuy(
+          sym,
+          coin.priceUSDT,
+          `⚡ VIP Alpha Override Slot (${vipSlotsRemaining} left): God-Candle Breakout! Score ${coin.score} >= 88, OBI ${(book.obi * 100).toFixed(0)}% >= 60%, 1h: +${(coin.change1hPct || 0).toFixed(1)}%, 24h: +${coin.priceChangePct.toFixed(1)}%`,
+          true
+        );
+        break;
+      }
+    }
   }
 }
 
 // -------------------------------------------------------------
 // ORDER EXECUTION & RISK MANAGEMENT
 // -------------------------------------------------------------
-function executeSimulatedBuy(pairKey, priceUSDT, reason) {
+function executeSimulatedBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
   if (State.portfolio.cashUSDT < 30) return;
   
   const notionalUSDT = Math.min(50, State.portfolio.cashUSDT);
@@ -980,7 +987,8 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason) {
     highWatermarkUSDT: priceUSDT,
     decayRisk: 5,
     consecutiveDecayTicks: 0,
-    predictiveStatus: 'SAFE'
+    predictiveStatus: 'SAFE',
+    isVipAlpha
   };
 
   State.portfolio.holdings[pairKey] = {
@@ -991,6 +999,10 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason) {
   };
 
   State.tradeFrequencyController.rollingTrades24h.push(Date.now());
+  if (isVipAlpha) {
+    State.tradeFrequencyController.vipTrades24h.push(Date.now());
+  }
+
   syncRollingTradeQuota();
 
   saveStateToDisk();
