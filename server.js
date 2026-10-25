@@ -359,13 +359,106 @@ function formatBinanceUSDTPrice(usdtPrice) {
 }
 
 // -------------------------------------------------------------
+// IST DATE & TIME TIMESTAMP PARSER
+// -------------------------------------------------------------
+const MONTH_MAP = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+};
+
+function parseIstDateTimeToEpoch(dateStr, timeStr) {
+  let day, month, year;
+  const dClean = String(dateStr || '').trim();
+
+  const alphaMatch = dClean.match(/([a-zA-Z]{3,9})/);
+  if (alphaMatch) {
+    const monthKey = alphaMatch[1].slice(0, 3).toLowerCase();
+    if (MONTH_MAP[monthKey] !== undefined) {
+      month = MONTH_MAP[monthKey];
+      const numbers = dClean.match(/\d+/g);
+      if (numbers && numbers.length >= 2) {
+        if (numbers[0].length === 4) {
+          year = parseInt(numbers[0], 10);
+          day = parseInt(numbers[1], 10);
+        } else {
+          day = parseInt(numbers[0], 10);
+          year = parseInt(numbers[1].length === 4 ? numbers[1] : (numbers[2] || numbers[1]), 10);
+        }
+      }
+    }
+  } else if (dClean.includes('/') || dClean.includes('-')) {
+    const parts = dClean.split(/[\/\-]/);
+    if (parts.length === 3) {
+      if (parts[0].length === 4) {
+        year = parseInt(parts[0], 10);
+        month = parseInt(parts[1], 10) - 1;
+        day = parseInt(parts[2], 10);
+      } else {
+        day = parseInt(parts[0], 10);
+        month = parseInt(parts[1], 10) - 1;
+        year = parseInt(parts[2], 10);
+      }
+    }
+  }
+
+  if (!year || isNaN(year) || !day || isNaN(day) || month === undefined || isNaN(month)) {
+    return 0;
+  }
+  if (year < 100) year += 2000;
+
+  let hours = 0, minutes = 0, seconds = 0;
+  const tClean = String(timeStr || '').trim().toUpperCase();
+  const isPM = tClean.includes('PM');
+  const isAM = tClean.includes('AM');
+  const timeNums = tClean.match(/\d+/g);
+  if (timeNums && timeNums.length >= 2) {
+    hours = parseInt(timeNums[0], 10);
+    minutes = parseInt(timeNums[1], 10);
+    if (timeNums.length >= 3) {
+      seconds = parseInt(timeNums[2], 10);
+    }
+    if (isPM && hours < 12) hours += 12;
+    if (isAM && hours === 12) hours = 0;
+  }
+
+  const istOffsetMs = (5 * 60 + 30) * 60 * 1000;
+  return Date.UTC(year, month, day, hours, minutes, seconds) - istOffsetMs;
+}
+
+function parseTradeTimestamp(trade) {
+  if (!trade) return 0;
+
+  if (trade.date && typeof trade.date === 'string') {
+    const dateClean = trade.date.trim();
+    const timeClean = String(trade.time || '12:00:00 AM').trim();
+
+    if (!dateClean.includes('1899') && !dateClean.includes('1970')) {
+      const parsedMs = parseIstDateTimeToEpoch(dateClean, timeClean);
+      if (parsedMs > 1700000000000 && parsedMs < 2500000000000) {
+        return parsedMs;
+      }
+    }
+  }
+
+  let numId = Number(String(trade.id || '').replace(/[^0-9]/g, ''));
+  if (!isNaN(numId) && numId > 1700000000000 && numId < 2500000000000) {
+    return numId;
+  }
+
+  if (!isNaN(numId) && numId > 1700000000 && numId < 2500000000) {
+    return numId * 1000;
+  }
+
+  return 0;
+}
+
+// -------------------------------------------------------------
 // PNL INTEGRITY AUDITOR & INTELLIGENT DATE SANITIZATION
 // -------------------------------------------------------------
 function cleanAndNormalizeDateString(rawDate, rawTime, timestampId) {
   const dateStr = String(rawDate || '').trim();
   const timeStr = String(rawTime || '').trim();
 
-  // If date contains 1899, 1970, or is empty/corrupted, reconstruct from timestamp
   const isCorrupted = !dateStr || 
     dateStr.includes('1899') || 
     dateStr.includes('1970') || 
@@ -373,7 +466,6 @@ function cleanAndNormalizeDateString(rawDate, rawTime, timestampId) {
     dateStr.length > 25;
 
   let validTimestamp = Number(timestampId);
-  // Valid timestamp between years 2024 and 2035 (approx 1.7e12 to 2.1e12 ms)
   const isProperEpochMs = !isNaN(validTimestamp) && validTimestamp > 1700000000000 && validTimestamp < 2100000000000;
 
   if (isCorrupted || !isProperEpochMs) {
@@ -399,7 +491,6 @@ function cleanAndNormalizeDateString(rawDate, rawTime, timestampId) {
     return { date: formattedDate, time: formattedTime };
   }
 
-  // If date was a formatted date object like "2026-10-25T..." or similar
   if (dateStr.includes('T') || dateStr.includes('-')) {
     const parsed = new Date(dateStr);
     if (!isNaN(parsed.getTime()) && parsed.getFullYear() > 2020) {
@@ -423,11 +514,12 @@ function sanitizeAndAuditTradeHistory(logs) {
   logs.forEach(l => {
     if (!l) return;
     
-    let id = Number(l.id);
+    const parsedEpoch = parseTradeTimestamp(l);
+    let id = parsedEpoch > 0 ? parsedEpoch : Number(l.id);
     if (!id || isNaN(id) || id < 1000000) {
-      id = Date.now() - Math.floor(Math.random() * 50000);
-      l.id = id;
+      id = Date.now() - (25 * 60 * 60 * 1000);
     }
+    l.id = id;
 
     const { date, time } = cleanAndNormalizeDateString(l.date, l.time, id);
     l.date = date;
@@ -482,11 +574,10 @@ function reconcileRollingTradeQuotaFromHistory() {
   const timestamps = new Set();
   const vipTimestamps = new Set();
 
-  // 1. Add timestamps from all executed trade logs within last 24h
+  // 1. Add timestamps from all executed trade logs strictly within last 24h
   State.tradeLogs.forEach(l => {
-    const tradeTs = Number(l.id);
-    // Only accept valid timestamps strictly within the past 24 hours up to right now
-    if (!isNaN(tradeTs) && tradeTs > dayAgo && tradeTs <= now) {
+    const tradeTs = parseTradeTimestamp(l);
+    if (tradeTs > 0 && tradeTs > dayAgo && tradeTs <= now) {
       timestamps.add(tradeTs);
       if (l.type && l.type.includes('VIP')) {
         vipTimestamps.add(tradeTs);
@@ -661,7 +752,10 @@ function syncRollingTradeQuota() {
   // 1. Calculate consecutive winning streak from recent settled trades in 24h
   let currentStreak = 0;
   let rollingNetGainUSDT = 0;
-  const recentLogs24h = State.tradeLogs.filter(l => l && l.id && l.id > dayAgo);
+  const recentLogs24h = State.tradeLogs.filter(l => {
+    const ts = parseTradeTimestamp(l);
+    return ts > dayAgo && ts <= now;
+  });
 
   for (const log of recentLogs24h) {
     const pnl = Number(log.pnlUSDT || 0);
@@ -1384,6 +1478,10 @@ wss.on('connection', ws => {
         syncRollingTradeQuota();
         saveStateToDisk();
         broadcastState();
+      } else if (data.type === 'RECONCILE_QUOTA') {
+        reconcileRollingTradeQuotaFromHistory();
+        saveStateToDisk();
+        broadcastState();
       } else if (data.type === 'CLOSE_POSITION' && data.pairKey) {
         const livePriceUSDT = State.universe[data.pairKey]?.priceUSDT || State.activePositions[data.pairKey]?.entryPriceUSDT;
         if (livePriceUSDT) settlePosition(data.pairKey, 'MANUAL EXIT', livePriceUSDT, 'Closed by user command');
@@ -1402,6 +1500,19 @@ wss.on('connection', ws => {
 // -------------------------------------------------------------
 // REST API ENDPOINTS
 // -------------------------------------------------------------
+app.get('/api/quota/reconcile', (req, res) => {
+  reconcileRollingTradeQuotaFromHistory();
+  saveStateToDisk();
+  broadcastState();
+  res.json({
+    success: true,
+    rollingTrades24h: State.tradeFrequencyController.rollingTrades24h,
+    executed24hCount: State.subsystems.quotaManager.executed24hCount,
+    quotaRemaining: State.subsystems.quotaManager.quotaRemaining,
+    formattedReset: State.subsystems.quotaManager.formattedReset
+  });
+});
+
 app.get('/api/quota/toggle-bypass', (req, res) => {
   const current = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
   State.tradeFrequencyController.quotaBypassEnabled = !current;
