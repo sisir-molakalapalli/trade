@@ -126,7 +126,7 @@ const State = {
       nextRunCountdownSec: 90,
       scannedPairsCount: 0,
       qualifiedCandidatesCount: 0,
-      liquidityFloorUSD: 'Dynamic ($1.5M-$10M)',
+      liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)',
       cadenceSec: 90
     },
     regimeController: {
@@ -145,7 +145,7 @@ const State = {
       activePositionsMonitored: 0,
       recoveryBagsMonitored: 0,
       trailingLocksActive: 0,
-      architecture: 'Alternative 5: Spot Recovery Bag (Zero Realized Loss Model)'
+      architecture: 'High-Sustain Confluence + Zero Realized Loss Recovery Bag'
     },
     recoveryManager: {
       status: 'ONLINE',
@@ -945,11 +945,17 @@ async function runDynamicMarketScreener() {
       const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
       const vwapPremiumPct = vwapPrice > 0 ? ((lastPrice - vwapPrice) / vwapPrice) * 100 : 0;
 
-      let requiredFloor = 10000000;
-      if (priceChangePct >= 5.0 || (vwapPremiumPct >= 3.0 && pricePositionInRange >= 0.72)) {
-        requiredFloor = 1500000;
-      } else if (priceChangePct >= 2.5 || vwapPremiumPct >= 1.8) {
-        requiredFloor = 2500000;
+      if (lastPrice <= 0 || highPrice <= lowPrice) continue;
+
+      // -----------------------------------------------------------
+      // HIGH-SUSTAIN INSTITUTIONAL LIQUIDITY FLOOR
+      // Filters out fragile micro-caps ($1.5M) that lack bid depth to sustain price.
+      // -----------------------------------------------------------
+      let requiredFloor = 10000000; // $10M standard
+      if (priceChangePct >= 5.0 && vwapPremiumPct >= 2.5 && pricePositionInRange >= 0.72) {
+        requiredFloor = 3500000; // $3.5M minimum for clean breakouts
+      } else if (priceChangePct >= 2.5 || vwapPremiumPct >= 1.5) {
+        requiredFloor = 5000000; // $5.0M for moderate momentum
       } else if (isCompression || isStarved) {
         requiredFloor = 4500000;
       }
@@ -982,7 +988,7 @@ async function runDynamicMarketScreener() {
     }
 
     State.subsystems.screener.qualifiedCandidatesCount = candidates.length;
-    State.subsystems.screener.liquidityFloorUSD = 'Dynamic ($1.5M-$10M)';
+    State.subsystems.screener.liquidityFloorUSD = 'High-Sustain ($3.5M-$12M)';
 
     const activeCandidates = candidates.filter(c => c.isActive);
     const nonActiveSorted = candidates
@@ -999,9 +1005,14 @@ async function runDynamicMarketScreener() {
       p.change4hPct = shortTerm.change4hPct;
       p.rvol = shortTerm.rvol;
 
-      if (p.change15mPct >= 1.5) p.breakoutScore += (p.change15mPct * 4.5);
+      // Penalize dead-cat bounces where 4h is sharply negative
+      if (p.change4hPct < -4.0 && p.change15mPct > 0) {
+        p.breakoutScore -= 12; // De-prioritize counter-trend relief pops
+      }
+
+      if (p.change15mPct >= 1.5 && p.change1hPct >= 0) p.breakoutScore += (p.change15mPct * 4.5);
       if (p.change1hPct >= 1.0) p.breakoutScore += (p.change1hPct * 2.5);
-      if (p.change4hPct >= 2.5) p.breakoutScore += (p.change4hPct * 1.2);
+      if (p.change4hPct >= 2.0) p.breakoutScore += (p.change4hPct * 1.2);
       if (p.rvol >= 1.8 && (p.change15mPct > 0.5 || p.change1hPct > 1.0)) {
         p.breakoutScore += Math.min(18, (p.rvol - 1.0) * 5.0);
       }
@@ -1308,7 +1319,24 @@ async function evaluateAutopilotEntries(regimeConfig) {
     const book = await fetchRealOrderBookDepth(sym);
     if (!book) continue;
 
-    if ((coin.change15mPct || 0) >= 12.0 && book.obi < 0.60) continue;
+    // -----------------------------------------------------------
+    // HIGH-SUSTAIN CONFLUENCE GATES (PREVENTING UNNECESSARY BAG TRANSFERS)
+    // -----------------------------------------------------------
+    
+    // Gate 1: Anti-Top Exhaustion Filter
+    // If 15m is already up > 4.5%, buying at the top of the candle guarantees getting wicked.
+    // Must have massive bid depth (OBI >= 0.60) or be early in momentum to justify entry.
+    const isExhaustionCandle = (coin.change15mPct >= 4.5 && book.obi < 0.60);
+    if (isExhaustionCandle) continue;
+
+    // Gate 2: Multi-Timeframe (MTF) Confirmation
+    // Avoid dead-cat relief rallies (e.g. 15m up, but 1h and 4h heavily dumping)
+    const isMacroDowntrend = (coin.change1hPct < -0.8 && coin.change4hPct < -3.5);
+    if (isMacroDowntrend) continue;
+
+    // Gate 3: VWAP Premium Alignment
+    // Must be trading at or above VWAP (institutional accumulation signature)
+    if (coin.vwapPremiumPct !== undefined && coin.vwapPremiumPct < -0.5) continue;
 
     const isSubCent = (coin.priceUSDT && coin.priceUSDT < 0.01);
     const isLowDollarAlt = (coin.priceUSDT && coin.priceUSDT >= 0.01 && coin.priceUSDT < 1.50);
@@ -1323,24 +1351,25 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
 
-    // Case A1: Standard Breakout Confluence
-    if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold) {
+    // Case A1: Standard Breakout Confluence (MTF confirmed + OBI support)
+    const mtfConfirmed = (coin.change1hPct >= 0.2 || coin.vwapPremiumPct >= 1.0);
+    if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold && mtfConfirmed) {
       executeSpotBuy(
         sym, 
         coin.priceUSDT, 
-        `Spot Confluence (${config.regime}|${config.pacingMode}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}%, 15m +${(coin.change15mPct || 0).toFixed(1)}%)`,
+        `High-Sustain Confluence (${config.regime}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}%, 15m +${(coin.change15mPct || 0).toFixed(1)}%, 1h +${(coin.change1hPct || 0).toFixed(1)}%)`,
         false
       );
       break;
     }
 
-    // Case A2: Ignition Spike Fast-Track
-    const isVerifiedIgnition = isHighVelocitySpike && (coin.rvol || 1) >= 1.6 && (coin.pricePositionInRange || 0.6) >= 0.68;
-    if (standardQuotaAvailable && isVerifiedIgnition && coin.score >= (config.scoreThreshold - 2) && book.obi >= 0.52) {
+    // Case A2: Ignition Spike Fast-Track (Volume backed + non-exhausted)
+    const isVerifiedIgnition = isHighVelocitySpike && (coin.rvol || 1) >= 1.8 && (coin.pricePositionInRange || 0.6) >= 0.70 && (coin.change15mPct <= 5.5);
+    if (standardQuotaAvailable && isVerifiedIgnition && coin.score >= (config.scoreThreshold - 2) && book.obi >= 0.54) {
       executeSpotBuy(
         sym,
         coin.priceUSDT,
-        `🚀 Ignition Fast-Track (${sym}: 15m +${(coin.change15mPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x, Score ${coin.score})`,
+        `🚀 High-Sustain Ignition (${sym}: 15m +${(coin.change15mPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x, OBI ${(book.obi * 100).toFixed(0)}%)`,
         false
       );
       break;
@@ -1348,8 +1377,8 @@ async function evaluateAutopilotEntries(regimeConfig) {
 
     // Case B: VIP Alpha Override Gate
     if (!standardQuotaAvailable && vipSlotsRemaining > 0) {
-      const isExtremeMomentum = (coin.change15mPct >= 3.0 || coin.change1hPct >= 5.0 || coin.priceChangePct >= 12.0);
-      const isExtremeConfluence = (coin.score >= (config.vipScoreThreshold || 87) && book.obi >= (config.vipObiThreshold || 0.58));
+      const isExtremeMomentum = (coin.change15mPct >= 3.0 && coin.change1hPct >= 4.0 && coin.priceChangePct >= 10.0);
+      const isExtremeConfluence = (coin.score >= (config.vipScoreThreshold || 88) && book.obi >= (config.vipObiThreshold || 0.60));
 
       if (isExtremeMomentum && isExtremeConfluence) {
         executeSpotBuy(
@@ -1657,16 +1686,31 @@ async function monitorOpenPositionsHealth() {
         continue;
       }
     } else {
-      // C. ALTERNATIVE 5: ZERO REALIZED LOSS RECOVERY BAG DISPATCH
-      // Instead of selling at a loss on dips, transfer to Recovery Bag!
+      // ---------------------------------------------------------
+      // C. HIGH-SUSTAIN SPOT RECOVERY BAG DISPATCH
+      // ---------------------------------------------------------
+
+      // 1. Adverse dip filter: Requires persistent breakdown (-2.20% with tick check)
       if (gainPct <= -2.20) {
-        moveToRecoveryBag(sym, `Adverse dip (${gainPct.toFixed(2)}%) - Shifted to Recovery Bag at Breakeven`);
-        continue;
+        pos.adverseDipTicks = (pos.adverseDipTicks || 0) + 1;
+        // Require 2 consecutive ticks (5 seconds) to avoid 1-second flash wicks
+        if (pos.adverseDipTicks >= 2) {
+          moveToRecoveryBag(sym, `Confirmed adverse pullback (${gainPct.toFixed(2)}%) - Shifted to Recovery Bag at Breakeven`);
+          continue;
+        }
+      } else {
+        pos.adverseDipTicks = 0;
       }
 
-      // Stagnation window: If after 25 minutes price hasn't moved, shift to Recovery Bag
-      if (holdSeconds >= 1500 && gainPct < 0.20) {
-        moveToRecoveryBag(sym, `Stagnation after 25m (${gainPct.toFixed(2)}%) - Shifted to Recovery Bag`);
+      // 2. Intelligent Dynamic Stagnation Window:
+      // High-conviction altcoin bull flags regularly consolidate for 30-45 minutes.
+      // If position is floating near breakeven (-0.80% to +0.30%), allow up to 45 minutes (2700s).
+      // Only move to bag if it's dead after 45 minutes, saving active breakouts from premature bag moves!
+      const isHealthyConsolidation = (gainPct >= -0.80 && gainPct < 0.30);
+      const stagnationLimitSec = isHealthyConsolidation ? 2700 : 1800; // 45m if flat, 30m if sluggish
+
+      if (holdSeconds >= stagnationLimitSec) {
+        moveToRecoveryBag(sym, `Stagnation after ${Math.round(holdSeconds / 60)}m (${gainPct.toFixed(2)}%) - Shifted to Recovery Bag`);
         continue;
       }
     }
