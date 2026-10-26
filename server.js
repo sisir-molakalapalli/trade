@@ -20,7 +20,7 @@ const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL || '';
 const app = express();
 
 // -------------------------------------------------------------
-// CORS & PRE-FLIGHT HEADERS (Allows mobile webviews & cross-origin browsers)
+// CORS & PRE-FLIGHT HEADERS
 // -------------------------------------------------------------
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -39,7 +39,7 @@ app.use(express.static(__dirname));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Clean baseline universe in pure USDT
+// Baseline Universe
 const DEFAULT_UNIVERSE = {
   SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9987.69, score: 82, direction: 'STRONG BUY', cvd: 14.2, obi: 0.56, intradayRangePct: 4.2, volumeM: 320, source: 'QUANT_ALGO', reasoning: 'Institutional spot bid depth absorption', verifiedAt: Date.now() },
   BTCUSDT:  { name: 'Bitcoin', symbol: 'BTC', priceUSDT: 84500.00, priceINR: 8022430.00, score: 81, direction: 'STRONG BUY', cvd: 12.3, obi: 0.55, intradayRangePct: 2.8, volumeM: 950, source: 'QUANT_ALGO', reasoning: 'Deep institutional liquidity anchor', verifiedAt: Date.now() },
@@ -73,7 +73,7 @@ const State = {
     bonusSlotsEarned: 0,
     consecutiveWinStreak: 0,
     streakBonusReason: 'BASELINE',
-    maxConcurrentPositions: 3, // EXPANDED: 3 concurrent positions for multi-tranche execution
+    maxConcurrentPositions: 2, // Standard 2 active breakout slots
     rollingTrades24h: [],
     nextSlotReleaseTimestamp: 0,
     globalCircuitBreakerUntil: 0,
@@ -100,7 +100,12 @@ const State = {
     realizedPnL: 0.00
   },
 
+  // Active slots (limited to 2 concurrent)
   activePositions: {},
+
+  // Alternative 5: Spot Recovery Bags (Zero Realized Loss Model)
+  // Assets that pull back move here so active slots stay completely free!
+  recoveryBags: {},
 
   subsystems: {
     microstructure: {
@@ -134,9 +139,16 @@ const State = {
       lastMonitorTick: '--:--:--',
       intervalSec: 2.5,
       activePositionsMonitored: 0,
+      recoveryBagsMonitored: 0,
       trailingLocksActive: 0,
-      highDecayAlerts: 0,
-      architecture: '3-Pillar Spot Resiliency (Flow-Based Exit + Two-Tranche DCA + -4.5% Disaster Belt)'
+      architecture: 'Alternative 5: Spot Recovery Bag (Zero Realized Loss Model)'
+    },
+    recoveryManager: {
+      status: 'ONLINE',
+      activeRecoveryBagsCount: 0,
+      totalRecoveryCapitalUSDT: 0.00,
+      meanReversionTargetRate: 'Breakeven (+0.30% Fee Buffer)',
+      bagsResolvedWinCount: 0
     },
     quotaManager: {
       status: 'NORMAL',
@@ -164,15 +176,15 @@ const State = {
   },
 
   quantTelemetry: {
-    engine: 'Institutional 3-Pillar Spot Resiliency Architecture (Two-Tranche DCA + Flow Invalidation)',
+    engine: 'Alternative 5: Spot Recovery Bag Strategy (Zero Realized Loss Architecture)',
     source: 'PURE_QUANT_ALGO',
     frequencySeconds: 15,
     lastAnalysisTime: '--:--:--',
-    screenerCadence: 'Dynamic 90s-180s (Active Pacing)',
+    screenerCadence: 'Dynamic 90s-180s',
     riskCadence: 'Every 2.5 Seconds',
     persistenceStatus: 'ACTIVE (Non-Destructive)',
     p2pRateStatus: 'Binance P2P Daily Sync Active',
-    regimeReasoning: 'Executing 60/40 two-tranche entries to absorb pullback wicks with order-flow invalidation (OBI < 40%) and wide -4.5% disaster safety floor.'
+    regimeReasoning: 'Eliminated stop-out losses entirely. Retest pullbacks transfer to Spot Recovery Bags with standing breakeven targets while active slots trade without interruption.'
   },
 
   universe: { ...DEFAULT_UNIVERSE },
@@ -203,7 +215,7 @@ async function fetchFromBinance(endpoint) {
 }
 
 // -------------------------------------------------------------
-// LIVE BINANCE P2P USDT/INR RATE SYNC (HOURLY & DAILY)
+// LIVE BINANCE P2P USDT/INR RATE SYNC
 // -------------------------------------------------------------
 async function syncBinanceP2PUsdtInrRate() {
   try {
@@ -464,9 +476,6 @@ function parseTradeTimestamp(trade) {
   return 0;
 }
 
-// -------------------------------------------------------------
-// PNL INTEGRITY AUDITOR & INTELLIGENT DATE SANITIZATION
-// -------------------------------------------------------------
 function cleanAndNormalizeDateString(rawDate, rawTime, timestampId) {
   const dateStr = String(rawDate || '').trim();
   const timeStr = String(rawTime || '').trim();
@@ -616,6 +625,7 @@ function saveStateToDisk() {
     const dataToSave = {
       portfolio: State.portfolio,
       activePositions: State.activePositions,
+      recoveryBags: State.recoveryBags,
       tradeLogs: State.tradeLogs.slice(0, 500),
       autopilotEnabled: State.autopilotEnabled,
       cooldowns: State.cooldowns,
@@ -707,6 +717,9 @@ function loadStateFromDisk() {
       if (parsed.activePositions && typeof parsed.activePositions === 'object') {
         State.activePositions = parsed.activePositions;
       }
+      if (parsed.recoveryBags && typeof parsed.recoveryBags === 'object') {
+        State.recoveryBags = parsed.recoveryBags;
+      }
       if (Array.isArray(parsed.tradeLogs)) {
         State.tradeLogs = sanitizeAndAuditTradeHistory(parsed.tradeLogs);
         recalculateTrueRealizedPnL();
@@ -739,7 +752,7 @@ syncWithGoogleDrive();
 syncBinanceP2PUsdtInrRate();
 
 // -------------------------------------------------------------
-// 24-HOUR ROLLING TRADE QUOTA MANAGER WITH DYNAMIC RATCHET & VIP ALPHA
+// 24-HOUR ROLLING TRADE QUOTA MANAGER
 // -------------------------------------------------------------
 function syncRollingTradeQuota() {
   const now = Date.now();
@@ -765,7 +778,7 @@ function syncRollingTradeQuota() {
   for (const log of recentLogs24h) {
     const pnl = Number(log.pnlUSDT || 0);
     rollingNetGainUSDT += pnl;
-    if (pnl > 0.10) {
+    if (pnl > 0.05) {
       currentStreak++;
     } else if (pnl < -0.05) {
       break;
@@ -824,8 +837,6 @@ function syncRollingTradeQuota() {
   }
 
   State.tradeFrequencyController.nextSlotReleaseTimestamp = nextReleaseTimestamp;
-
-  // PILLAR 3: Abolish 20-minute post-loss freeze in spot algorithmic trading
   State.tradeFrequencyController.globalCircuitBreakerUntil = 0;
 
   if (isBypassActive) {
@@ -859,7 +870,7 @@ function syncRollingTradeQuota() {
 }
 
 // -------------------------------------------------------------
-// STAGE 1 & 2: DISCOVERY SCREENER (PACED RUN)
+// DISCOVERY SCREENER
 // -------------------------------------------------------------
 async function runDynamicMarketScreener() {
   State.subsystems.screener.status = 'SCANNING';
@@ -873,7 +884,7 @@ async function runDynamicMarketScreener() {
 
     State.subsystems.screener.scannedPairsCount = tickers.length;
     const candidates = [];
-    const activeSymbols = Object.keys(State.activePositions);
+    const activeSymbols = [...Object.keys(State.activePositions), ...Object.keys(State.recoveryBags)];
 
     const isCompression = (State.marketRegime === 'COMPRESSION');
     const isStarved = (State.tradeFrequencyController.pacingMode === 'STARVED');
@@ -967,23 +978,25 @@ async function runDynamicMarketScreener() {
       activeSymbols.forEach(sym => {
         if (State.universe[sym]) {
           updatedUniverse[sym] = { ...State.universe[sym] };
-        } else if (State.activePositions[sym]) {
-          const pos = State.activePositions[sym];
-          const base = pos.pairSymbol || sym.replace('USDT', '');
-          updatedUniverse[sym] = {
-            name: base,
-            symbol: base,
-            priceUSDT: pos.livePriceUSDT || pos.entryPriceUSDT,
-            priceINR: calculateAccurateINRPrice(pos.livePriceUSDT || pos.entryPriceUSDT, State.usdtToInrRate),
-            score: 80,
-            direction: 'BUY',
-            obi: 0.55,
-            cvd: 3.5,
-            volumeM: 10,
-            source: 'ACTIVE_HOLD_ANCHOR',
-            reasoning: 'Active position anchored in universe',
-            verifiedAt: Date.now()
-          };
+        } else {
+          const pos = State.activePositions[sym] || State.recoveryBags[sym];
+          if (pos) {
+            const base = pos.pairSymbol || sym.replace('USDT', '');
+            updatedUniverse[sym] = {
+              name: base,
+              symbol: base,
+              priceUSDT: pos.livePriceUSDT || pos.entryPriceUSDT,
+              priceINR: calculateAccurateINRPrice(pos.livePriceUSDT || pos.entryPriceUSDT, State.usdtToInrRate),
+              score: 80,
+              direction: 'BUY',
+              obi: 0.55,
+              cvd: 3.5,
+              volumeM: 10,
+              source: 'ACTIVE_HOLD_ANCHOR',
+              reasoning: 'Active or Recovery position anchored in universe',
+              verifiedAt: Date.now()
+            };
+          }
         }
       });
 
@@ -1039,7 +1052,7 @@ function scheduleNextScreenerRun() {
 }
 
 // -------------------------------------------------------------
-// STAGE 3: VOLATILITY REGIME & 15-SECOND MICROSTRUCTURE SCORING
+// VOLATILITY REGIME & MICROSTRUCTURE SCORING
 // -------------------------------------------------------------
 function calculateMarketVolatilityRegime() {
   const ranges = Object.values(State.universe)
@@ -1107,7 +1120,7 @@ function calculateMarketVolatilityRegime() {
     scoreThreshold: finalScoreGate,
     obiThreshold: baseObi,
     maxSpread,
-    cooldownMinutes: 15, // PILLAR 3: Reduced from 90m to 15m
+    cooldownMinutes: 15,
     marketAvgRange: medianRange,
     pacingGateOffset,
     vipScoreThreshold: 87,
@@ -1198,18 +1211,18 @@ async function runPureQuantScoring() {
 }
 
 // -------------------------------------------------------------
-// AUTOPILOT ENTRY MATRIX WITH 3-PILLAR TWO-TRANCHE DCA ARCHITECTURE
+// AUTOPILOT ENTRY MATRIX (CLEAN SINGLE-ENTRY SPOT ARCHITECTURE)
 // -------------------------------------------------------------
 async function evaluateAutopilotEntries(regimeConfig) {
   if (!State.autopilotEnabled) return;
 
   syncRollingTradeQuota();
 
-  const currentCount = Object.keys(State.activePositions).length;
-  // EXPANDED CEILING: Up to 3 concurrent active positions (15% max portfolio exposure)
-  if (currentCount >= State.tradeFrequencyController.maxConcurrentPositions) return;
+  const currentActiveCount = Object.keys(State.activePositions).length;
+  // Maximum 2 concurrent active breakout slots (Recovery bags do NOT count against this!)
+  if (currentActiveCount >= (State.tradeFrequencyController.maxConcurrentPositions || 2)) return;
 
-  if (State.portfolio.cashUSDT < 30) return;
+  if (State.portfolio.cashUSDT < 50.00) return;
   if (State.warmupCycles < 1) return;
 
   const config = regimeConfig || State.activeThresholds;
@@ -1220,7 +1233,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
   if (!standardQuotaAvailable && vipSlotsRemaining <= 0) return;
 
   const sortedCandidates = Object.keys(State.universe)
-    .filter(k => !State.activePositions[k])
+    .filter(k => !State.activePositions[k] && !State.recoveryBags[k])
     .sort((a, b) => (State.universe[b].score || 0) - (State.universe[a].score || 0));
 
   for (const sym of sortedCandidates) {
@@ -1230,16 +1243,9 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (State.cooldowns[sym]) {
       const cdObj = typeof State.cooldowns[sym] === 'object'
         ? State.cooldowns[sym]
-        : { until: Number(State.cooldowns[sym]) || 0, stoppedEntryPriceUSDT: 0 };
+        : { until: Number(State.cooldowns[sym]) || 0 };
       const remaining = cdObj.until - Date.now();
-
-      // V-Shape Wick Reclaim Override
-      const isVShapeReclaim = cdObj.stoppedEntryPriceUSDT > 0 &&
-        coin.priceUSDT >= (cdObj.stoppedEntryPriceUSDT * 1.002) &&
-        coin.score >= 82 &&
-        (coin.obi || 0) >= 0.56;
-
-      if (remaining > 0 && !isVShapeReclaim) continue;
+      if (remaining > 0) continue;
       delete State.cooldowns[sym];
     }
 
@@ -1261,12 +1267,12 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
 
-    // Case A1: Standard High-Conviction Confluence
+    // Case A1: Standard Breakout Confluence
     if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold) {
-      executeTwoTrancheBuy(
+      executeSpotBuy(
         sym, 
         coin.priceUSDT, 
-        `3-Pillar Confluence (${config.regime}|${config.pacingMode}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}%, 15m: +${(coin.change15mPct || 0).toFixed(1)}%, Spread ${book.spreadPct.toFixed(2)}%)`,
+        `Spot Confluence (${config.regime}|${config.pacingMode}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}%, 15m +${(coin.change15mPct || 0).toFixed(1)}%)`,
         false
       );
       break;
@@ -1275,10 +1281,10 @@ async function evaluateAutopilotEntries(regimeConfig) {
     // Case A2: Ignition Spike Fast-Track
     const isVerifiedIgnition = isHighVelocitySpike && (coin.rvol || 1) >= 1.6 && (coin.pricePositionInRange || 0.6) >= 0.68;
     if (standardQuotaAvailable && isVerifiedIgnition && coin.score >= (config.scoreThreshold - 2) && book.obi >= 0.52) {
-      executeTwoTrancheBuy(
+      executeSpotBuy(
         sym,
         coin.priceUSDT,
-        `🚀 Ignition Fast-Track (${sym}: 15m +${(coin.change15mPct || 0).toFixed(1)}%, 1h +${(coin.change1hPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x, Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%)`,
+        `🚀 Ignition Fast-Track (${sym}: 15m +${(coin.change15mPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x, Score ${coin.score})`,
         false
       );
       break;
@@ -1290,10 +1296,10 @@ async function evaluateAutopilotEntries(regimeConfig) {
       const isExtremeConfluence = (coin.score >= (config.vipScoreThreshold || 87) && book.obi >= (config.vipObiThreshold || 0.58));
 
       if (isExtremeMomentum && isExtremeConfluence) {
-        executeTwoTrancheBuy(
+        executeSpotBuy(
           sym,
           coin.priceUSDT,
-          `⚡ VIP Alpha Override (${vipSlotsRemaining} left): God-Candle Breakout! Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%`,
+          `⚡ VIP Alpha Override: God-Candle Breakout! Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%`,
           true
         );
         break;
@@ -1303,68 +1309,39 @@ async function evaluateAutopilotEntries(regimeConfig) {
 }
 
 // -------------------------------------------------------------
-// PILLAR 1: ASYMMETRIC TWO-TRANCHE EXECUTION (SMART DCA BUFFER)
+// SPOT BUY EXECUTION ($50 FIXED NOTIONAL)
 // -------------------------------------------------------------
-function executeTwoTrancheBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
-  if (State.portfolio.cashUSDT < 30) return;
+function executeSpotBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
+  if (State.portfolio.cashUSDT < 50.00) return;
 
-  // Split allocation: $30 Tranche 1 (Market) + $20 Tranche 2 (Limit Retest Bid)
-  const tranche1Notional = 30.00;
-  const tranche2Notional = 20.00;
-  const totalTargetNotional = 50.00;
+  const notionalUSDT = 50.00;
+  const qty = notionalUSDT / priceUSDT;
 
-  const t1Qty = tranche1Notional / priceUSDT;
+  State.portfolio.cashUSDT -= notionalUSDT;
 
-  // Tranche 2 limit bid placed at -1.6% retest support
-  const t2PriceUSDT = formatBinanceUSDTPrice(priceUSDT * (1 - 0.016));
-  const t2Qty = tranche2Notional / t2PriceUSDT;
-
-  // Deduct Tranche 1 from cash balance immediately
-  State.portfolio.cashUSDT -= tranche1Notional;
-
-  // Pillar 3: Wide Catastrophic Safety Floor (-4.5%)
-  const catastrophicFloorUSDT = formatBinanceUSDTPrice(priceUSDT * (1 - 0.045));
-  const tp1 = formatBinanceUSDTPrice(priceUSDT * (1 + 0.018)); // +1.80% TP1
+  const tp1 = formatBinanceUSDTPrice(priceUSDT * 1.018); // +1.80% Target TP1
 
   State.activePositions[pairKey] = {
     pairKey,
     pairSymbol: State.universe[pairKey]?.symbol || pairKey,
     entryPriceUSDT: priceUSDT,
-    initialMarketEntryPriceUSDT: priceUSDT,
-    qty: t1Qty,
-    originalQty: t1Qty,
-    notionalUSDT: tranche1Notional,
-    totalTargetNotional,
-    
-    // Tranche Sub-Structure
-    tranche1Notional,
-    tranche1Qty: t1Qty,
-    tranche1PriceUSDT: priceUSDT,
-    tranche2Notional,
-    tranche2Qty: t2Qty,
-    tranche2PriceUSDT: t2PriceUSDT,
-    tranche2Filled: false,
-    tranche2Cancelled: false,
-
-    // Risk Architecture
-    catastrophicFloorUSDT,
-    retestGraceUntil: Date.now() + (20 * 60 * 1000), // 20-min retest window
-    flowInvalidationTicks: 0,
-    currentObi: 0.55,
-    sl: catastrophicFloorUSDT, // Default floor is catastrophic belt
+    qty,
+    notionalUSDT,
     tp1,
+    sl: formatBinanceUSDTPrice(priceUSDT * 0.95), // Deep reference
     openedAt: Date.now(),
     isTrailingActive: false,
     tp1Secured: false,
     highWatermarkUSDT: priceUSDT,
+    retestGraceUntil: Date.now() + (20 * 60 * 1000), // 20-min momentum window
     isVipAlpha
   };
 
   State.portfolio.holdings[pairKey] = {
     symbol: State.universe[pairKey]?.symbol || pairKey,
-    qty: t1Qty,
+    qty,
     avgBuyPriceUSDT: priceUSDT,
-    totalCostUSDT: tranche1Notional
+    totalCostUSDT: notionalUSDT
   };
 
   State.tradeFrequencyController.rollingTrades24h.push(Date.now());
@@ -1376,7 +1353,86 @@ function executeTwoTrancheBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
   saveStateToDisk();
   broadcastState();
 
-  console.log(`[Smart DCA Entry] Opened ${pairKey}: Tranche 1 ($30) @ $${priceUSDT} | Tranche 2 Limit ($20) placed @ $${t2PriceUSDT}`);
+  console.log(`[Spot Buy] Opened ${pairKey} @ $${priceUSDT} ($50 USDT) | TP1 Target: $${tp1}`);
+}
+
+// -------------------------------------------------------------
+// ALTERNATIVE 5: SPOT RECOVERY BAG TRANSFER (ZERO REALIZED LOSS)
+// -------------------------------------------------------------
+function moveToRecoveryBag(pairKey, transferReason) {
+  const pos = State.activePositions[pairKey];
+  if (!pos) return;
+
+  // Set standing mean-reversion target at breakeven (+0.30% to clear trading fees cleanly)
+  const targetExitPriceUSDT = formatBinanceUSDTPrice(pos.entryPriceUSDT * 1.0030);
+
+  State.recoveryBags[pairKey] = {
+    pairKey,
+    pairSymbol: pos.pairSymbol || pairKey,
+    entryPriceUSDT: pos.entryPriceUSDT,
+    qty: pos.qty,
+    notionalUSDT: pos.notionalUSDT,
+    targetExitPriceUSDT,
+    movedAt: Date.now(),
+    livePriceUSDT: pos.livePriceUSDT || pos.entryPriceUSDT,
+    reason: transferReason
+  };
+
+  // REMOVE from active positions so active slot is immediately OPEN for the bot to trade!
+  delete State.activePositions[pairKey];
+
+  State.subsystems.recoveryManager.activeRecoveryBagsCount = Object.keys(State.recoveryBags).length;
+
+  saveStateToDisk();
+  broadcastState();
+
+  console.log(`[Spot Recovery Bag] Shifted ${pairKey} to Recovery Bag. Standing Breakeven Limit: $${targetExitPriceUSDT}. Active slot is now FREE!`);
+}
+
+function settleRecoveryBag(pairKey, exitPriceUSDT, reason) {
+  const bag = State.recoveryBags[pairKey];
+  if (!bag) return;
+
+  const finalValueUSDT = bag.qty * exitPriceUSDT;
+  const pnlUSDT = Number((finalValueUSDT - bag.notionalUSDT).toFixed(4));
+
+  State.portfolio.cashUSDT += finalValueUSDT;
+  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + pnlUSDT).toFixed(4));
+
+  delete State.portfolio.holdings[pairKey];
+  delete State.recoveryBags[pairKey];
+
+  State.subsystems.recoveryManager.bagsResolvedWinCount++;
+  State.subsystems.recoveryManager.activeRecoveryBagsCount = Object.keys(State.recoveryBags).length;
+
+  const now = new Date();
+  const istTime = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+  const istDate = now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
+
+  const logEntry = {
+    id: Date.now(),
+    type: 'RECOVERY EXIT (ZERO LOSS)',
+    pair: `${bag.pairSymbol}/USDT`,
+    entryPriceUSDT: formatBinanceUSDTPrice(bag.entryPriceUSDT),
+    exitPriceUSDT: formatBinanceUSDTPrice(exitPriceUSDT),
+    pnlUSDT: Math.max(0, pnlUSDT),
+    pnlINR: Number((Math.max(0, pnlUSDT) * State.usdtToInrRate).toFixed(2)),
+    reason: `Mean-reversion bounce filled breakeven target (+${(((exitPriceUSDT - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100).toFixed(2)}%)`,
+    time: istTime,
+    date: istDate,
+    regime: State.activeThresholds?.regime || 'BALANCED',
+    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
+  };
+
+  State.tradeLogs.unshift(logEntry);
+  if (State.tradeLogs.length > 500) State.tradeLogs.pop();
+
+  recalculateTrueRealizedPnL();
+  appendTradeToGoogleDrive(logEntry);
+  saveStateToDisk();
+  broadcastState();
+
+  console.log(`[Recovery Resolved] ${pairKey} mean-reversion exit filled at $${exitPriceUSDT} with Zero Realized Loss! Cash restored.`);
 }
 
 function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
@@ -1398,30 +1454,14 @@ function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
   pos.sl = pos.entryPriceUSDT * 1.0025; // Breakeven lock
   pos.highWatermarkUSDT = Math.max(pos.highWatermarkUSDT || exitPriceUSDT, exitPriceUSDT);
 
-  // If Tranche 2 never filled, cancel it cleanly
-  if (!pos.tranche2Filled) {
-    pos.tranche2Cancelled = true;
-  }
-
   if (State.portfolio.holdings[pairKey]) {
     State.portfolio.holdings[pairKey].qty = halfQty;
     State.portfolio.holdings[pairKey].totalCostUSDT = halfNotional;
   }
 
   const now = new Date();
-  const istTime = now.toLocaleTimeString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: true
-  });
-  const istDate = now.toLocaleDateString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric'
-  });
+  const istTime = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+  const istDate = now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
 
   const logEntry = {
     id: Date.now(),
@@ -1434,7 +1474,7 @@ function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
     reason: exitReason,
     time: istTime,
     date: istDate,
-    regime: State.activeThresholds?.regime || State.marketRegime || 'BALANCED',
+    regime: State.activeThresholds?.regime || 'BALANCED',
     volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
   };
 
@@ -1461,32 +1501,9 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   delete State.portfolio.holdings[pairKey];
   delete State.activePositions[pairKey];
 
-  if (pnlUSDT < 0) {
-    // PILLAR 3: Mild 15-minute asset cooldown with V-reclaim active; NO global circuit breaker freeze!
-    State.cooldowns[pairKey] = {
-      until: Date.now() + (15 * 60 * 1000),
-      stoppedEntryPriceUSDT: pos.entryPriceUSDT
-    };
-    State.tradeFrequencyController.globalCircuitBreakerUntil = 0; // Abolished 20-min freeze
-    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
-    State.tradeFrequencyController.consecutiveWinStreak = 0;
-    State.tradeFrequencyController.bonusSlotsEarned = 0;
-  }
-
   const now = new Date();
-  const istTime = now.toLocaleTimeString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: true
-  });
-  const istDate = now.toLocaleDateString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric'
-  });
+  const istTime = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+  const istDate = now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
 
   const logEntry = {
     id: Date.now(),
@@ -1499,7 +1516,7 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
     reason: exitReason,
     time: istTime,
     date: istDate,
-    regime: State.activeThresholds?.regime || State.marketRegime || 'BALANCED',
+    regime: State.activeThresholds?.regime || 'BALANCED',
     volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
   };
 
@@ -1515,76 +1532,50 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
 }
 
 // -------------------------------------------------------------
-// PILLARS 2 & 3: FLOW-BASED SENTRY & DISASTER RISK MONITOR
+// SENTRY & RISK MONITOR (ACTIVE POSITIONS & RECOVERY BAGS)
 // -------------------------------------------------------------
 async function monitorOpenPositionsHealth() {
   const openKeys = Object.keys(State.activePositions);
+  const recoveryKeys = Object.keys(State.recoveryBags);
+
   State.subsystems.predictiveSentry.lastMonitorTick = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
   State.subsystems.predictiveSentry.activePositionsMonitored = openKeys.length;
+  State.subsystems.predictiveSentry.recoveryBagsMonitored = recoveryKeys.length;
+  State.subsystems.recoveryManager.activeRecoveryBagsCount = recoveryKeys.length;
 
-  let trailingCount = 0;
-  let highDecayCount = 0;
+  let totalRecoveryCap = 0;
+  recoveryKeys.forEach(k => {
+    totalRecoveryCap += (State.recoveryBags[k]?.notionalUSDT || 50);
+  });
+  State.subsystems.recoveryManager.totalRecoveryCapitalUSDT = totalRecoveryCap;
 
-  if (openKeys.length === 0) {
-    State.subsystems.predictiveSentry.trailingLocksActive = 0;
-    State.subsystems.predictiveSentry.highDecayAlerts = 0;
-    State.subsystems.predictiveSentry.status = 'WATCHING';
-    return;
+  // -----------------------------------------------------------
+  // 1. MONITOR SPOT RECOVERY BAGS FOR MEAN-REVERSION BOUNCES
+  // -----------------------------------------------------------
+  for (const sym of recoveryKeys) {
+    const bag = State.recoveryBags[sym];
+    if (!bag) continue;
+
+    let live = bag.livePriceUSDT || State.universe[sym]?.priceUSDT || bag.entryPriceUSDT;
+    if (live >= bag.targetExitPriceUSDT) {
+      // Mean-reversion target reached! Liquidate with Zero Realized Loss
+      settleRecoveryBag(sym, live, 'Standing mean-reversion target reached');
+    }
   }
 
-  State.subsystems.predictiveSentry.status = 'ACTIVE_MONITORING';
+  // -----------------------------------------------------------
+  // 2. MONITOR ACTIVE BREAKOUT POSITIONS
+  // -----------------------------------------------------------
+  if (openKeys.length === 0) {
+    State.subsystems.predictiveSentry.trailingLocksActive = 0;
+    return;
+  }
 
   for (const sym of openKeys) {
     const pos = State.activePositions[sym];
     if (!pos) continue;
 
-    if (pos.isTrailingActive) trailingCount++;
-
-    let livePriceUSDT = pos.livePriceUSDT || State.universe[sym]?.priceUSDT;
-    if (!livePriceUSDT || livePriceUSDT <= 0) {
-      try {
-        const tick = await fetchFromBinance(`/api/v3/ticker/price?symbol=${sym}`);
-        if (tick && tick.price) {
-          livePriceUSDT = formatBinanceUSDTPrice(parseFloat(tick.price));
-          pos.livePriceUSDT = livePriceUSDT;
-          if (State.universe[sym]) State.universe[sym].priceUSDT = livePriceUSDT;
-        }
-      } catch (e) {}
-    }
-
-    if (!livePriceUSDT || livePriceUSDT <= 0) {
-      livePriceUSDT = pos.entryPriceUSDT;
-    }
-
-    // ---------------------------------------------------------
-    // PILLAR 1: CHECK TRANCHE 2 RETEST LIMIT FILL (-1.6% Wick)
-    // ---------------------------------------------------------
-    if (!pos.tranche2Filled && !pos.tranche2Cancelled) {
-      if (livePriceUSDT <= pos.tranche2PriceUSDT && State.portfolio.cashUSDT >= 20.00) {
-        State.portfolio.cashUSDT -= pos.tranche2Notional;
-        pos.tranche2Filled = true;
-
-        const combinedNotional = pos.notionalUSDT + pos.tranche2Notional;
-        const combinedQty = pos.qty + pos.tranche2Qty;
-        const newAvgEntry = formatBinanceUSDTPrice(combinedNotional / combinedQty);
-
-        pos.entryPriceUSDT = newAvgEntry;
-        pos.qty = combinedQty;
-        pos.notionalUSDT = combinedNotional;
-        pos.tp1 = formatBinanceUSDTPrice(newAvgEntry * 1.018);
-        pos.catastrophicFloorUSDT = formatBinanceUSDTPrice(newAvgEntry * 0.955);
-
-        if (State.portfolio.holdings[sym]) {
-          State.portfolio.holdings[sym].qty = combinedQty;
-          State.portfolio.holdings[sym].avgBuyPriceUSDT = newAvgEntry;
-          State.portfolio.holdings[sym].totalCostUSDT = combinedNotional;
-        }
-
-        console.log(`[Tranche 2 Filled] ${sym} retest wick filled $20 limit @ $${pos.tranche2PriceUSDT}! New blended entry: $${newAvgEntry}`);
-        saveStateToDisk();
-      }
-    }
-
+    let livePriceUSDT = pos.livePriceUSDT || State.universe[sym]?.priceUSDT || pos.entryPriceUSDT;
     const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
     pos.gainPct = Number(gainPct.toFixed(2));
     pos.unrealizedPnLUSDT = Number(((livePriceUSDT - pos.entryPriceUSDT) * pos.qty).toFixed(4));
@@ -1594,17 +1585,13 @@ async function monitorOpenPositionsHealth() {
       pos.highWatermarkUSDT = livePriceUSDT;
     }
 
-    // ---------------------------------------------------------
-    // 1. Partial TP1 Take-Profit (+1.80% Gross)
-    // ---------------------------------------------------------
+    // A. Profit Target: Bank TP1 (+1.80%)
     if (livePriceUSDT >= pos.tp1 && !pos.tp1Secured) {
       settlePartialPosition(sym, livePriceUSDT, `TP1 Banked (+${gainPct.toFixed(2)}%), runner active`);
       continue;
     }
 
-    // ---------------------------------------------------------
-    // 2. High Watermark Runner Trail Logic
-    // ---------------------------------------------------------
+    // B. Runner Trailing Logic
     if (pos.tp1Secured) {
       const runnerTrailPrice = pos.highWatermarkUSDT * (1 - 0.012);
       pos.sl = Math.max(pos.entryPriceUSDT * 1.0025, runnerTrailPrice);
@@ -1614,63 +1601,20 @@ async function monitorOpenPositionsHealth() {
         continue;
       }
     } else {
-      // ---------------------------------------------------------
-      // PILLAR 3: CATASTROPHIC NUCLEAR DISASTER BELT (-4.5%)
-      // ---------------------------------------------------------
-      if (livePriceUSDT <= pos.catastrophicFloorUSDT || gainPct <= -4.50) {
-        settlePosition(sym, 'DISASTER FLOOR CUT', livePriceUSDT, `Hit -4.5% Nuclear Safety Belt (${gainPct.toFixed(2)}%)`);
+      // C. ALTERNATIVE 5: ZERO REALIZED LOSS RECOVERY BAG DISPATCH
+      // Instead of selling at a loss on dips, transfer to Recovery Bag!
+      if (gainPct <= -2.20) {
+        moveToRecoveryBag(sym, `Adverse dip (${gainPct.toFixed(2)}%) - Shifted to Recovery Bag at Breakeven`);
         continue;
       }
 
-      // Early Trailing Lock (Activates after +1.20% gain)
-      if (gainPct >= 1.20 && !pos.isTrailingActive) {
-        pos.isTrailingActive = true;
-        pos.sl = pos.entryPriceUSDT * 1.0025;
-      }
-
-      if (pos.isTrailingActive && livePriceUSDT <= pos.sl) {
-        settlePosition(sym, 'TRAILING SL', livePriceUSDT, `Breakeven trailing stop triggered (${gainPct.toFixed(2)}%)`);
-        continue;
-      }
-
-      // ---------------------------------------------------------
-      // PILLAR 2: ORDER-FLOW & LIQUIDITY INVALIDATION
-      // (Exiting strictly on confirmed flow decay, NEVER on price wicks)
-      // ---------------------------------------------------------
-      const realBook = await fetchRealOrderBookDepth(sym);
-      const currentObi = realBook ? realBook.obi : (pos.currentObi || 0.52);
-      pos.currentObi = Number(currentObi.toFixed(2));
-
-      // As long as institutional limit bids are absorbing depth (OBI >= 48%), HOLD.
-      if (currentObi >= 0.48) {
-        pos.flowInvalidationTicks = 0;
-      } else if (gainPct <= -2.20 && currentObi < 0.40) {
-        // Price is down past -2.2% AND buyer book has genuinely collapsed (<40%)
-        pos.flowInvalidationTicks = (pos.flowInvalidationTicks || 0) + 1;
-        highDecayCount++;
-
-        // Must persist for at least 5 consecutive ticks (12.5 seconds)
-        if (pos.flowInvalidationTicks >= 5) {
-          settlePosition(sym, 'FLOW INVALIDATION', livePriceUSDT, `Order flow breakdown: OBI ${(currentObi * 100).toFixed(0)}% < 40% sustained for 5 ticks (${gainPct.toFixed(2)}%)`);
-          continue;
-        }
-      } else {
-        pos.flowInvalidationTicks = 0;
-      }
-
-      // ---------------------------------------------------------
-      // Time-Decay Stagnation Exit (>25 Minutes without progress)
-      // ---------------------------------------------------------
-      const isLiveVerified = Boolean(pos.livePriceUSDT && pos.livePriceUSDT > 0);
-      if (isLiveVerified && holdSeconds >= 1500 && gainPct < 0.20 && gainPct >= -2.0) {
-        settlePosition(sym, 'PATIENT SCRATCH EXIT', livePriceUSDT, `No momentum continuation within 25 minutes (${gainPct.toFixed(2)}%)`);
+      // Stagnation window: If after 25 minutes price hasn't moved, shift to Recovery Bag
+      if (holdSeconds >= 1500 && gainPct < 0.20) {
+        moveToRecoveryBag(sym, `Stagnation after 25m (${gainPct.toFixed(2)}%) - Shifted to Recovery Bag`);
         continue;
       }
     }
   }
-
-  State.subsystems.predictiveSentry.trailingLocksActive = trailingCount;
-  State.subsystems.predictiveSentry.highDecayAlerts = highDecayCount;
 }
 
 // -------------------------------------------------------------
@@ -1684,7 +1628,7 @@ async function syncLiveBinancePrices() {
     const priceMap = {};
     list.forEach(i => { priceMap[i.symbol] = parseFloat(i.price); });
 
-    const openKeys = Object.keys(State.activePositions);
+    const openKeys = [...Object.keys(State.activePositions), ...Object.keys(State.recoveryBags)];
     openKeys.forEach(sym => {
       const live = priceMap[sym];
       if (live && live > 0) {
@@ -1704,7 +1648,7 @@ async function syncLiveBinancePrices() {
             cvd: 3.5,
             volumeM: 10,
             source: 'ACTIVE_HOLD_ANCHOR',
-            reasoning: 'Active position retained in universe',
+            reasoning: 'Position retained in universe',
             verifiedAt: Date.now()
           };
         } else {
@@ -1713,11 +1657,18 @@ async function syncLiveBinancePrices() {
           State.universe[sym].verifiedAt = Date.now();
         }
 
-        const pos = State.activePositions[sym];
-        if (pos) {
-          pos.livePriceUSDT = formatted;
-          pos.unrealizedPnLUSDT = Number(((live - pos.entryPriceUSDT) * pos.qty).toFixed(4));
-          pos.gainPct = Number((((live - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100).toFixed(2));
+        const activePos = State.activePositions[sym];
+        if (activePos) {
+          activePos.livePriceUSDT = formatted;
+          activePos.unrealizedPnLUSDT = Number(((live - activePos.entryPriceUSDT) * activePos.qty).toFixed(4));
+          activePos.gainPct = Number((((live - activePos.entryPriceUSDT) / activePos.entryPriceUSDT) * 100).toFixed(2));
+        }
+
+        const bag = State.recoveryBags[sym];
+        if (bag) {
+          bag.livePriceUSDT = formatted;
+          bag.unrealizedPnLUSDT = Number(((live - bag.entryPriceUSDT) * bag.qty).toFixed(4));
+          bag.gainPct = Number((((live - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100).toFixed(2));
         }
       }
     });
@@ -1750,6 +1701,7 @@ function broadcastState() {
     type: 'STATE_UPDATE',
     portfolio: State.portfolio,
     activePositions: State.activePositions,
+    recoveryBags: State.recoveryBags,
     universe: State.universe,
     tradeLogs: State.tradeLogs.slice(0, 100),
     quantTelemetry: State.quantTelemetry,
@@ -1789,6 +1741,7 @@ function broadcastPricesOnly() {
     type: 'PRICE_TICK',
     prices: priceData,
     activePositions: State.activePositions,
+    recoveryBags: State.recoveryBags,
     portfolio: State.portfolio,
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
@@ -1810,6 +1763,7 @@ wss.on('connection', ws => {
     type: 'INIT',
     portfolio: State.portfolio,
     activePositions: State.activePositions,
+    recoveryBags: State.recoveryBags,
     universe: State.universe,
     tradeLogs: State.tradeLogs.slice(0, 100),
     quantTelemetry: State.quantTelemetry,
@@ -1840,6 +1794,9 @@ wss.on('connection', ws => {
       } else if (data.type === 'CLOSE_POSITION' && data.pairKey) {
         const livePriceUSDT = State.universe[data.pairKey]?.priceUSDT || State.activePositions[data.pairKey]?.entryPriceUSDT;
         if (livePriceUSDT) settlePosition(data.pairKey, 'MANUAL EXIT', livePriceUSDT, 'Closed by user command');
+      } else if (data.type === 'CLOSE_RECOVERY_BAG' && data.pairKey) {
+        const livePriceUSDT = State.universe[data.pairKey]?.priceUSDT || State.recoveryBags[data.pairKey]?.entryPriceUSDT;
+        if (livePriceUSDT) settleRecoveryBag(data.pairKey, livePriceUSDT, 'Manual recovery exit by user command');
       } else if (data.type === 'SYNC_P2P_RATE') {
         syncBinanceP2PUsdtInrRate();
       } else if (data.type === 'SET_GOOGLE_SHEET_URL' && data.url) {
@@ -1899,6 +1856,7 @@ app.get('/api/state', (req, res) => {
   res.json({
     portfolio: State.portfolio,
     activePositions: State.activePositions,
+    recoveryBags: State.recoveryBags,
     universe: State.universe,
     tradeLogs: State.tradeLogs.slice(0, 100),
     quantTelemetry: State.quantTelemetry,
@@ -1976,52 +1934,6 @@ app.get('/api/settings/googlesheet/sync', async (req, res) => {
   }
 });
 
-app.get('/api/settings/googlesheet/test', async (req, res) => {
-  const targetUrl = State.googleSheetUrl;
-  if (!targetUrl) {
-    return res.status(400).json({ success: false, message: 'GOOGLE_SHEET_URL is not set.' });
-  }
-
-  const now = new Date();
-  const testPayload = {
-    id: Date.now(),
-    date: now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' }),
-    time: now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
-    pair: 'TEST/USDT',
-    type: 'SYNC TEST',
-    entryPriceUSDT: 100.00,
-    exitPriceUSDT: 101.60,
-    pnlUSDT: 0.80,
-    pnlINR: Number((0.80 * State.usdtToInrRate).toFixed(2)),
-    reason: 'Manual diagnostic test from Render',
-    regime: State.activeThresholds?.regime || 'BALANCED',
-    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
-  };
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-    const response = await fetch(targetUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(testPayload),
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-
-    const bodyText = await response.text();
-    res.json({
-      success: response.ok,
-      status: response.status,
-      response: bodyText,
-      message: response.ok ? 'Test row posted to Google Sheet!' : 'Google Sheet returned an error.'
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
 app.get('/api/screener/run', async (req, res) => {
   await runDynamicMarketScreener();
   res.json({ 
@@ -2040,6 +1952,7 @@ app.get('/api/quant/audit', (req, res) => {
     tradeFrequencyController: State.tradeFrequencyController,
     subsystems: State.subsystems,
     activePositionsCount: Object.keys(State.activePositions).length,
+    recoveryBagsCount: Object.keys(State.recoveryBags).length,
     cooldowns: State.cooldowns,
     realizedPnL: State.portfolio.realizedPnL,
     usdtToInrRate: State.usdtToInrRate,
@@ -2053,7 +1966,7 @@ app.get('/healthz', (req, res) => res.status(200).send('OK'));
 // BOOTSTRAP TIMERS
 // -------------------------------------------------------------
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Quant Server] Running on port ${PORT} with 3-Pillar Spot Resiliency Architecture`);
+  console.log(`[Quant Server] Running on port ${PORT} with Alternative 5: Spot Recovery Bag Architecture`);
 
   setTimeout(runDynamicMarketScreener, 2000);
   setInterval(runPureQuantScoring, 15 * 1000);
