@@ -101,7 +101,8 @@ const State = {
   portfolio: {
     cashUSDT: 1000.00,
     holdings: {},
-    realizedPnL: 0.00
+    realizedPnL: 0.00,
+    bagSubsidyPoolUSDT: 0.00 // Winner-funded reserve dedicated to auto-clearing stagnant bags
   },
 
   // Active slots (limited to 2 concurrent)
@@ -129,6 +130,14 @@ const State = {
       liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)',
       cadenceSec: 90
     },
+    btcMacroGate: {
+      status: 'NORMAL',
+      btcChange15m: 0,
+      btcChange1h: 0,
+      btcVwapPremium: 0,
+      allowAltcoinEntries: true,
+      reason: 'BTC macro trend supportive'
+    },
     regimeController: {
       status: 'CALIBRATED',
       currentRegime: 'BALANCED',
@@ -151,8 +160,10 @@ const State = {
       status: 'ONLINE',
       activeRecoveryBagsCount: 0,
       totalRecoveryCapitalUSDT: 0.00,
-      meanReversionTargetRate: 'Breakeven (+0.30% Fee Buffer)',
-      bagsResolvedWinCount: 0
+      meanReversionTargetRate: 'Dynamic Stepped Target (+0.30% -> 0.00% -> -0.75%)',
+      bagsResolvedWinCount: 0,
+      subsidyPoolUSDT: 0.00,
+      bagsSubsidizedCount: 0
     },
     quotaManager: {
       status: 'NORMAL',
@@ -370,6 +381,52 @@ async function fetchShortTermMomentum(symbol) {
     }
   } catch (e) {}
   return { change15mPct: 0, change1hPct: 0, change4hPct: 0, rvol: 1.0 };
+}
+
+// -------------------------------------------------------------
+// BITCOIN (BTC) MACRO TREND SHIELD
+// -------------------------------------------------------------
+async function evaluateBtcMacroStatus() {
+  try {
+    const [shortTerm, book] = await Promise.all([
+      fetchShortTermMomentum('BTCUSDT'),
+      fetchRealOrderBookDepth('BTCUSDT')
+    ]);
+
+    const btcTicker = State.universe['BTCUSDT'];
+    const vwapPremium = btcTicker?.vwapPremiumPct || 0;
+    const c15m = shortTerm?.change15mPct || 0;
+    const c1h = shortTerm?.change1hPct || 0;
+    const obi = book ? book.obi : 0.52;
+
+    let allowAltcoins = true;
+    let reason = 'BTC trend healthy';
+
+    // Guard: If BTC 15m is flushing (< -0.35%) or 1h is dumping (< -1.0%)
+    if (c15m <= -0.35 && c1h < 0) {
+      allowAltcoins = false;
+      reason = `BTC 15m flush (${c15m >= 0 ? '+' : ''}${c15m}%) - Altcoin gate locked`;
+    } else if (c1h <= -1.00) {
+      allowAltcoins = false;
+      reason = `BTC 1h macro downtrend (${c1h}%) - Altcoin gate locked`;
+    } else if (obi < 0.40 && c15m < -0.15) {
+      allowAltcoins = false;
+      reason = `BTC bid book thin (${Math.round(obi * 100)}% OBI) - Sympathetic drop caution`;
+    }
+
+    State.subsystems.btcMacroGate = {
+      status: allowAltcoins ? 'NORMAL' : 'BLOCKED',
+      btcChange15m: c15m,
+      btcChange1h: c1h,
+      btcVwapPremium: vwapPremium,
+      allowAltcoinEntries: allowAltcoins,
+      reason,
+      lastChecked: Date.now()
+    };
+    return State.subsystems.btcMacroGate;
+  } catch (e) {
+    return { allowAltcoinEntries: true, reason: 'BTC check bypass on network glitch' };
+  }
 }
 
 function calculateAccurateINRPrice(usdtPrice, rate) {
@@ -1252,6 +1309,7 @@ async function runPureQuantScoring() {
     State.subsystems.microstructure.evaluatedUniverseSize = symbols.length;
     State.quantTelemetry.lastAnalysisTime = nowStr;
 
+    await evaluateBtcMacroStatus();
     await evaluateAutopilotEntries(regimeConfig);
     broadcastPricesOnly();
   } catch (err) {
@@ -1291,6 +1349,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
     return;
   }
 
+  const btcGate = State.subsystems.btcMacroGate || { allowAltcoinEntries: true };
   const config = regimeConfig || State.activeThresholds;
   const isBypassActive = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
   const isDynamicGov = Boolean(State.tradeFrequencyController.dynamicGovernorEnabled);
@@ -1306,6 +1365,12 @@ async function evaluateAutopilotEntries(regimeConfig) {
   for (const sym of sortedCandidates) {
     const coin = State.universe[sym];
     if (!coin || !coin.score) continue;
+
+    // PRONG 1: BTC MACRO SHIELD
+    // If Bitcoin is flashing an active drop, block all altcoin entries to prevent sympathetic dump traps
+    if (sym !== 'BTCUSDT' && !btcGate.allowAltcoinEntries) {
+      continue;
+    }
 
     if (State.cooldowns[sym]) {
       const cdObj = typeof State.cooldowns[sym] === 'object'
@@ -1323,11 +1388,11 @@ async function evaluateAutopilotEntries(regimeConfig) {
     // HIGH-SUSTAIN CONFLUENCE GATES (PREVENTING UNNECESSARY BAG TRANSFERS)
     // -----------------------------------------------------------
     
-    // Gate 1: Anti-Top Exhaustion Filter
-    // If 15m is already up > 4.5%, buying at the top of the candle guarantees getting wicked.
-    // Must have massive bid depth (OBI >= 0.60) or be early in momentum to justify entry.
-    const isExhaustionCandle = (coin.change15mPct >= 4.5 && book.obi < 0.60);
-    if (isExhaustionCandle) continue;
+    // Gate 1: Anti-Apex & Top-Chase Filter
+    // If 15m is already up > 3.8% and trading at apex of candle range (>0.88), buying the top guarantees taking the retest wick!
+    // Require either a confirmed base/pullback or massive bid absorption (OBI >= 0.60)
+    const isApexChasing = (coin.change15mPct >= 3.8 && (coin.pricePositionInRange || 0.8) > 0.88 && book.obi < 0.60);
+    if (isApexChasing) continue;
 
     // Gate 2: Multi-Timeframe (MTF) Confirmation
     // Avoid dead-cat relief rallies (e.g. 15m up, but 1h and 4h heavily dumping)
@@ -1458,8 +1523,13 @@ function moveToRecoveryBag(pairKey, transferReason) {
     qty: pos.qty,
     notionalUSDT: pos.notionalUSDT,
     targetExitPriceUSDT,
+    initialTargetPriceUSDT: targetExitPriceUSDT,
+    targetStep: 'STEP 1 (+0.30%)',
     movedAt: Date.now(),
     livePriceUSDT: pos.livePriceUSDT || pos.entryPriceUSDT,
+    gainPct: pos.gainPct || 0,
+    unrealizedPnLUSDT: pos.unrealizedPnLUSDT || 0,
+    ageHours: 0,
     reason: transferReason
   };
 
@@ -1471,7 +1541,7 @@ function moveToRecoveryBag(pairKey, transferReason) {
   saveStateToDisk();
   broadcastState();
 
-  console.log(`[Spot Recovery Bag] Shifted ${pairKey} to Recovery Bag. Standing Breakeven Limit: $${targetExitPriceUSDT}. Active slot is now FREE!`);
+  console.log(`[Spot Recovery Bag] Shifted ${pairKey} to Recovery Bag. Initial Breakeven Limit: $${targetExitPriceUSDT}. Active slot is now FREE!`);
 }
 
 function settleRecoveryBag(pairKey, exitPriceUSDT, reason) {
@@ -1500,9 +1570,9 @@ function settleRecoveryBag(pairKey, exitPriceUSDT, reason) {
     pair: `${bag.pairSymbol}/USDT`,
     entryPriceUSDT: formatBinanceUSDTPrice(bag.entryPriceUSDT),
     exitPriceUSDT: formatBinanceUSDTPrice(exitPriceUSDT),
-    pnlUSDT: Math.max(0, pnlUSDT),
-    pnlINR: Number((Math.max(0, pnlUSDT) * State.usdtToInrRate).toFixed(2)),
-    reason: `Mean-reversion bounce filled breakeven target (+${(((exitPriceUSDT - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100).toFixed(2)}%)`,
+    pnlUSDT: pnlUSDT,
+    pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2)),
+    reason: reason || `Mean-reversion bounce filled target (+${(((exitPriceUSDT - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100).toFixed(2)}%)`,
     time: istTime,
     date: istDate,
     regime: State.activeThresholds?.regime || 'BALANCED',
@@ -1517,7 +1587,7 @@ function settleRecoveryBag(pairKey, exitPriceUSDT, reason) {
   saveStateToDisk();
   broadcastState();
 
-  console.log(`[Recovery Resolved] ${pairKey} mean-reversion exit filled at $${exitPriceUSDT} with Zero Realized Loss! Cash restored.`);
+  console.log(`[Recovery Resolved] ${pairKey} exit filled at $${exitPriceUSDT}. Cash restored.`);
 }
 
 function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
@@ -1531,6 +1601,13 @@ function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
 
   State.portfolio.cashUSDT += halfValUSDT;
   State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + pnlUSDT).toFixed(4));
+
+  // PRONG 2: SELF-HEALING PORTFOLIO (Route 35% of winning gains to Bag Liquidation Subsidy Pool)
+  if (pnlUSDT > 0.05) {
+    const contribution = Number((pnlUSDT * 0.35).toFixed(4));
+    State.portfolio.bagSubsidyPoolUSDT = Number(((State.portfolio.bagSubsidyPoolUSDT || 0) + contribution).toFixed(4));
+    State.subsystems.recoveryManager.subsidyPoolUSDT = State.portfolio.bagSubsidyPoolUSDT;
+  }
 
   pos.qty = halfQty;
   pos.notionalUSDT = halfNotional;
@@ -1583,6 +1660,13 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   State.portfolio.cashUSDT += finalValueUSDT;
   State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + pnlUSDT).toFixed(4));
 
+  // PRONG 2: SELF-HEALING PORTFOLIO (Route 35% of winning runner gains to Bag Subsidy Pool)
+  if (pnlUSDT > 0.05) {
+    const contribution = Number((pnlUSDT * 0.35).toFixed(4));
+    State.portfolio.bagSubsidyPoolUSDT = Number(((State.portfolio.bagSubsidyPoolUSDT || 0) + contribution).toFixed(4));
+    State.subsystems.recoveryManager.subsidyPoolUSDT = State.portfolio.bagSubsidyPoolUSDT;
+  }
+
   delete State.portfolio.holdings[pairKey];
   delete State.activePositions[pairKey];
 
@@ -1627,6 +1711,7 @@ async function monitorOpenPositionsHealth() {
   State.subsystems.predictiveSentry.activePositionsMonitored = openKeys.length;
   State.subsystems.predictiveSentry.recoveryBagsMonitored = recoveryKeys.length;
   State.subsystems.recoveryManager.activeRecoveryBagsCount = recoveryKeys.length;
+  State.subsystems.recoveryManager.subsidyPoolUSDT = State.portfolio.bagSubsidyPoolUSDT || 0;
 
   let totalRecoveryCap = 0;
   recoveryKeys.forEach(k => {
@@ -1635,16 +1720,64 @@ async function monitorOpenPositionsHealth() {
   State.subsystems.recoveryManager.totalRecoveryCapitalUSDT = totalRecoveryCap;
 
   // -----------------------------------------------------------
-  // 1. MONITOR SPOT RECOVERY BAGS FOR MEAN-REVERSION BOUNCES
+  // 1. MONITOR SPOT RECOVERY BAGS (DYNAMIC STEPPING & SUBSIDIZATION)
   // -----------------------------------------------------------
   for (const sym of recoveryKeys) {
     const bag = State.recoveryBags[sym];
     if (!bag) continue;
 
+    const ageHours = (Date.now() - (bag.movedAt || Date.now())) / (1000 * 60 * 60);
     let live = bag.livePriceUSDT || State.universe[sym]?.priceUSDT || bag.entryPriceUSDT;
+    const gainFromEntryPct = ((live - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100;
+    bag.gainPct = Number(gainFromEntryPct.toFixed(2));
+    bag.unrealizedPnLUSDT = Number(((live - bag.entryPriceUSDT) * bag.qty).toFixed(4));
+    bag.ageHours = Number(ageHours.toFixed(1));
+
+    // Dynamic Target Stepping based on holding duration:
+    // Step 1 (0 to 4 hours): Breakeven + fee buffer (+0.30%)
+    // Step 2 (4 to 12 hours): Exact Breakeven (+0.00%)
+    // Step 3 (12 to 24 hours): Micro relief exit (-0.75%)
+    // Step 4 (> 24 hours): Relief exit (-1.50%) or VWAP bounce to recycle $50 capital
+    let dynamicTargetPrice = bag.entryPriceUSDT * 1.0030;
+    let stepName = 'STEP 1 (+0.30%)';
+
+    if (ageHours >= 24) {
+      dynamicTargetPrice = bag.entryPriceUSDT * 0.9850; // -1.50% capital recycle
+      stepName = 'STEP 4 (-1.50% RECYCLE)';
+    } else if (ageHours >= 12) {
+      dynamicTargetPrice = bag.entryPriceUSDT * 0.9925; // -0.75% relief exit
+      stepName = 'STEP 3 (-0.75% RELIEF)';
+    } else if (ageHours >= 4) {
+      dynamicTargetPrice = bag.entryPriceUSDT * 1.0000; // Exact Breakeven
+      stepName = 'STEP 2 (0.00% BREAKEVEN)';
+    }
+
+    bag.targetExitPriceUSDT = formatBinanceUSDTPrice(dynamicTargetPrice);
+    bag.targetStep = stepName;
+
+    // Check if live price filled the dynamic stepped target
     if (live >= bag.targetExitPriceUSDT) {
-      // Mean-reversion target reached! Liquidate with Zero Realized Loss
-      settleRecoveryBag(sym, live, 'Standing mean-reversion target reached');
+      settleRecoveryBag(sym, live, `Stepped Target ${stepName} filled on relief bounce (${gainFromEntryPct >= 0 ? '+' : ''}${gainFromEntryPct.toFixed(2)}%)`);
+      continue;
+    }
+
+    // Cross-Trade Profit Subsidization Check:
+    // If bag has been stuck for >= 6 hours and subsidy pool has accumulated winner buffer,
+    // subsidize the deficit and liquidate the bag so $50 cash is completely recycled!
+    const deficitUSDT = Math.abs(Math.min(0, bag.unrealizedPnLUSDT));
+    const subsidyPool = Number(State.portfolio.bagSubsidyPoolUSDT || 0);
+
+    if (ageHours >= 6 && deficitUSDT > 0 && subsidyPool >= deficitUSDT) {
+      State.portfolio.bagSubsidyPoolUSDT = Number((subsidyPool - deficitUSDT).toFixed(4));
+      State.subsystems.recoveryManager.bagsSubsidizedCount = (State.subsystems.recoveryManager.bagsSubsidizedCount || 0) + 1;
+      State.subsystems.recoveryManager.subsidyPoolUSDT = State.portfolio.bagSubsidyPoolUSDT;
+
+      settleRecoveryBag(
+        sym, 
+        live, 
+        `Self-Healing Subsidization: Stagnant bag cleared after ${ageHours.toFixed(1)}h using $${deficitUSDT.toFixed(2)} winner profits`
+      );
+      continue;
     }
   }
 
@@ -1690,12 +1823,16 @@ async function monitorOpenPositionsHealth() {
       // C. HIGH-SUSTAIN SPOT RECOVERY BAG DISPATCH
       // ---------------------------------------------------------
 
-      // 1. Adverse dip filter: Requires persistent breakdown (-2.20% with tick check)
-      if (gainPct <= -2.20) {
+      // 1. Adverse dip filter: Widened to -3.20% with OBI support verification
+      // If OBI is holding >= 46%, let the position breathe through normal 15m retest wicks!
+      const book = await fetchRealOrderBookDepth(sym);
+      const isStrongSupport = Boolean(book && book.obi >= 0.46);
+
+      if (gainPct <= -3.20 || (gainPct <= -2.50 && !isStrongSupport)) {
         pos.adverseDipTicks = (pos.adverseDipTicks || 0) + 1;
-        // Require 2 consecutive ticks (5 seconds) to avoid 1-second flash wicks
-        if (pos.adverseDipTicks >= 2) {
-          moveToRecoveryBag(sym, `Confirmed adverse pullback (${gainPct.toFixed(2)}%) - Shifted to Recovery Bag at Breakeven`);
+        // Require 3 consecutive ticks (7.5 seconds) to avoid flash wicks
+        if (pos.adverseDipTicks >= 3) {
+          moveToRecoveryBag(sym, `Confirmed structural breakdown (${gainPct.toFixed(2)}%, OBI ${book ? Math.round(book.obi * 100) : 40}%) - Shifted to Recovery Bag`);
           continue;
         }
       } else {
@@ -1705,7 +1842,6 @@ async function monitorOpenPositionsHealth() {
       // 2. Intelligent Dynamic Stagnation Window:
       // High-conviction altcoin bull flags regularly consolidate for 30-45 minutes.
       // If position is floating near breakeven (-0.80% to +0.30%), allow up to 45 minutes (2700s).
-      // Only move to bag if it's dead after 45 minutes, saving active breakouts from premature bag moves!
       const isHealthyConsolidation = (gainPct >= -0.80 && gainPct < 0.30);
       const stagnationLimitSec = isHealthyConsolidation ? 2700 : 1800; // 45m if flat, 30m if sluggish
 
