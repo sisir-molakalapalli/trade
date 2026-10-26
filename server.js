@@ -322,26 +322,42 @@ async function fetchRealOrderBookDepth(symbol) {
 
 async function fetchShortTermMomentum(symbol) {
   try {
-    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=1h&limit=5`);
-    if (Array.isArray(klines) && klines.length >= 4) {
+    // 16 bars of 15m klines = full 4-hour window with 15m ignition granularity & RVOL
+    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=16`);
+    if (Array.isArray(klines) && klines.length >= 6) {
       const latest = klines[klines.length - 1];
-      const prev1h = klines[klines.length - 2];
+      const prev15m = klines[klines.length - 2];
+      const prev1h = klines[Math.max(0, klines.length - 5)];
       const prev4h = klines[0];
 
       const currentClose = parseFloat(latest[4]) || 0;
+      const open15m = parseFloat(prev15m[1]) || currentClose;
       const open1h = parseFloat(prev1h[1]) || currentClose;
       const open4h = parseFloat(prev4h[1]) || currentClose;
 
+      const change15mPct = open15m > 0 ? ((currentClose - open15m) / open15m) * 100 : 0;
       const change1hPct = open1h > 0 ? ((currentClose - open1h) / open1h) * 100 : 0;
       const change4hPct = open4h > 0 ? ((currentClose - open4h) / open4h) * 100 : 0;
 
+      // Calculate Relative Volume (RVOL): recent 2 candles (30m) vs preceding baseline average
+      const recentVolAvg = ((parseFloat(latest[7]) || 0) + (parseFloat(prev15m[7]) || 0)) / 2;
+      let baselineSum = 0;
+      const baselineCount = klines.length - 2;
+      for (let i = 0; i < baselineCount; i++) {
+        baselineSum += (parseFloat(klines[i][7]) || 0);
+      }
+      const baselineVolAvg = baselineCount > 0 ? (baselineSum / baselineCount) : 1;
+      const rvol = baselineVolAvg > 0 ? (recentVolAvg / baselineVolAvg) : 1.0;
+
       return {
+        change15mPct: Number(change15mPct.toFixed(2)),
         change1hPct: Number(change1hPct.toFixed(2)),
-        change4hPct: Number(change4hPct.toFixed(2))
+        change4hPct: Number(change4hPct.toFixed(2)),
+        rvol: Number(Math.min(15, Math.max(0.2, rvol)).toFixed(2))
       };
     }
   } catch (e) {}
-  return { change1hPct: 0, change4hPct: 0 };
+  return { change15mPct: 0, change1hPct: 0, change4hPct: 0, rvol: 1.0 };
 }
 
 function calculateAccurateINRPrice(usdtPrice, rate) {
@@ -882,32 +898,42 @@ async function runDynamicMarketScreener() {
       if (!t.symbol.endsWith('USDT')) continue;
       const base = t.symbol.slice(0, -4);
       // Strictly guard single-letter tickers (like TUSDT) from matching pegged tokens
-      if (['UP', 'DOWN', 'BEAR', 'BULL', 'USDC', 'FDUSD', 'TUSD', 'EUR', 'DAI', 'USDP', 'BUSD'].includes(base)) continue;
+      if (['UP', 'DOWN', 'BEAR', 'BULL', 'USDC', 'FDUSD', 'TUSD', 'EUR', 'DAI', 'USDP', 'BUSD', 'PAXG', 'WBTC'].includes(base)) continue;
 
       const quoteVol = parseFloat(t.quoteVolume) || 0;
       const lastPrice = parseFloat(t.lastPrice) || 0;
       const priceChangePct = parseFloat(t.priceChangePercent) || 0;
       const highPrice = parseFloat(t.highPrice) || 0;
       const lowPrice = parseFloat(t.lowPrice) || 0;
+      const vwapPrice = parseFloat(t.weightedAvgPrice) || lastPrice;
 
-      let requiredFloor = 14000000;
-      if (priceChangePct >= 7.5) requiredFloor = 3500000;
-      else if (priceChangePct >= 4.0) requiredFloor = 5000000;
-      else if (priceChangePct >= 1.5) requiredFloor = 8000000;
-      else if (isCompression || isStarved) requiredFloor = 6000000;
+      if (lastPrice <= 0 || highPrice <= lowPrice) continue;
 
-      if (quoteVol >= requiredFloor && lastPrice > 0 && highPrice > lowPrice) {
-        const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
-        const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
+      const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
+      const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
+      const vwapPremiumPct = vwapPrice > 0 ? ((lastPrice - vwapPrice) / vwapPrice) * 100 : 0;
 
-        const minPositionRatio = (isCompression || isStarved) ? 0.48 : 0.55;
+      // Dynamic Mid-Cap Awakening Floor (Catches DODO/USDT & explosive altcoins at $1.5M+ volume)
+      let requiredFloor = 10000000;
+      if (priceChangePct >= 5.0 || (vwapPremiumPct >= 3.0 && pricePositionInRange >= 0.72)) {
+        requiredFloor = 1500000; // $1.5M floor for high-velocity VWAP breakouts
+      } else if (priceChangePct >= 2.5 || vwapPremiumPct >= 1.8) {
+        requiredFloor = 2500000; // $2.5M floor for early momentum builders
+      } else if (isCompression || isStarved) {
+        requiredFloor = 4500000;
+      }
+
+      if (quoteVol >= requiredFloor) {
+        const minPositionRatio = (isCompression || isStarved) ? 0.48 : 0.54;
         if (pricePositionInRange < minPositionRatio) continue;
 
-        const liquidityDensityScore = Math.min(30, Math.log10(quoteVol) * 3.8);
-        const rangeProximityBoost = pricePositionInRange * 15;
-        const directionalMomentum = Math.max(0, priceChangePct) * 2.2;
+        // Balanced liquidity scoring so mega-caps don't drown out mid-cap rockets
+        const liquidityDensityScore = Math.min(22, Math.log10(quoteVol) * 3.0);
+        const rangeProximityBoost = pricePositionInRange * 16;
+        const directionalMomentum = Math.max(0, priceChangePct) * 2.4;
+        const vwapBreakoutBoost = Math.max(0, vwapPremiumPct) * 3.2;
 
-        const breakoutScore = directionalMomentum + liquidityDensityScore + rangeProximityBoost;
+        const breakoutScore = directionalMomentum + vwapBreakoutBoost + liquidityDensityScore + rangeProximityBoost;
 
         candidates.push({
           symbol: t.symbol,
@@ -915,9 +941,10 @@ async function runDynamicMarketScreener() {
           priceUSDT: formatBinanceUSDTPrice(lastPrice),
           priceINR: calculateAccurateINRPrice(lastPrice, State.usdtToInrRate),
           priceChangePct,
+          vwapPremiumPct: Number(vwapPremiumPct.toFixed(2)),
           intradayRangePct,
           pricePositionInRange,
-          volumeM: Math.round(quoteVol / 1000000),
+          volumeM: Number((quoteVol / 1000000).toFixed(1)),
           breakoutScore,
           isActive: activeSymbols.includes(t.symbol)
         });
@@ -925,47 +952,62 @@ async function runDynamicMarketScreener() {
     }
 
     State.subsystems.screener.qualifiedCandidatesCount = candidates.length;
+    State.subsystems.screener.liquidityFloorUSD = 'Dynamic ($1.5M-$10M)';
 
     const activeCandidates = candidates.filter(c => c.isActive);
     const nonActiveSorted = candidates
       .filter(c => !c.isActive)
       .sort((a, b) => b.breakoutScore - a.breakoutScore);
 
-    const neededSlots = Math.max(0, 10 - activeCandidates.length);
-    const topPicks = [...activeCandidates, ...nonActiveSorted.slice(0, neededSlots)];
+    // Inspect top 15 candidates in Stage 2 for 15m Ignition & RVOL velocity
+    const stage2PoolSize = Math.max(0, 15 - activeCandidates.length);
+    const stage2Pool = [...activeCandidates, ...nonActiveSorted.slice(0, stage2PoolSize)];
 
-    for (const p of topPicks) {
+    for (const p of stage2Pool) {
       const shortTerm = await fetchShortTermMomentum(p.symbol);
+      p.change15mPct = shortTerm.change15mPct;
       p.change1hPct = shortTerm.change1hPct;
       p.change4hPct = shortTerm.change4hPct;
+      p.rvol = shortTerm.rvol;
 
-      if (p.change1hPct > 0.8) p.breakoutScore += (p.change1hPct * 2.2);
-      if (p.change4hPct > 2.5) p.breakoutScore += (p.change4hPct * 1.4);
+      // Boost Stage 2 score heavily for 15m ignition spikes & RVOL surges (e.g., DODO at 12:30 AM)
+      if (p.change15mPct >= 1.5) p.breakoutScore += (p.change15mPct * 4.5);
+      if (p.change1hPct >= 1.0) p.breakoutScore += (p.change1hPct * 2.5);
+      if (p.change4hPct >= 2.5) p.breakoutScore += (p.change4hPct * 1.2);
+      if (p.rvol >= 1.8 && (p.change15mPct > 0.5 || p.change1hPct > 1.0)) {
+        p.breakoutScore += Math.min(18, (p.rvol - 1.0) * 5.0);
+      }
     }
 
-    topPicks.sort((a, b) => b.breakoutScore - a.breakoutScore);
+    stage2Pool.sort((a, b) => b.breakoutScore - a.breakoutScore);
+    const topPicks = stage2Pool.slice(0, 10);
 
     if (topPicks.length > 0) {
       const updatedUniverse = {};
       topPicks.forEach(c => {
         const existing = State.universe[c.symbol];
+        const isSpike = (c.change15mPct >= 2.0 || c.change1hPct >= 4.0) && c.rvol >= 1.6;
         updatedUniverse[c.symbol] = {
           name: c.baseAsset,
           symbol: c.baseAsset,
           priceUSDT: c.priceUSDT,
           priceINR: c.priceINR,
           priceChangePct: c.priceChangePct,
+          vwapPremiumPct: c.vwapPremiumPct || 0,
+          change15mPct: c.change15mPct || 0,
           change1hPct: c.change1hPct || 0,
           change4hPct: c.change4hPct || 0,
+          rvol: c.rvol || 1.0,
+          isSpikeCandidate: isSpike,
           intradayRangePct: c.intradayRangePct,
           pricePositionInRange: c.pricePositionInRange,
           volumeM: c.volumeM,
-          score: existing ? existing.score : 76,
+          score: existing ? existing.score : 78,
           direction: existing ? existing.direction : 'BUY',
           obi: existing ? existing.obi : 0.55,
           cvd: existing ? existing.cvd : 3.5,
           source: 'QUANT_ALGO',
-          reasoning: `Rank: ${c.breakoutScore.toFixed(1)} ($${c.volumeM}M Vol, 1h: ${c.change1hPct >= 0 ? '+' : ''}${(c.change1hPct || 0).toFixed(1)}%, ${(c.pricePositionInRange * 100).toFixed(0)}% Range)`,
+          reasoning: `${isSpike ? '🚀 SPIKE IGNITION | ' : ''}15m: ${c.change15mPct >= 0 ? '+' : ''}${(c.change15mPct || 0).toFixed(1)}%, 1h: ${c.change1hPct >= 0 ? '+' : ''}${(c.change1hPct || 0).toFixed(1)}%, RVOL: ${(c.rvol || 1).toFixed(1)}x ($${c.volumeM}M Vol)`,
           verifiedAt: Date.now()
         };
       });
@@ -976,6 +1018,9 @@ async function runDynamicMarketScreener() {
 
     State.subsystems.screener.status = 'ACTIVE';
     State.subsystems.screener.lastRunTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+
+    // Immediately run quant microstructure scoring & entry check on the newly discovered universe
+    await runPureQuantScoring();
   } catch (err) {
     State.subsystems.screener.status = 'ERROR';
   } finally {
@@ -990,7 +1035,172 @@ function scheduleNextScreenerRun() {
 }
 
 // -------------------------------------------------------------
-// AUTOPILOT ENTRY MATRIX WITH VIP ALPHA OVERRIDE
+// STAGE 3: VOLATILITY REGIME & 15-SECOND MICROSTRUCTURE SCORING
+// -------------------------------------------------------------
+function calculateMarketVolatilityRegime() {
+  const ranges = Object.values(State.universe)
+    .map(u => Number(u.intradayRangePct) || 4.5)
+    .filter(r => r > 0)
+    .sort((a, b) => a - b);
+
+  let medianRange = 4.5;
+  if (ranges.length > 0) {
+    const mid = Math.floor(ranges.length / 2);
+    medianRange = ranges.length % 2 !== 0 ? ranges[mid] : (ranges[mid - 1] + ranges[mid]) / 2;
+  }
+  medianRange = Number(medianRange.toFixed(2));
+
+  // Determine Active Quota Pacing Mode (AQPE)
+  const now = Date.now();
+  const sixHoursAgo = now - (6 * 60 * 60 * 1000);
+  const twelveHoursAgo = now - (12 * 60 * 60 * 1000);
+  const tradesLast6h = (State.tradeFrequencyController.rollingTrades24h || []).filter(ts => ts > sixHoursAgo).length;
+  const tradesLast12h = (State.tradeFrequencyController.rollingTrades24h || []).filter(ts => ts > twelveHoursAgo).length;
+
+  let pacingMode = 'BALANCED';
+  let pacingGateOffset = 0;
+
+  if (tradesLast6h === 0) {
+    pacingMode = 'STARVED';
+    pacingGateOffset = -2;
+    screenerIntervalMs = 60 * 1000; // Accelerate screener to 60s when starved
+  } else if (tradesLast12h >= 5) {
+    pacingMode = 'SATURATED';
+    pacingGateOffset = 2;
+    screenerIntervalMs = 120 * 1000;
+  } else {
+    pacingMode = 'BALANCED';
+    pacingGateOffset = 0;
+    screenerIntervalMs = 75 * 1000;
+  }
+
+  State.tradeFrequencyController.pacingMode = pacingMode;
+  State.subsystems.quotaManager.pacingMode = pacingMode;
+  State.subsystems.screener.cadenceSec = Math.round(screenerIntervalMs / 1000);
+
+  let regime = 'BALANCED';
+  let baseScore = 80;
+  let baseObi = 0.55;
+  let maxSpread = 0.10;
+
+  if (medianRange <= 4.0) {
+    regime = 'COMPRESSION';
+    baseScore = 78;
+    baseObi = 0.54;
+    maxSpread = 0.10;
+  } else if (medianRange >= 9.5) {
+    regime = 'TURBULENT';
+    baseScore = 83;
+    baseObi = 0.57;
+    maxSpread = 0.08;
+  }
+
+  const finalScoreGate = Math.max(75, Math.min(86, baseScore + pacingGateOffset));
+
+  State.marketRegime = regime;
+  State.activeThresholds = {
+    regime,
+    pacingMode,
+    scoreThreshold: finalScoreGate,
+    obiThreshold: baseObi,
+    maxSpread,
+    cooldownMinutes: 90,
+    marketAvgRange: medianRange,
+    pacingGateOffset,
+    vipScoreThreshold: 87,
+    vipObiThreshold: 0.58
+  };
+
+  State.subsystems.regimeController = {
+    status: 'CALIBRATED',
+    currentRegime: regime,
+    marketAvgVolatilityPct: medianRange,
+    liveScoreGate: finalScoreGate,
+    liveObiGatePct: Math.round(baseObi * 100),
+    liveMaxSpreadPct: maxSpread,
+    lastAdjustmentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
+  };
+
+  return State.activeThresholds;
+}
+
+async function runPureQuantScoring() {
+  try {
+    const regimeConfig = calculateMarketVolatilityRegime();
+    const symbols = Object.keys(State.universe);
+
+    for (const sym of symbols) {
+      const coin = State.universe[sym];
+      if (!coin) continue;
+
+      const [book, shortTerm] = await Promise.all([
+        fetchRealOrderBookDepth(sym),
+        fetchShortTermMomentum(sym)
+      ]);
+
+      const obi = book ? book.obi : (coin.obi || 0.55);
+      const spreadPct = book ? book.spreadPct : 0.05;
+
+      coin.obi = Number(obi.toFixed(2));
+      coin.spreadPct = Number(spreadPct.toFixed(3));
+      coin.change15mPct = shortTerm.change15mPct;
+      coin.change1hPct = shortTerm.change1hPct;
+      coin.change4hPct = shortTerm.change4hPct;
+      coin.rvol = shortTerm.rvol;
+
+      // 1. Order Book Imbalance Component (S_OBI: max 40 pts)
+      const sObi = Math.max(0, Math.min(40, (obi - 0.40) * 145));
+
+      // 2. Multi-Timeframe Velocity & Ignition Component (S_MOM: max 38 pts)
+      const c24 = Number(coin.priceChangePct) || 0;
+      const c1h = Number(coin.change1hPct) || 0;
+      const c15m = Number(coin.change15mPct) || 0;
+      const effectiveMom = Math.max(
+        c24,
+        (c1h * 2.4) + (c15m * 3.8),
+        (c15m * 5.0)
+      );
+      const sMom = Math.max(0, Math.min(38, (effectiveMom + 2.5) * 3.6));
+
+      // 3. Liquidity & Relative Volume Surge Component (S_VOL: max 25 pts)
+      const volM = Math.max(1, Number(coin.volumeM) || 5);
+      const rvolBoost = coin.rvol >= 1.5 ? Math.min(10, (coin.rvol - 1.0) * 4.5) : 0;
+      const sVol = Math.min(25, (Math.log10(volM) * 7.2) + rvolBoost);
+
+      // 4. Spike Ignition Bonus (Catches breakouts like DODO/USDT +30%)
+      const isSpike = (c15m >= 1.8 || c1h >= 3.8) && coin.rvol >= 1.6;
+      const spikeBonus = isSpike ? 6 : 0;
+      coin.isSpikeCandidate = isSpike;
+
+      const rawScore = Math.round(sObi + sMom + sVol + spikeBonus);
+      coin.score = Math.max(45, Math.min(98, rawScore));
+      coin.cvd = Number(((obi - 0.50) * 120 + (c15m * 2.5)).toFixed(1));
+
+      if (coin.score >= 82) coin.direction = 'STRONG BUY';
+      else if (coin.score >= 74) coin.direction = 'BUY';
+      else if (coin.score >= 60) coin.direction = 'NEUTRAL';
+      else coin.direction = 'WEAK';
+
+      coin.reasoning = `${isSpike ? '🚀 SPIKE IGNITION | ' : ''}15m: ${c15m >= 0 ? '+' : ''}${c15m.toFixed(1)}%, 1h: ${c1h >= 0 ? '+' : ''}${c1h.toFixed(1)}%, RVOL: ${coin.rvol.toFixed(1)}x, OBI: ${Math.round(obi * 100)}% ($${coin.volumeM}M Vol)`;
+      coin.verifiedAt = Date.now();
+    }
+
+    const nowStr = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+    State.subsystems.microstructure.cyclesCompleted++;
+    State.subsystems.microstructure.lastCycleTime = nowStr;
+    State.subsystems.microstructure.evaluatedUniverseSize = symbols.length;
+    State.quantTelemetry.lastAnalysisTime = nowStr;
+
+    // Immediately evaluate Autopilot entries after scoring
+    await evaluateAutopilotEntries(regimeConfig);
+    broadcastPricesOnly();
+  } catch (err) {
+    console.warn('[Quant Scoring Warning]', err.message);
+  }
+}
+
+// -------------------------------------------------------------
+// AUTOPILOT ENTRY MATRIX WITH SPIKE FAST-TRACK & VIP ALPHA OVERRIDE
 // -------------------------------------------------------------
 async function evaluateAutopilotEntries(regimeConfig) {
   if (!State.autopilotEnabled) return;
@@ -1030,35 +1240,54 @@ async function evaluateAutopilotEntries(regimeConfig) {
     const book = await fetchRealOrderBookDepth(sym);
     if (!book) continue;
 
-    const isMicroAsset = (coin.priceUSDT && coin.priceUSDT < 0.01);
-    const allowedSpread = isMicroAsset ? 0.35 : config.maxSpread;
+    // Price-Tiered & Spike-Aware Spread Tolerance (Prevents rejecting $0.10-$1.00 coins like DODO/USDT)
+    const isSubCent = (coin.priceUSDT && coin.priceUSDT < 0.01);
+    const isLowDollarAlt = (coin.priceUSDT && coin.priceUSDT >= 0.01 && coin.priceUSDT < 1.50);
+    const isHighVelocitySpike = Boolean(coin.isSpikeCandidate || coin.change15mPct >= 2.0 || coin.change1hPct >= 4.0);
+
+    let allowedSpread = config.maxSpread;
+    if (isSubCent) allowedSpread = 0.35;
+    else if (isHighVelocitySpike) allowedSpread = 0.25;
+    else if (isLowDollarAlt) allowedSpread = 0.20;
+
     if (book.spreadPct > allowedSpread) continue;
 
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
 
-    // Check Case A: Standard Quota Available (or Quota Bypass is Active)
+    // Case A1: Standard High-Conviction Confluence
     if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold) {
       executeSimulatedBuy(
         sym, 
         coin.priceUSDT, 
-        `AQPE High-Conviction Confluence (${config.regime}|${config.pacingMode}${isBypassActive ? '|UNLIMITED' : ''}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}% >= ${(config.obiThreshold * 100).toFixed(0)}%, Spread ${book.spreadPct.toFixed(2)}%)`,
+        `AQPE High-Conviction Confluence (${config.regime}|${config.pacingMode}${isBypassActive ? '|UNLIMITED' : ''}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}%, 15m: +${(coin.change15mPct || 0).toFixed(1)}%, Spread ${book.spreadPct.toFixed(2)}%)`,
         false
       );
       break;
     }
 
-    // Check Case B: VIP Alpha Override Gate (When standard quota exhausted)
-    // Catches God-candle surges like T/USDT (+22%) or ANIME (+20%)
+    // Case A2: Ignition Spike Fast-Track (Catches explosive mid-cap surges like DODO/USDT when quota is open)
+    const isVerifiedIgnition = isHighVelocitySpike && (coin.rvol || 1) >= 1.6 && (coin.pricePositionInRange || 0.6) >= 0.68;
+    if (standardQuotaAvailable && isVerifiedIgnition && coin.score >= (config.scoreThreshold - 2) && book.obi >= 0.52) {
+      executeSimulatedBuy(
+        sym,
+        coin.priceUSDT,
+        `🚀 Ignition Spike Fast-Track (${sym}: 15m +${(coin.change15mPct || 0).toFixed(1)}%, 1h +${(coin.change1hPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x, Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%)`,
+        false
+      );
+      break;
+    }
+
+    // Case B: VIP Alpha Override Gate (When standard quota exhausted)
     if (!standardQuotaAvailable && vipSlotsRemaining > 0) {
-      const isExtremeMomentum = (coin.change1hPct >= 5.0 || coin.priceChangePct >= 12.0);
-      const isExtremeConfluence = (coin.score >= 88 && book.obi >= 0.60);
+      const isExtremeMomentum = (coin.change15mPct >= 3.0 || coin.change1hPct >= 5.0 || coin.priceChangePct >= 12.0);
+      const isExtremeConfluence = (coin.score >= (config.vipScoreThreshold || 87) && book.obi >= (config.vipObiThreshold || 0.58));
 
       if (isExtremeMomentum && isExtremeConfluence) {
         executeSimulatedBuy(
           sym,
           coin.priceUSDT,
-          `⚡ VIP Alpha Override Slot (${vipSlotsRemaining} left): God-Candle Breakout! Score ${coin.score} >= 88, OBI ${(book.obi * 100).toFixed(0)}% >= 60%, 1h: +${(coin.change1hPct || 0).toFixed(1)}%, 24h: +${coin.priceChangePct.toFixed(1)}%`,
+          `⚡ VIP Alpha Override Slot (${vipSlotsRemaining} left): God-Candle Breakout! Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%, 15m: +${(coin.change15mPct || 0).toFixed(1)}%, 1h: +${(coin.change1hPct || 0).toFixed(1)}%`,
           true
         );
         break;
