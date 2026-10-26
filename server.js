@@ -64,7 +64,7 @@ const State = {
   googleSheetUrl: GOOGLE_SHEET_URL,
 
   tradeFrequencyController: {
-    quotaBypassEnabled: false, // Set to true to disable the 8-trade cap for full 48h stress-testing
+    quotaBypassEnabled: false,
     baseMaxTradesPer24h: 8,
     maxTradesPer24h: 8,
     vipAlphaSlotsAllowed: 2,
@@ -73,7 +73,7 @@ const State = {
     bonusSlotsEarned: 0,
     consecutiveWinStreak: 0,
     streakBonusReason: 'BASELINE',
-    maxConcurrentPositions: 2,
+    maxConcurrentPositions: 3, // EXPANDED: 3 concurrent positions for multi-tranche execution
     rollingTrades24h: [],
     nextSlotReleaseTimestamp: 0,
     globalCircuitBreakerUntil: 0,
@@ -87,7 +87,7 @@ const State = {
     scoreThreshold: 80,
     obiThreshold: 0.55,
     maxSpread: 0.08,
-    cooldownMinutes: 90,
+    cooldownMinutes: 15,
     marketAvgRange: 4.5,
     pacingGateOffset: 0,
     vipScoreThreshold: 88,
@@ -117,7 +117,7 @@ const State = {
       nextRunCountdownSec: 90,
       scannedPairsCount: 0,
       qualifiedCandidatesCount: 0,
-      liquidityFloorUSD: 'Dynamic ($3.5M-$14M)',
+      liquidityFloorUSD: 'Dynamic ($1.5M-$10M)',
       cadenceSec: 90
     },
     regimeController: {
@@ -135,7 +135,8 @@ const State = {
       intervalSec: 2.5,
       activePositionsMonitored: 0,
       trailingLocksActive: 0,
-      highDecayAlerts: 0
+      highDecayAlerts: 0,
+      architecture: '3-Pillar Spot Resiliency (Flow-Based Exit + Two-Tranche DCA + -4.5% Disaster Belt)'
     },
     quotaManager: {
       status: 'NORMAL',
@@ -163,7 +164,7 @@ const State = {
   },
 
   quantTelemetry: {
-    engine: 'Institutional 3-Stage Discovery & Active Quota Pacing Engine',
+    engine: 'Institutional 3-Pillar Spot Resiliency Architecture (Two-Tranche DCA + Flow Invalidation)',
     source: 'PURE_QUANT_ALGO',
     frequencySeconds: 15,
     lastAnalysisTime: '--:--:--',
@@ -171,7 +172,7 @@ const State = {
     riskCadence: 'Every 2.5 Seconds',
     persistenceStatus: 'ACTIVE (Non-Destructive)',
     p2pRateStatus: 'Binance P2P Daily Sync Active',
-    regimeReasoning: 'Actively pacing trades to consistently utilize 4-8 slots/24h while maintaining positive statistical expectancy.'
+    regimeReasoning: 'Executing 60/40 two-tranche entries to absorb pullback wicks with order-flow invalidation (OBI < 40%) and wide -4.5% disaster safety floor.'
   },
 
   universe: { ...DEFAULT_UNIVERSE },
@@ -208,7 +209,6 @@ async function syncBinanceP2PUsdtInrRate() {
   try {
     let rateFound = 0;
 
-    // 1. Try Binance Public C2C P2P Quote API
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 7000);
@@ -244,7 +244,6 @@ async function syncBinanceP2PUsdtInrRate() {
       }
     } catch (e) {}
 
-    // 2. Secondary fallback: Binance Price Reference endpoint
     if (!rateFound) {
       try {
         const controller = new AbortController();
@@ -261,7 +260,6 @@ async function syncBinanceP2PUsdtInrRate() {
       } catch (e) {}
     }
 
-    // 3. Third fallback: Standard FX + P2P premium average
     if (!rateFound) {
       try {
         const controller = new AbortController();
@@ -322,7 +320,6 @@ async function fetchRealOrderBookDepth(symbol) {
 
 async function fetchShortTermMomentum(symbol) {
   try {
-    // 16 bars of 15m klines = full 4-hour window with 15m ignition granularity & RVOL
     const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=16`);
     if (Array.isArray(klines) && klines.length >= 6) {
       const latest = klines[klines.length - 1];
@@ -339,7 +336,6 @@ async function fetchShortTermMomentum(symbol) {
       const change1hPct = open1h > 0 ? ((currentClose - open1h) / open1h) * 100 : 0;
       const change4hPct = open4h > 0 ? ((currentClose - open4h) / open4h) * 100 : 0;
 
-      // Calculate Relative Volume (RVOL): recent 2 candles (30m) vs preceding baseline average
       const recentVolAvg = ((parseFloat(latest[7]) || 0) + (parseFloat(prev15m[7]) || 0)) / 2;
       let baselineSum = 0;
       const baselineCount = klines.length - 2;
@@ -583,14 +579,12 @@ function recalculateTrueRealizedPnL() {
   State.portfolio.realizedPnL = Number(trueSumUSDT.toFixed(4));
 }
 
-// Reconstruct 24h rolling trade timestamps from trade logs and active positions
 function reconcileRollingTradeQuotaFromHistory() {
   const now = Date.now();
   const dayAgo = now - (24 * 60 * 60 * 1000);
   const timestamps = new Set();
   const vipTimestamps = new Set();
 
-  // 1. Add timestamps from all executed trade logs strictly within last 24h
   State.tradeLogs.forEach(l => {
     const tradeTs = parseTradeTimestamp(l);
     if (tradeTs > 0 && tradeTs > dayAgo && tradeTs <= now) {
@@ -601,7 +595,6 @@ function reconcileRollingTradeQuotaFromHistory() {
     }
   });
 
-  // 2. Add timestamps from currently open active positions
   Object.values(State.activePositions || {}).forEach(pos => {
     const openTs = Number(pos.openedAt);
     if (!isNaN(openTs) && openTs > dayAgo && openTs <= now) {
@@ -612,11 +605,8 @@ function reconcileRollingTradeQuotaFromHistory() {
     }
   });
 
-  State.tradeFrequencyController.rollingTrades24h = Array.from(timestamps)
-    .sort((a, b) => a - b);
-
-  State.tradeFrequencyController.vipTrades24h = Array.from(vipTimestamps)
-    .sort((a, b) => a - b);
+  State.tradeFrequencyController.rollingTrades24h = Array.from(timestamps).sort((a, b) => a - b);
+  State.tradeFrequencyController.vipTrades24h = Array.from(vipTimestamps).sort((a, b) => a - b);
 
   syncRollingTradeQuota();
 }
@@ -667,7 +657,7 @@ async function syncWithGoogleDrive() {
         State.subsystems.persistence.googleSheetSync = 'ACTIVE';
         saveStateToDisk();
         broadcastState();
-        console.log(`[GoogleSheet Sync] Successfully restored ${data.trades.length} trades from Google Drive with clean dates.`);
+        console.log(`[GoogleSheet Sync] Successfully restored ${data.trades.length} trades from Google Drive.`);
       }
     }
   } catch (err) {
@@ -765,7 +755,6 @@ function syncRollingTradeQuota() {
 
   const isBypassActive = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
 
-  // 1. Calculate consecutive winning streak from recent settled trades in 24h
   let currentStreak = 0;
   let rollingNetGainUSDT = 0;
   const recentLogs24h = State.tradeLogs.filter(l => {
@@ -779,11 +768,10 @@ function syncRollingTradeQuota() {
     if (pnl > 0.10) {
       currentStreak++;
     } else if (pnl < -0.05) {
-      break; // Streak terminates at first net loss
+      break;
     }
   }
 
-  // 2. Dynamic Earned Quota Ratchet:
   let bonusSlots = 0;
   let streakReason = 'BASELINE';
 
@@ -809,13 +797,11 @@ function syncRollingTradeQuota() {
   const count = State.tradeFrequencyController.rollingTrades24h.length;
   const remaining = isBypassActive ? 999 : Math.max(0, dynamicMaxAllowed - count);
 
-  // VIP Alpha Slots (Max 2 Reserve Overrides per 24h)
   const vipUsed = State.tradeFrequencyController.vipTrades24h.length;
   const vipMax = State.tradeFrequencyController.vipAlphaSlotsAllowed || 2;
   const vipRemaining = isBypassActive ? 999 : Math.max(0, vipMax - vipUsed);
   State.tradeFrequencyController.vipAlphaSlotsUsed24h = vipUsed;
 
-  // Accurate Slot Expiration Tracking
   let resetTimeMin = 0;
   let nextReleaseTimestamp = 0;
   let formattedReset = isBypassActive ? 'UNLIMITED TRADES ACTIVE' : 'All Slots Open';
@@ -839,12 +825,10 @@ function syncRollingTradeQuota() {
 
   State.tradeFrequencyController.nextSlotReleaseTimestamp = nextReleaseTimestamp;
 
-  let circuitBreakerRemainingSec = 0;
-  if (State.tradeFrequencyController.globalCircuitBreakerUntil > now) {
-    circuitBreakerRemainingSec = Math.round((State.tradeFrequencyController.globalCircuitBreakerUntil - now) / 1000);
-    State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
-    State.subsystems.quotaManager.status = 'PAUSED_LOSS_COOLDOWN';
-  } else if (isBypassActive) {
+  // PILLAR 3: Abolish 20-minute post-loss freeze in spot algorithmic trading
+  State.tradeFrequencyController.globalCircuitBreakerUntil = 0;
+
+  if (isBypassActive) {
     State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
     State.subsystems.quotaManager.status = 'UNLIMITED_BYPASS_ACTIVE';
   } else if (remaining === 0 && vipRemaining > 0) {
@@ -871,7 +855,7 @@ function syncRollingTradeQuota() {
   State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
   State.subsystems.quotaManager.nextSlotReleaseTimestamp = nextReleaseTimestamp;
   State.subsystems.quotaManager.formattedReset = formattedReset;
-  State.subsystems.quotaManager.circuitBreakerRemainingSec = circuitBreakerRemainingSec;
+  State.subsystems.quotaManager.circuitBreakerRemainingSec = 0;
 }
 
 // -------------------------------------------------------------
@@ -897,7 +881,6 @@ async function runDynamicMarketScreener() {
     for (const t of tickers) {
       if (!t.symbol.endsWith('USDT')) continue;
       const base = t.symbol.slice(0, -4);
-      // Strictly guard single-letter tickers (like TUSDT) from matching pegged tokens
       if (['UP', 'DOWN', 'BEAR', 'BULL', 'USDC', 'FDUSD', 'TUSD', 'EUR', 'DAI', 'USDP', 'BUSD', 'PAXG', 'WBTC'].includes(base)) continue;
 
       const quoteVol = parseFloat(t.quoteVolume) || 0;
@@ -913,12 +896,11 @@ async function runDynamicMarketScreener() {
       const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
       const vwapPremiumPct = vwapPrice > 0 ? ((lastPrice - vwapPrice) / vwapPrice) * 100 : 0;
 
-      // Dynamic Mid-Cap Awakening Floor (Catches DODO/USDT & explosive altcoins at $1.5M+ volume)
       let requiredFloor = 10000000;
       if (priceChangePct >= 5.0 || (vwapPremiumPct >= 3.0 && pricePositionInRange >= 0.72)) {
-        requiredFloor = 1500000; // $1.5M floor for high-velocity VWAP breakouts
+        requiredFloor = 1500000;
       } else if (priceChangePct >= 2.5 || vwapPremiumPct >= 1.8) {
-        requiredFloor = 2500000; // $2.5M floor for early momentum builders
+        requiredFloor = 2500000;
       } else if (isCompression || isStarved) {
         requiredFloor = 4500000;
       }
@@ -927,7 +909,6 @@ async function runDynamicMarketScreener() {
         const minPositionRatio = (isCompression || isStarved) ? 0.48 : 0.54;
         if (pricePositionInRange < minPositionRatio) continue;
 
-        // Balanced liquidity scoring so mega-caps don't drown out mid-cap rockets
         const liquidityDensityScore = Math.min(22, Math.log10(quoteVol) * 3.0);
         const rangeProximityBoost = pricePositionInRange * 16;
         const directionalMomentum = Math.max(0, priceChangePct) * 2.4;
@@ -959,7 +940,6 @@ async function runDynamicMarketScreener() {
       .filter(c => !c.isActive)
       .sort((a, b) => b.breakoutScore - a.breakoutScore);
 
-    // Inspect top 15 candidates in Stage 2 for 15m Ignition & RVOL velocity
     const stage2PoolSize = Math.max(0, 15 - activeCandidates.length);
     const stage2Pool = [...activeCandidates, ...nonActiveSorted.slice(0, stage2PoolSize)];
 
@@ -970,7 +950,6 @@ async function runDynamicMarketScreener() {
       p.change4hPct = shortTerm.change4hPct;
       p.rvol = shortTerm.rvol;
 
-      // Boost Stage 2 score heavily for 15m ignition spikes & RVOL surges (e.g., DODO at 12:30 AM)
       if (p.change15mPct >= 1.5) p.breakoutScore += (p.change15mPct * 4.5);
       if (p.change1hPct >= 1.0) p.breakoutScore += (p.change1hPct * 2.5);
       if (p.change4hPct >= 2.5) p.breakoutScore += (p.change4hPct * 1.2);
@@ -985,7 +964,6 @@ async function runDynamicMarketScreener() {
     if (topPicks.length > 0) {
       const updatedUniverse = {};
 
-      // 1. ANCHOR GUARANTEE: Active positions MUST ALWAYS remain in universe while open
       activeSymbols.forEach(sym => {
         if (State.universe[sym]) {
           updatedUniverse[sym] = { ...State.universe[sym] };
@@ -1009,7 +987,6 @@ async function runDynamicMarketScreener() {
         }
       });
 
-      // 2. Add top screener discoveries up to top pool
       topPicks.forEach(c => {
         if (!updatedUniverse[c.symbol]) {
           const existing = State.universe[c.symbol];
@@ -1047,7 +1024,6 @@ async function runDynamicMarketScreener() {
     State.subsystems.screener.status = 'ACTIVE';
     State.subsystems.screener.lastRunTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
-    // Immediately run quant microstructure scoring & entry check on the newly discovered universe
     await runPureQuantScoring();
   } catch (err) {
     State.subsystems.screener.status = 'ERROR';
@@ -1078,7 +1054,6 @@ function calculateMarketVolatilityRegime() {
   }
   medianRange = Number(medianRange.toFixed(2));
 
-  // Determine Active Quota Pacing Mode (AQPE)
   const now = Date.now();
   const sixHoursAgo = now - (6 * 60 * 60 * 1000);
   const twelveHoursAgo = now - (12 * 60 * 60 * 1000);
@@ -1091,7 +1066,7 @@ function calculateMarketVolatilityRegime() {
   if (tradesLast6h === 0) {
     pacingMode = 'STARVED';
     pacingGateOffset = -2;
-    screenerIntervalMs = 60 * 1000; // Accelerate screener to 60s when starved
+    screenerIntervalMs = 60 * 1000;
   } else if (tradesLast12h >= 5) {
     pacingMode = 'SATURATED';
     pacingGateOffset = 2;
@@ -1132,7 +1107,7 @@ function calculateMarketVolatilityRegime() {
     scoreThreshold: finalScoreGate,
     obiThreshold: baseObi,
     maxSpread,
-    cooldownMinutes: 90,
+    cooldownMinutes: 15, // PILLAR 3: Reduced from 90m to 15m
     marketAvgRange: medianRange,
     pacingGateOffset,
     vipScoreThreshold: 87,
@@ -1176,10 +1151,8 @@ async function runPureQuantScoring() {
       coin.change4hPct = shortTerm.change4hPct;
       coin.rvol = shortTerm.rvol;
 
-      // 1. Order Book Imbalance Component (S_OBI: max 40 pts)
       const sObi = Math.max(0, Math.min(40, (obi - 0.40) * 145));
 
-      // 2. Multi-Timeframe Velocity & Ignition Component (S_MOM: max 38 pts)
       const c24 = Number(coin.priceChangePct) || 0;
       const c1h = Number(coin.change1hPct) || 0;
       const c15m = Number(coin.change15mPct) || 0;
@@ -1190,12 +1163,10 @@ async function runPureQuantScoring() {
       );
       const sMom = Math.max(0, Math.min(38, (effectiveMom + 2.5) * 3.6));
 
-      // 3. Liquidity & Relative Volume Surge Component (S_VOL: max 25 pts)
       const volM = Math.max(1, Number(coin.volumeM) || 5);
       const rvolBoost = coin.rvol >= 1.5 ? Math.min(10, (coin.rvol - 1.0) * 4.5) : 0;
       const sVol = Math.min(25, (Math.log10(volM) * 7.2) + rvolBoost);
 
-      // 4. Spike Ignition Bonus (Catches breakouts like DODO/USDT +30%)
       const isSpike = (c15m >= 1.8 || c1h >= 3.8) && coin.rvol >= 1.6;
       const spikeBonus = isSpike ? 6 : 0;
       coin.isSpikeCandidate = isSpike;
@@ -1219,7 +1190,6 @@ async function runPureQuantScoring() {
     State.subsystems.microstructure.evaluatedUniverseSize = symbols.length;
     State.quantTelemetry.lastAnalysisTime = nowStr;
 
-    // Immediately evaluate Autopilot entries after scoring
     await evaluateAutopilotEntries(regimeConfig);
     broadcastPricesOnly();
   } catch (err) {
@@ -1228,16 +1198,15 @@ async function runPureQuantScoring() {
 }
 
 // -------------------------------------------------------------
-// AUTOPILOT ENTRY MATRIX WITH SPIKE FAST-TRACK & VIP ALPHA OVERRIDE
+// AUTOPILOT ENTRY MATRIX WITH 3-PILLAR TWO-TRANCHE DCA ARCHITECTURE
 // -------------------------------------------------------------
 async function evaluateAutopilotEntries(regimeConfig) {
   if (!State.autopilotEnabled) return;
 
   syncRollingTradeQuota();
 
-  if (State.tradeFrequencyController.circuitBreakerReason !== 'NORMAL') return;
-
   const currentCount = Object.keys(State.activePositions).length;
+  // EXPANDED CEILING: Up to 3 concurrent active positions (15% max portfolio exposure)
   if (currentCount >= State.tradeFrequencyController.maxConcurrentPositions) return;
 
   if (State.portfolio.cashUSDT < 30) return;
@@ -1248,7 +1217,6 @@ async function evaluateAutopilotEntries(regimeConfig) {
   const standardQuotaAvailable = isBypassActive || (State.subsystems.quotaManager.quotaRemaining > 0);
   const vipSlotsRemaining = isBypassActive ? 999 : (State.subsystems.quotaManager.vipSlotsRemaining || 0);
 
-  // If neither standard quota nor VIP reserve is available, abort
   if (!standardQuotaAvailable && vipSlotsRemaining <= 0) return;
 
   const sortedCandidates = Object.keys(State.universe)
@@ -1265,7 +1233,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
         : { until: Number(State.cooldowns[sym]) || 0, stoppedEntryPriceUSDT: 0 };
       const remaining = cdObj.until - Date.now();
 
-      // V-Shape Wick Reclaim Override: If asset reclaimed its prior entry price with Score >= 82 & OBI >= 56%, lift cooldown!
+      // V-Shape Wick Reclaim Override
       const isVShapeReclaim = cdObj.stoppedEntryPriceUSDT > 0 &&
         coin.priceUSDT >= (cdObj.stoppedEntryPriceUSDT * 1.002) &&
         coin.score >= 82 &&
@@ -1278,10 +1246,8 @@ async function evaluateAutopilotEntries(regimeConfig) {
     const book = await fetchRealOrderBookDepth(sym);
     if (!book) continue;
 
-    // Anti-Chasing Climax Guard: Avoid buying the exact top tick of an exhausted +12% 15m vertical spike unless OBI >= 60%
     if ((coin.change15mPct || 0) >= 12.0 && book.obi < 0.60) continue;
 
-    // Price-Tiered & Spike-Aware Spread Tolerance (Prevents rejecting $0.10-$1.00 coins like DODO/USDT or ERA/USDT)
     const isSubCent = (coin.priceUSDT && coin.priceUSDT < 0.01);
     const isLowDollarAlt = (coin.priceUSDT && coin.priceUSDT >= 0.01 && coin.priceUSDT < 1.50);
     const isHighVelocitySpike = Boolean(coin.isSpikeCandidate || coin.change15mPct >= 2.0 || coin.change1hPct >= 4.0);
@@ -1292,43 +1258,42 @@ async function evaluateAutopilotEntries(regimeConfig) {
     else if (isLowDollarAlt) allowedSpread = 0.20;
 
     if (book.spreadPct > allowedSpread) continue;
-
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
 
     // Case A1: Standard High-Conviction Confluence
     if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold) {
-      executeSimulatedBuy(
+      executeTwoTrancheBuy(
         sym, 
         coin.priceUSDT, 
-        `AQPE High-Conviction Confluence (${config.regime}|${config.pacingMode}${isBypassActive ? '|UNLIMITED' : ''}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}%, 15m: +${(coin.change15mPct || 0).toFixed(1)}%, Spread ${book.spreadPct.toFixed(2)}%)`,
+        `3-Pillar Confluence (${config.regime}|${config.pacingMode}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}%, 15m: +${(coin.change15mPct || 0).toFixed(1)}%, Spread ${book.spreadPct.toFixed(2)}%)`,
         false
       );
       break;
     }
 
-    // Case A2: Ignition Spike Fast-Track (Catches explosive mid-cap surges like DODO/USDT when quota is open)
+    // Case A2: Ignition Spike Fast-Track
     const isVerifiedIgnition = isHighVelocitySpike && (coin.rvol || 1) >= 1.6 && (coin.pricePositionInRange || 0.6) >= 0.68;
     if (standardQuotaAvailable && isVerifiedIgnition && coin.score >= (config.scoreThreshold - 2) && book.obi >= 0.52) {
-      executeSimulatedBuy(
+      executeTwoTrancheBuy(
         sym,
         coin.priceUSDT,
-        `🚀 Ignition Spike Fast-Track (${sym}: 15m +${(coin.change15mPct || 0).toFixed(1)}%, 1h +${(coin.change1hPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x, Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%)`,
+        `🚀 Ignition Fast-Track (${sym}: 15m +${(coin.change15mPct || 0).toFixed(1)}%, 1h +${(coin.change1hPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x, Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%)`,
         false
       );
       break;
     }
 
-    // Case B: VIP Alpha Override Gate (When standard quota exhausted)
+    // Case B: VIP Alpha Override Gate
     if (!standardQuotaAvailable && vipSlotsRemaining > 0) {
       const isExtremeMomentum = (coin.change15mPct >= 3.0 || coin.change1hPct >= 5.0 || coin.priceChangePct >= 12.0);
       const isExtremeConfluence = (coin.score >= (config.vipScoreThreshold || 87) && book.obi >= (config.vipObiThreshold || 0.58));
 
       if (isExtremeMomentum && isExtremeConfluence) {
-        executeSimulatedBuy(
+        executeTwoTrancheBuy(
           sym,
           coin.priceUSDT,
-          `⚡ VIP Alpha Override Slot (${vipSlotsRemaining} left): God-Candle Breakout! Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%, 15m: +${(coin.change15mPct || 0).toFixed(1)}%, 1h: +${(coin.change1hPct || 0).toFixed(1)}%`,
+          `⚡ VIP Alpha Override (${vipSlotsRemaining} left): God-Candle Breakout! Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%`,
           true
         );
         break;
@@ -1338,46 +1303,68 @@ async function evaluateAutopilotEntries(regimeConfig) {
 }
 
 // -------------------------------------------------------------
-// ORDER EXECUTION & RISK MANAGEMENT
+// PILLAR 1: ASYMMETRIC TWO-TRANCHE EXECUTION (SMART DCA BUFFER)
 // -------------------------------------------------------------
-function executeSimulatedBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
+function executeTwoTrancheBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
   if (State.portfolio.cashUSDT < 30) return;
-  
-  const notionalUSDT = Math.min(50, State.portfolio.cashUSDT);
-  const qty = notionalUSDT / priceUSDT;
 
-  State.portfolio.cashUSDT -= notionalUSDT;
+  // Split allocation: $30 Tranche 1 (Market) + $20 Tranche 2 (Limit Retest Bid)
+  const tranche1Notional = 30.00;
+  const tranche2Notional = 20.00;
+  const totalTargetNotional = 50.00;
 
-  const isMicroAsset = (priceUSDT < 0.10);
-  const slPct = isMicroAsset ? 0.0095 : 0.0080;
-  const sl = priceUSDT * (1 - slPct);
-  const tp1 = priceUSDT * (1 + 0.016);
+  const t1Qty = tranche1Notional / priceUSDT;
+
+  // Tranche 2 limit bid placed at -1.6% retest support
+  const t2PriceUSDT = formatBinanceUSDTPrice(priceUSDT * (1 - 0.016));
+  const t2Qty = tranche2Notional / t2PriceUSDT;
+
+  // Deduct Tranche 1 from cash balance immediately
+  State.portfolio.cashUSDT -= tranche1Notional;
+
+  // Pillar 3: Wide Catastrophic Safety Floor (-4.5%)
+  const catastrophicFloorUSDT = formatBinanceUSDTPrice(priceUSDT * (1 - 0.045));
+  const tp1 = formatBinanceUSDTPrice(priceUSDT * (1 + 0.018)); // +1.80% TP1
 
   State.activePositions[pairKey] = {
     pairKey,
     pairSymbol: State.universe[pairKey]?.symbol || pairKey,
     entryPriceUSDT: priceUSDT,
-    qty,
-    originalQty: qty,
-    notionalUSDT,
-    originalNotionalUSDT: notionalUSDT,
-    sl,
+    initialMarketEntryPriceUSDT: priceUSDT,
+    qty: t1Qty,
+    originalQty: t1Qty,
+    notionalUSDT: tranche1Notional,
+    totalTargetNotional,
+    
+    // Tranche Sub-Structure
+    tranche1Notional,
+    tranche1Qty: t1Qty,
+    tranche1PriceUSDT: priceUSDT,
+    tranche2Notional,
+    tranche2Qty: t2Qty,
+    tranche2PriceUSDT: t2PriceUSDT,
+    tranche2Filled: false,
+    tranche2Cancelled: false,
+
+    // Risk Architecture
+    catastrophicFloorUSDT,
+    retestGraceUntil: Date.now() + (20 * 60 * 1000), // 20-min retest window
+    flowInvalidationTicks: 0,
+    currentObi: 0.55,
+    sl: catastrophicFloorUSDT, // Default floor is catastrophic belt
     tp1,
     openedAt: Date.now(),
     isTrailingActive: false,
     tp1Secured: false,
     highWatermarkUSDT: priceUSDT,
-    decayRisk: 5,
-    consecutiveDecayTicks: 0,
-    predictiveStatus: 'SAFE',
     isVipAlpha
   };
 
   State.portfolio.holdings[pairKey] = {
     symbol: State.universe[pairKey]?.symbol || pairKey,
-    qty,
+    qty: t1Qty,
     avgBuyPriceUSDT: priceUSDT,
-    totalCostUSDT: notionalUSDT
+    totalCostUSDT: tranche1Notional
   };
 
   State.tradeFrequencyController.rollingTrades24h.push(Date.now());
@@ -1386,9 +1373,10 @@ function executeSimulatedBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
   }
 
   syncRollingTradeQuota();
-
   saveStateToDisk();
   broadcastState();
+
+  console.log(`[Smart DCA Entry] Opened ${pairKey}: Tranche 1 ($30) @ $${priceUSDT} | Tranche 2 Limit ($20) placed @ $${t2PriceUSDT}`);
 }
 
 function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
@@ -1407,8 +1395,13 @@ function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
   pos.notionalUSDT = halfNotional;
   pos.tp1Secured = true;
   pos.isTrailingActive = true;
-  pos.sl = pos.entryPriceUSDT * 1.0025;
+  pos.sl = pos.entryPriceUSDT * 1.0025; // Breakeven lock
   pos.highWatermarkUSDT = Math.max(pos.highWatermarkUSDT || exitPriceUSDT, exitPriceUSDT);
+
+  // If Tranche 2 never filled, cancel it cleanly
+  if (!pos.tranche2Filled) {
+    pos.tranche2Cancelled = true;
+  }
 
   if (State.portfolio.holdings[pairKey]) {
     State.portfolio.holdings[pairKey].qty = halfQty;
@@ -1469,11 +1462,13 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   delete State.activePositions[pairKey];
 
   if (pnlUSDT < 0) {
-    const cooldownMinutes = State.activeThresholds?.cooldownMinutes || 90;
-    State.cooldowns[pairKey] = Date.now() + (cooldownMinutes * 60 * 1000);
-    State.tradeFrequencyController.globalCircuitBreakerUntil = Date.now() + (20 * 60 * 1000);
-    State.tradeFrequencyController.circuitBreakerReason = 'POST_LOSS_FREEZE';
-    // Instant Retract Guard: Any single loss collapses bonus quota slots back to baseline
+    // PILLAR 3: Mild 15-minute asset cooldown with V-reclaim active; NO global circuit breaker freeze!
+    State.cooldowns[pairKey] = {
+      until: Date.now() + (15 * 60 * 1000),
+      stoppedEntryPriceUSDT: pos.entryPriceUSDT
+    };
+    State.tradeFrequencyController.globalCircuitBreakerUntil = 0; // Abolished 20-min freeze
+    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
     State.tradeFrequencyController.consecutiveWinStreak = 0;
     State.tradeFrequencyController.bonusSlotsEarned = 0;
   }
@@ -1520,7 +1515,7 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
 }
 
 // -------------------------------------------------------------
-// SENTRY RISK MONITOR
+// PILLARS 2 & 3: FLOW-BASED SENTRY & DISASTER RISK MONITOR
 // -------------------------------------------------------------
 async function monitorOpenPositionsHealth() {
   const openKeys = Object.keys(State.activePositions);
@@ -1545,7 +1540,6 @@ async function monitorOpenPositionsHealth() {
 
     if (pos.isTrailingActive) trailingCount++;
 
-    // Prioritize direct live tick stamped on pos, then universe, with emergency ticker fallback
     let livePriceUSDT = pos.livePriceUSDT || State.universe[sym]?.priceUSDT;
     if (!livePriceUSDT || livePriceUSDT <= 0) {
       try {
@@ -1562,23 +1556,55 @@ async function monitorOpenPositionsHealth() {
       livePriceUSDT = pos.entryPriceUSDT;
     }
 
+    // ---------------------------------------------------------
+    // PILLAR 1: CHECK TRANCHE 2 RETEST LIMIT FILL (-1.6% Wick)
+    // ---------------------------------------------------------
+    if (!pos.tranche2Filled && !pos.tranche2Cancelled) {
+      if (livePriceUSDT <= pos.tranche2PriceUSDT && State.portfolio.cashUSDT >= 20.00) {
+        State.portfolio.cashUSDT -= pos.tranche2Notional;
+        pos.tranche2Filled = true;
+
+        const combinedNotional = pos.notionalUSDT + pos.tranche2Notional;
+        const combinedQty = pos.qty + pos.tranche2Qty;
+        const newAvgEntry = formatBinanceUSDTPrice(combinedNotional / combinedQty);
+
+        pos.entryPriceUSDT = newAvgEntry;
+        pos.qty = combinedQty;
+        pos.notionalUSDT = combinedNotional;
+        pos.tp1 = formatBinanceUSDTPrice(newAvgEntry * 1.018);
+        pos.catastrophicFloorUSDT = formatBinanceUSDTPrice(newAvgEntry * 0.955);
+
+        if (State.portfolio.holdings[sym]) {
+          State.portfolio.holdings[sym].qty = combinedQty;
+          State.portfolio.holdings[sym].avgBuyPriceUSDT = newAvgEntry;
+          State.portfolio.holdings[sym].totalCostUSDT = combinedNotional;
+        }
+
+        console.log(`[Tranche 2 Filled] ${sym} retest wick filled $20 limit @ $${pos.tranche2PriceUSDT}! New blended entry: $${newAvgEntry}`);
+        saveStateToDisk();
+      }
+    }
+
     const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
     pos.gainPct = Number(gainPct.toFixed(2));
     pos.unrealizedPnLUSDT = Number(((livePriceUSDT - pos.entryPriceUSDT) * pos.qty).toFixed(4));
     const holdSeconds = (Date.now() - pos.openedAt) / 1000;
-    const isMicroAsset = (pos.entryPriceUSDT < 0.10);
 
     if (!pos.highWatermarkUSDT || livePriceUSDT > pos.highWatermarkUSDT) {
       pos.highWatermarkUSDT = livePriceUSDT;
     }
 
-    // 1. Partial TP1 Take-Profit (+1.60% Gross)
+    // ---------------------------------------------------------
+    // 1. Partial TP1 Take-Profit (+1.80% Gross)
+    // ---------------------------------------------------------
     if (livePriceUSDT >= pos.tp1 && !pos.tp1Secured) {
       settlePartialPosition(sym, livePriceUSDT, `TP1 Banked (+${gainPct.toFixed(2)}%), runner active`);
       continue;
     }
 
+    // ---------------------------------------------------------
     // 2. High Watermark Runner Trail Logic
+    // ---------------------------------------------------------
     if (pos.tp1Secured) {
       const runnerTrailPrice = pos.highWatermarkUSDT * (1 - 0.012);
       pos.sl = Math.max(pos.entryPriceUSDT * 1.0025, runnerTrailPrice);
@@ -1588,59 +1614,56 @@ async function monitorOpenPositionsHealth() {
         continue;
       }
     } else {
-      // 3. Early Trailing Lock (Activates after +1.20% gain, avoiding spread traps)
+      // ---------------------------------------------------------
+      // PILLAR 3: CATASTROPHIC NUCLEAR DISASTER BELT (-4.5%)
+      // ---------------------------------------------------------
+      if (livePriceUSDT <= pos.catastrophicFloorUSDT || gainPct <= -4.50) {
+        settlePosition(sym, 'DISASTER FLOOR CUT', livePriceUSDT, `Hit -4.5% Nuclear Safety Belt (${gainPct.toFixed(2)}%)`);
+        continue;
+      }
+
+      // Early Trailing Lock (Activates after +1.20% gain)
       if (gainPct >= 1.20 && !pos.isTrailingActive) {
         pos.isTrailingActive = true;
         pos.sl = pos.entryPriceUSDT * 1.0025;
       }
 
-      // 4. Hard Stop Loss Boundary
-      if (livePriceUSDT <= pos.sl) {
-        settlePosition(sym, pos.isTrailingActive ? 'TRAILING SL' : 'STOP LOSS', livePriceUSDT, `Hit boundary (${gainPct.toFixed(2)}%)`);
+      if (pos.isTrailingActive && livePriceUSDT <= pos.sl) {
+        settlePosition(sym, 'TRAILING SL', livePriceUSDT, `Breakeven trailing stop triggered (${gainPct.toFixed(2)}%)`);
         continue;
       }
 
-      // 5. Stagnation Exit: Only cut if price is confirmed live and genuinely stagnant
+      // ---------------------------------------------------------
+      // PILLAR 2: ORDER-FLOW & LIQUIDITY INVALIDATION
+      // (Exiting strictly on confirmed flow decay, NEVER on price wicks)
+      // ---------------------------------------------------------
+      const realBook = await fetchRealOrderBookDepth(sym);
+      const currentObi = realBook ? realBook.obi : (pos.currentObi || 0.52);
+      pos.currentObi = Number(currentObi.toFixed(2));
+
+      // As long as institutional limit bids are absorbing depth (OBI >= 48%), HOLD.
+      if (currentObi >= 0.48) {
+        pos.flowInvalidationTicks = 0;
+      } else if (gainPct <= -2.20 && currentObi < 0.40) {
+        // Price is down past -2.2% AND buyer book has genuinely collapsed (<40%)
+        pos.flowInvalidationTicks = (pos.flowInvalidationTicks || 0) + 1;
+        highDecayCount++;
+
+        // Must persist for at least 5 consecutive ticks (12.5 seconds)
+        if (pos.flowInvalidationTicks >= 5) {
+          settlePosition(sym, 'FLOW INVALIDATION', livePriceUSDT, `Order flow breakdown: OBI ${(currentObi * 100).toFixed(0)}% < 40% sustained for 5 ticks (${gainPct.toFixed(2)}%)`);
+          continue;
+        }
+      } else {
+        pos.flowInvalidationTicks = 0;
+      }
+
+      // ---------------------------------------------------------
+      // Time-Decay Stagnation Exit (>25 Minutes without progress)
+      // ---------------------------------------------------------
       const isLiveVerified = Boolean(pos.livePriceUSDT && pos.livePriceUSDT > 0);
-      const maxStagnationSeconds = (State.universe[sym]?.priceChangePct >= 5.0) ? 720 : 540;
-      if (isLiveVerified && holdSeconds >= maxStagnationSeconds && gainPct < 0.25) {
-        settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, `No momentum continuation within ${Math.round(maxStagnationSeconds/60)} minutes`);
-        continue;
-      }
-    }
-
-    // 6. Intelligent Order Book Decay Metric with Multi-Tick Confirmation
-    let decay = 5;
-    const realBook = await fetchRealOrderBookDepth(sym);
-
-    if (realBook) {
-      if (realBook.obi < 0.38) decay += 25;
-      else if (realBook.obi < 0.46) decay += 10;
-      
-      const spreadPenaltyThreshold = isMicroAsset ? 0.30 : 0.12;
-      if (realBook.spreadPct > spreadPenaltyThreshold) decay += 15;
-    }
-
-    const dipThreshold1 = isMicroAsset ? -0.45 : -0.30;
-    const dipThreshold2 = isMicroAsset ? -0.65 : -0.45;
-    if (gainPct <= dipThreshold1) decay += 15;
-    if (gainPct <= dipThreshold2) decay += 25;
-
-    pos.decayRisk = Math.min(100, decay);
-    pos.predictiveStatus = pos.decayRisk >= 55 ? 'EXITING' : (pos.decayRisk >= 30 ? 'CAUTION' : 'SAFE');
-
-    if (pos.decayRisk >= 55) {
-      pos.consecutiveDecayTicks = (pos.consecutiveDecayTicks || 0) + 1;
-      highDecayCount++;
-    } else {
-      pos.consecutiveDecayTicks = 0;
-    }
-
-    // 7. Predictive Cut Protection Window (Requires 150s grace + 3-tick decay)
-    const predictiveDipGate = isMicroAsset ? -0.75 : -0.55;
-    if (holdSeconds >= 150 && !pos.tp1Secured) {
-      if (gainPct <= predictiveDipGate && (pos.consecutiveDecayTicks >= 3)) {
-        settlePosition(sym, 'PREDICTIVE SL', livePriceUSDT, `Persistent decay confirmed over 3 ticks at ${gainPct.toFixed(2)}% (Decay: ${pos.decayRisk}%)`);
+      if (isLiveVerified && holdSeconds >= 1500 && gainPct < 0.20 && gainPct >= -2.0) {
+        settlePosition(sym, 'PATIENT SCRATCH EXIT', livePriceUSDT, `No momentum continuation within 25 minutes (${gainPct.toFixed(2)}%)`);
         continue;
       }
     }
@@ -1661,7 +1684,6 @@ async function syncLiveBinancePrices() {
     const priceMap = {};
     list.forEach(i => { priceMap[i.symbol] = parseFloat(i.price); });
 
-    // 1. Direct sync for all active positions (guarantees live ticks even if coin drops from screener top 10)
     const openKeys = Object.keys(State.activePositions);
     openKeys.forEach(sym => {
       const live = priceMap[sym];
@@ -1700,7 +1722,6 @@ async function syncLiveBinancePrices() {
       }
     });
 
-    // 2. Sync all other universe assets
     Object.keys(State.universe).forEach(sym => {
       if (priceMap[sym]) {
         const usdt = priceMap[sym];
@@ -2032,7 +2053,7 @@ app.get('/healthz', (req, res) => res.status(200).send('OK'));
 // BOOTSTRAP TIMERS
 // -------------------------------------------------------------
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Quant Server] Running on port ${PORT}`);
+  console.log(`[Quant Server] Running on port ${PORT} with 3-Pillar Spot Resiliency Architecture`);
 
   setTimeout(runDynamicMarketScreener, 2000);
   setInterval(runPureQuantScoring, 15 * 1000);
