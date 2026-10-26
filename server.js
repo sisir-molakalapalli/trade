@@ -1232,15 +1232,28 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (!coin || !coin.score) continue;
 
     if (State.cooldowns[sym]) {
-      const remaining = State.cooldowns[sym] - Date.now();
-      if (remaining > 0) continue;
+      const cdObj = typeof State.cooldowns[sym] === 'object'
+        ? State.cooldowns[sym]
+        : { until: Number(State.cooldowns[sym]) || 0, stoppedEntryPriceUSDT: 0 };
+      const remaining = cdObj.until - Date.now();
+
+      // V-Shape Wick Reclaim Override: If asset reclaimed its prior entry price with Score >= 82 & OBI >= 56%, lift cooldown!
+      const isVShapeReclaim = cdObj.stoppedEntryPriceUSDT > 0 &&
+        coin.priceUSDT >= (cdObj.stoppedEntryPriceUSDT * 1.002) &&
+        coin.score >= 82 &&
+        (coin.obi || 0) >= 0.56;
+
+      if (remaining > 0 && !isVShapeReclaim) continue;
       delete State.cooldowns[sym];
     }
 
     const book = await fetchRealOrderBookDepth(sym);
     if (!book) continue;
 
-    // Price-Tiered & Spike-Aware Spread Tolerance (Prevents rejecting $0.10-$1.00 coins like DODO/USDT)
+    // Anti-Chasing Climax Guard: Avoid buying the exact top tick of an exhausted +12% 15m vertical spike unless OBI >= 60%
+    if ((coin.change15mPct || 0) >= 12.0 && book.obi < 0.60) continue;
+
+    // Price-Tiered & Spike-Aware Spread Tolerance (Prevents rejecting $0.10-$1.00 coins like DODO/USDT or ERA/USDT)
     const isSubCent = (coin.priceUSDT && coin.priceUSDT < 0.01);
     const isLowDollarAlt = (coin.priceUSDT && coin.priceUSDT >= 0.01 && coin.priceUSDT < 1.50);
     const isHighVelocitySpike = Boolean(coin.isSpikeCandidate || coin.change15mPct >= 2.0 || coin.change1hPct >= 4.0);
@@ -1654,6 +1667,11 @@ function broadcastPricesOnly() {
       score: State.universe[k].score,
       direction: State.universe[k].direction,
       obi: State.universe[k].obi,
+      change15mPct: State.universe[k].change15mPct || 0,
+      change1hPct: State.universe[k].change1hPct || 0,
+      rvol: State.universe[k].rvol || 1.0,
+      isSpikeCandidate: Boolean(State.universe[k].isSpikeCandidate),
+      volumeM: State.universe[k].volumeM || 0,
       source: State.universe[k].source,
       reasoning: State.universe[k].reasoning
     };
