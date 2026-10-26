@@ -984,32 +984,60 @@ async function runDynamicMarketScreener() {
 
     if (topPicks.length > 0) {
       const updatedUniverse = {};
+
+      // 1. ANCHOR GUARANTEE: Active positions MUST ALWAYS remain in universe while open
+      activeSymbols.forEach(sym => {
+        if (State.universe[sym]) {
+          updatedUniverse[sym] = { ...State.universe[sym] };
+        } else if (State.activePositions[sym]) {
+          const pos = State.activePositions[sym];
+          const base = pos.pairSymbol || sym.replace('USDT', '');
+          updatedUniverse[sym] = {
+            name: base,
+            symbol: base,
+            priceUSDT: pos.livePriceUSDT || pos.entryPriceUSDT,
+            priceINR: calculateAccurateINRPrice(pos.livePriceUSDT || pos.entryPriceUSDT, State.usdtToInrRate),
+            score: 80,
+            direction: 'BUY',
+            obi: 0.55,
+            cvd: 3.5,
+            volumeM: 10,
+            source: 'ACTIVE_HOLD_ANCHOR',
+            reasoning: 'Active position anchored in universe',
+            verifiedAt: Date.now()
+          };
+        }
+      });
+
+      // 2. Add top screener discoveries up to top pool
       topPicks.forEach(c => {
-        const existing = State.universe[c.symbol];
-        const isSpike = (c.change15mPct >= 2.0 || c.change1hPct >= 4.0) && c.rvol >= 1.6;
-        updatedUniverse[c.symbol] = {
-          name: c.baseAsset,
-          symbol: c.baseAsset,
-          priceUSDT: c.priceUSDT,
-          priceINR: c.priceINR,
-          priceChangePct: c.priceChangePct,
-          vwapPremiumPct: c.vwapPremiumPct || 0,
-          change15mPct: c.change15mPct || 0,
-          change1hPct: c.change1hPct || 0,
-          change4hPct: c.change4hPct || 0,
-          rvol: c.rvol || 1.0,
-          isSpikeCandidate: isSpike,
-          intradayRangePct: c.intradayRangePct,
-          pricePositionInRange: c.pricePositionInRange,
-          volumeM: c.volumeM,
-          score: existing ? existing.score : 78,
-          direction: existing ? existing.direction : 'BUY',
-          obi: existing ? existing.obi : 0.55,
-          cvd: existing ? existing.cvd : 3.5,
-          source: 'QUANT_ALGO',
-          reasoning: `${isSpike ? '🚀 SPIKE IGNITION | ' : ''}15m: ${c.change15mPct >= 0 ? '+' : ''}${(c.change15mPct || 0).toFixed(1)}%, 1h: ${c.change1hPct >= 0 ? '+' : ''}${(c.change1hPct || 0).toFixed(1)}%, RVOL: ${(c.rvol || 1).toFixed(1)}x ($${c.volumeM}M Vol)`,
-          verifiedAt: Date.now()
-        };
+        if (!updatedUniverse[c.symbol]) {
+          const existing = State.universe[c.symbol];
+          const isSpike = (c.change15mPct >= 2.0 || c.change1hPct >= 4.0) && c.rvol >= 1.6;
+          updatedUniverse[c.symbol] = {
+            name: c.baseAsset,
+            symbol: c.baseAsset,
+            priceUSDT: c.priceUSDT,
+            priceINR: c.priceINR,
+            priceChangePct: c.priceChangePct,
+            vwapPremiumPct: c.vwapPremiumPct || 0,
+            change15mPct: c.change15mPct || 0,
+            change1hPct: c.change1hPct || 0,
+            change4hPct: c.change4hPct || 0,
+            rvol: c.rvol || 1.0,
+            isSpikeCandidate: isSpike,
+            intradayRangePct: c.intradayRangePct,
+            pricePositionInRange: c.pricePositionInRange,
+            volumeM: c.volumeM,
+            score: existing ? existing.score : 78,
+            direction: existing ? existing.direction : 'BUY',
+            obi: existing ? existing.obi : 0.55,
+            cvd: existing ? existing.cvd : 3.5,
+            source: 'QUANT_ALGO',
+            reasoning: `${isSpike ? '🚀 SPIKE IGNITION | ' : ''}15m: ${c.change15mPct >= 0 ? '+' : ''}${(c.change15mPct || 0).toFixed(1)}%, 1h: ${c.change1hPct >= 0 ? '+' : ''}${(c.change1hPct || 0).toFixed(1)}%, RVOL: ${(c.rvol || 1).toFixed(1)}x ($${c.volumeM}M Vol)`,
+            verifiedAt: Date.now()
+          };
+        }
       });
 
       State.universe = updatedUniverse;
@@ -1517,8 +1545,26 @@ async function monitorOpenPositionsHealth() {
 
     if (pos.isTrailingActive) trailingCount++;
 
-    const livePriceUSDT = State.universe[sym]?.priceUSDT || pos.entryPriceUSDT;
+    // Prioritize direct live tick stamped on pos, then universe, with emergency ticker fallback
+    let livePriceUSDT = pos.livePriceUSDT || State.universe[sym]?.priceUSDT;
+    if (!livePriceUSDT || livePriceUSDT <= 0) {
+      try {
+        const tick = await fetchFromBinance(`/api/v3/ticker/price?symbol=${sym}`);
+        if (tick && tick.price) {
+          livePriceUSDT = formatBinanceUSDTPrice(parseFloat(tick.price));
+          pos.livePriceUSDT = livePriceUSDT;
+          if (State.universe[sym]) State.universe[sym].priceUSDT = livePriceUSDT;
+        }
+      } catch (e) {}
+    }
+
+    if (!livePriceUSDT || livePriceUSDT <= 0) {
+      livePriceUSDT = pos.entryPriceUSDT;
+    }
+
     const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
+    pos.gainPct = Number(gainPct.toFixed(2));
+    pos.unrealizedPnLUSDT = Number(((livePriceUSDT - pos.entryPriceUSDT) * pos.qty).toFixed(4));
     const holdSeconds = (Date.now() - pos.openedAt) / 1000;
     const isMicroAsset = (pos.entryPriceUSDT < 0.10);
 
@@ -1554,9 +1600,10 @@ async function monitorOpenPositionsHealth() {
         continue;
       }
 
-      // 5. Stagnation Exit: Extended to 12 minutes (720s) for high-momentum assets
+      // 5. Stagnation Exit: Only cut if price is confirmed live and genuinely stagnant
+      const isLiveVerified = Boolean(pos.livePriceUSDT && pos.livePriceUSDT > 0);
       const maxStagnationSeconds = (State.universe[sym]?.priceChangePct >= 5.0) ? 720 : 540;
-      if (holdSeconds >= maxStagnationSeconds && gainPct < 0.25) {
+      if (isLiveVerified && holdSeconds >= maxStagnationSeconds && gainPct < 0.25) {
         settlePosition(sym, 'STAGNATION CUT', livePriceUSDT, `No momentum continuation within ${Math.round(maxStagnationSeconds/60)} minutes`);
         continue;
       }
@@ -1614,6 +1661,46 @@ async function syncLiveBinancePrices() {
     const priceMap = {};
     list.forEach(i => { priceMap[i.symbol] = parseFloat(i.price); });
 
+    // 1. Direct sync for all active positions (guarantees live ticks even if coin drops from screener top 10)
+    const openKeys = Object.keys(State.activePositions);
+    openKeys.forEach(sym => {
+      const live = priceMap[sym];
+      if (live && live > 0) {
+        const formatted = formatBinanceUSDTPrice(live);
+        const inr = calculateAccurateINRPrice(live, State.usdtToInrRate);
+
+        if (!State.universe[sym]) {
+          const base = sym.replace('USDT', '');
+          State.universe[sym] = {
+            name: base,
+            symbol: base,
+            priceUSDT: formatted,
+            priceINR: inr,
+            score: 80,
+            direction: 'BUY',
+            obi: 0.55,
+            cvd: 3.5,
+            volumeM: 10,
+            source: 'ACTIVE_HOLD_ANCHOR',
+            reasoning: 'Active position retained in universe',
+            verifiedAt: Date.now()
+          };
+        } else {
+          State.universe[sym].priceUSDT = formatted;
+          State.universe[sym].priceINR = inr;
+          State.universe[sym].verifiedAt = Date.now();
+        }
+
+        const pos = State.activePositions[sym];
+        if (pos) {
+          pos.livePriceUSDT = formatted;
+          pos.unrealizedPnLUSDT = Number(((live - pos.entryPriceUSDT) * pos.qty).toFixed(4));
+          pos.gainPct = Number((((live - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100).toFixed(2));
+        }
+      }
+    });
+
+    // 2. Sync all other universe assets
     Object.keys(State.universe).forEach(sym => {
       if (priceMap[sym]) {
         const usdt = priceMap[sym];
