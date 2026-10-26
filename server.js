@@ -65,8 +65,12 @@ const State = {
 
   tradeFrequencyController: {
     quotaBypassEnabled: false,
+    dynamicGovernorEnabled: true, // Permanent Dynamic Liquidity Governor (Uncapped trades governed by Cash Reserve)
+    cashReserveFloorUSDT: 300.00,  // Minimum free cash buffer required to open new trades
+    maxRecoveryBagsLimit: 6,       // Maximum concurrent bags allowed before temporary pause
+    governorTier: 'UNLIMITED_SPRINT', // UNLIMITED_SPRINT | SOFT_THROTTLE | LIQUIDITY_FREEZE
     baseMaxTradesPer24h: 8,
-    maxTradesPer24h: 8,
+    maxTradesPer24h: 9999,
     vipAlphaSlotsAllowed: 2,
     vipAlphaSlotsUsed24h: 0,
     vipTrades24h: [],
@@ -767,6 +771,31 @@ function syncRollingTradeQuota() {
     .sort((a, b) => a - b);
 
   const isBypassActive = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
+  const isDynamicGovernor = Boolean(State.tradeFrequencyController.dynamicGovernorEnabled);
+
+  // -------------------------------------------------------------
+  // DYNAMIC LIQUIDITY GOVERNOR CALCULATION
+  // -------------------------------------------------------------
+  const freeCash = Number(State.portfolio.cashUSDT || 0);
+  const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
+  const cashFloor = State.tradeFrequencyController.cashReserveFloorUSDT || 300.00;
+  const maxBags = State.tradeFrequencyController.maxRecoveryBagsLimit || 6;
+
+  let governorTier = 'UNLIMITED_SPRINT';
+  let canExecuteTrades = true;
+
+  if (freeCash < cashFloor || activeBagsCount >= maxBags) {
+    governorTier = 'LIQUIDITY_FREEZE';
+    canExecuteTrades = false;
+  } else if (freeCash < 600 || activeBagsCount >= 4) {
+    governorTier = 'SOFT_THROTTLE';
+    canExecuteTrades = true;
+  } else {
+    governorTier = 'UNLIMITED_SPRINT';
+    canExecuteTrades = true;
+  }
+
+  State.tradeFrequencyController.governorTier = governorTier;
 
   let currentStreak = 0;
   let rollingNetGainUSDT = 0;
@@ -799,8 +828,9 @@ function syncRollingTradeQuota() {
     streakReason = 'BASELINE';
   }
 
+  const isUncapped = isBypassActive || isDynamicGovernor;
   const baseMax = State.tradeFrequencyController.baseMaxTradesPer24h || 8;
-  const dynamicMaxAllowed = isBypassActive ? 9999 : (baseMax + bonusSlots);
+  const dynamicMaxAllowed = isUncapped ? 9999 : (baseMax + bonusSlots);
 
   State.tradeFrequencyController.bonusSlotsEarned = bonusSlots;
   State.tradeFrequencyController.consecutiveWinStreak = currentStreak;
@@ -808,18 +838,22 @@ function syncRollingTradeQuota() {
   State.tradeFrequencyController.maxTradesPer24h = dynamicMaxAllowed;
 
   const count = State.tradeFrequencyController.rollingTrades24h.length;
-  const remaining = isBypassActive ? 999 : Math.max(0, dynamicMaxAllowed - count);
+  const remaining = isUncapped 
+    ? (canExecuteTrades ? 999 : 0) 
+    : Math.max(0, dynamicMaxAllowed - count);
 
   const vipUsed = State.tradeFrequencyController.vipTrades24h.length;
   const vipMax = State.tradeFrequencyController.vipAlphaSlotsAllowed || 2;
-  const vipRemaining = isBypassActive ? 999 : Math.max(0, vipMax - vipUsed);
+  const vipRemaining = isUncapped ? 999 : Math.max(0, vipMax - vipUsed);
   State.tradeFrequencyController.vipAlphaSlotsUsed24h = vipUsed;
 
   let resetTimeMin = 0;
   let nextReleaseTimestamp = 0;
-  let formattedReset = isBypassActive ? 'UNLIMITED TRADES ACTIVE' : 'All Slots Open';
+  let formattedReset = isUncapped 
+    ? `GOVERNOR: ${governorTier} (Cash: $${freeCash.toFixed(0)}, Bags: ${activeBagsCount}/${maxBags})` 
+    : 'All Slots Open';
 
-  if (count > 0 && !isBypassActive) {
+  if (count > 0 && !isUncapped) {
     const oldest = Math.min(...State.tradeFrequencyController.rollingTrades24h);
     nextReleaseTimestamp = oldest + (24 * 60 * 60 * 1000);
     const msRemaining = Math.max(0, nextReleaseTimestamp - now);
@@ -839,9 +873,9 @@ function syncRollingTradeQuota() {
   State.tradeFrequencyController.nextSlotReleaseTimestamp = nextReleaseTimestamp;
   State.tradeFrequencyController.globalCircuitBreakerUntil = 0;
 
-  if (isBypassActive) {
-    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
-    State.subsystems.quotaManager.status = 'UNLIMITED_BYPASS_ACTIVE';
+  if (isUncapped) {
+    State.tradeFrequencyController.circuitBreakerReason = canExecuteTrades ? 'NORMAL' : 'LIQUIDITY_FLOOR_HOLD';
+    State.subsystems.quotaManager.status = governorTier;
   } else if (remaining === 0 && vipRemaining > 0) {
     State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
     State.subsystems.quotaManager.status = 'VIP_ALPHA_SNIPER_ACTIVE';
@@ -853,15 +887,19 @@ function syncRollingTradeQuota() {
     State.subsystems.quotaManager.status = 'NORMAL';
   }
 
-  State.subsystems.quotaManager.quotaBypassEnabled = isBypassActive;
+  State.subsystems.quotaManager.quotaBypassEnabled = isUncapped;
+  State.subsystems.quotaManager.dynamicGovernorEnabled = isDynamicGovernor;
+  State.subsystems.quotaManager.governorTier = governorTier;
+  State.subsystems.quotaManager.cashReserveFloorUSDT = cashFloor;
+  State.subsystems.quotaManager.maxRecoveryBagsLimit = maxBags;
   State.subsystems.quotaManager.executed24hCount = count;
-  State.subsystems.quotaManager.maxAllowed = isBypassActive ? 'UNLIMITED' : dynamicMaxAllowed;
+  State.subsystems.quotaManager.maxAllowed = isUncapped ? 'UNLIMITED' : dynamicMaxAllowed;
   State.subsystems.quotaManager.baseMaxAllowed = baseMax;
   State.subsystems.quotaManager.bonusSlotsEarned = bonusSlots;
   State.subsystems.quotaManager.consecutiveWinStreak = currentStreak;
   State.subsystems.quotaManager.streakBonusReason = streakReason;
-  State.subsystems.quotaManager.quotaRemaining = isBypassActive ? '∞' : remaining;
-  State.subsystems.quotaManager.vipSlotsRemaining = isBypassActive ? '∞' : vipRemaining;
+  State.subsystems.quotaManager.quotaRemaining = isUncapped ? (canExecuteTrades ? '∞' : '0 (HOLD)') : remaining;
+  State.subsystems.quotaManager.vipSlotsRemaining = isUncapped ? '∞' : vipRemaining;
   State.subsystems.quotaManager.vipSlotsUsed = vipUsed;
   State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
   State.subsystems.quotaManager.nextSlotReleaseTimestamp = nextReleaseTimestamp;
@@ -1222,13 +1260,31 @@ async function evaluateAutopilotEntries(regimeConfig) {
   // Maximum 2 concurrent active breakout slots (Recovery bags do NOT count against this!)
   if (currentActiveCount >= (State.tradeFrequencyController.maxConcurrentPositions || 2)) return;
 
-  if (State.portfolio.cashUSDT < 50.00) return;
   if (State.warmupCycles < 1) return;
+
+  // -----------------------------------------------------------
+  // DYNAMIC LIQUIDITY GOVERNOR RISK GUARDS
+  // -----------------------------------------------------------
+  const freeCash = Number(State.portfolio.cashUSDT || 0);
+  const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
+  const cashFloor = State.tradeFrequencyController.cashReserveFloorUSDT || 300.00;
+  const maxBags = State.tradeFrequencyController.maxRecoveryBagsLimit || 6;
+
+  // Guard 1: Must have at least $50 to buy AND maintain the $300 cash reserve floor
+  if (freeCash < (cashFloor + 50.00)) {
+    return;
+  }
+
+  // Guard 2: Max 6 concurrent Recovery Bags capacity
+  if (activeBagsCount >= maxBags) {
+    return;
+  }
 
   const config = regimeConfig || State.activeThresholds;
   const isBypassActive = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
-  const standardQuotaAvailable = isBypassActive || (State.subsystems.quotaManager.quotaRemaining > 0);
-  const vipSlotsRemaining = isBypassActive ? 999 : (State.subsystems.quotaManager.vipSlotsRemaining || 0);
+  const isDynamicGov = Boolean(State.tradeFrequencyController.dynamicGovernorEnabled);
+  const standardQuotaAvailable = isBypassActive || isDynamicGov || (State.subsystems.quotaManager.quotaRemaining > 0);
+  const vipSlotsRemaining = (isBypassActive || isDynamicGov) ? 999 : (State.subsystems.quotaManager.vipSlotsRemaining || 0);
 
   if (!standardQuotaAvailable && vipSlotsRemaining <= 0) return;
 
@@ -1787,6 +1843,29 @@ wss.on('connection', ws => {
         syncRollingTradeQuota();
         saveStateToDisk();
         broadcastState();
+      } else if (data.type === 'SET_DYNAMIC_GOVERNOR') {
+        State.tradeFrequencyController.dynamicGovernorEnabled = Boolean(data.enabled);
+        syncRollingTradeQuota();
+        saveStateToDisk();
+        broadcastState();
+      } else if (data.type === 'SET_CASH') {
+        const val = parseFloat(data.cashUSDT);
+        if (!isNaN(val) && val >= 0) {
+          State.portfolio.cashUSDT = Math.round(val * 100) / 100;
+          syncRollingTradeQuota();
+          saveStateToDisk();
+          broadcastState();
+          console.log(`[Portfolio] Cash updated to $${State.portfolio.cashUSDT} USDT`);
+        }
+      } else if (data.type === 'ADD_CASH') {
+        const delta = parseFloat(data.addUSDT);
+        if (!isNaN(delta)) {
+          State.portfolio.cashUSDT = Math.max(0, Math.round((State.portfolio.cashUSDT + delta) * 100) / 100);
+          syncRollingTradeQuota();
+          saveStateToDisk();
+          broadcastState();
+          console.log(`[Portfolio] Added $${delta} USDT. New Cash: $${State.portfolio.cashUSDT} USDT`);
+        }
       } else if (data.type === 'RECONCILE_QUOTA') {
         reconcileRollingTradeQuotaFromHistory();
         saveStateToDisk();
@@ -1849,6 +1928,51 @@ app.post('/api/quota/set-bypass', (req, res) => {
     success: true,
     quotaBypassEnabled: State.tradeFrequencyController.quotaBypassEnabled,
     status: State.subsystems.quotaManager.status
+  });
+});
+
+// -------------------------------------------------------------
+// CASH BALANCE MANAGEMENT API (SET / ADD AVAILABLE TRADING FUNDS)
+// -------------------------------------------------------------
+app.post('/api/portfolio/cash', (req, res) => {
+  const { cashUSDT, addUSDT } = req.body || {};
+  
+  if (cashUSDT !== undefined) {
+    const val = parseFloat(cashUSDT);
+    if (!isNaN(val) && val >= 0) {
+      State.portfolio.cashUSDT = Math.round(val * 100) / 100;
+      syncRollingTradeQuota();
+      saveStateToDisk();
+      broadcastState();
+      return res.json({ success: true, cashUSDT: State.portfolio.cashUSDT });
+    }
+  }
+
+  if (addUSDT !== undefined) {
+    const delta = parseFloat(addUSDT);
+    if (!isNaN(delta)) {
+      State.portfolio.cashUSDT = Math.max(0, Math.round((State.portfolio.cashUSDT + delta) * 100) / 100);
+      syncRollingTradeQuota();
+      saveStateToDisk();
+      broadcastState();
+      return res.json({ success: true, cashUSDT: State.portfolio.cashUSDT });
+    }
+  }
+
+  res.status(400).json({ success: false, message: 'Invalid cash value provided' });
+});
+
+// -------------------------------------------------------------
+// STRICT GOOGLE SHEET RE-FETCH & CLEAR LOCAL LOGS
+// -------------------------------------------------------------
+app.post('/api/trades/sync-strict-sheet', async (req, res) => {
+  State.tradeLogs = []; // Wipe local server array
+  await syncWithGoogleDrive(); // Pull strictly from Google Sheet
+  res.json({
+    success: true,
+    message: 'Cleared local logs and refreshed strictly from Google Sheet',
+    count: State.tradeLogs.length,
+    trades: State.tradeLogs
   });
 });
 
