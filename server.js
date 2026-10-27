@@ -570,6 +570,35 @@ function cleanAndNormalizeDateString(rawDate, rawTime, timestampId) {
 }
 
 // -------------------------------------------------------------
+// STRICT 5-POINT TRADE RECORD VALIDATOR (ZERO-GHOST GATE)
+// -------------------------------------------------------------
+function isValidTradeRecord(t) {
+  if (!t || typeof t !== 'object') return false;
+
+  const rawPair = String(t.pair || t.Pair || t.symbol || t.Symbol || t.asset || '').trim().toUpperCase();
+  // Reject missing, non-USDT, or generic placeholder tokens
+  if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair.includes('CRYPTO') || rawPair === 'UNKNOWN/USDT' || rawPair === 'UNDEFINED/USDT' || !rawPair.includes('USDT')) {
+    return false;
+  }
+
+  const entry = Number(t.entryPriceUSDT || t['Entry Price (USDT)'] || t.entryPrice || t.entry || 0);
+  const exit = Number(t.exitPriceUSDT || t['Exit Price (USDT)'] || t.exitPrice || t.exit || 0);
+
+  // Reject zero/negative prices
+  if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) {
+    return false;
+  }
+
+  // Reject entries without any valid action/type
+  const rawType = String(t.type || t.Type || t.action || '').trim().toUpperCase();
+  if (!rawType || rawType === 'UNDEFINED' || rawType === 'NULL') {
+    return false;
+  }
+
+  return true;
+}
+
+// -------------------------------------------------------------
 // STRICT TRADE HISTORY SANITIZATION & GHOST-ROW PURGER
 // -------------------------------------------------------------
 function sanitizeAndAuditTradeHistory(logs) {
@@ -577,21 +606,11 @@ function sanitizeAndAuditTradeHistory(logs) {
   
   const map = new Map();
   logs.forEach(l => {
-    if (!l || typeof l !== 'object') return;
+    if (!isValidTradeRecord(l)) return;
 
-    // Reject empty rows, placeholder rows, and rows without a real token symbol
-    const rawPair = String(l.pair || l.symbol || '').trim().toUpperCase();
-    if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair === 'UNKNOWN/USDT' || rawPair === 'UNDEFINED/USDT') {
-      return;
-    }
-
-    let entryUSDT = Number(l.entryPriceUSDT || l.entryPrice || 0);
-    let exitUSDT = Number(l.exitPriceUSDT || l.exitPrice || 0);
-
-    // Reject unpriced zero-entries
-    if (isNaN(entryUSDT) || entryUSDT <= 0 || isNaN(exitUSDT) || exitUSDT <= 0) {
-      return;
-    }
+    const rawPair = String(l.pair || l.Pair || l.symbol || l.Symbol || l.asset || '').trim().toUpperCase();
+    let entryUSDT = Number(l.entryPriceUSDT || l['Entry Price (USDT)'] || l.entryPrice || l.entry || 0);
+    let exitUSDT = Number(l.exitPriceUSDT || l['Exit Price (USDT)'] || l.exitPrice || l.exit || 0);
 
     const parsedEpoch = parseTradeTimestamp(l);
     let id = parsedEpoch > 0 ? parsedEpoch : Number(l.id);
@@ -628,11 +647,13 @@ function sanitizeAndAuditTradeHistory(logs) {
     l.entryPriceUSDT = formatBinanceUSDTPrice(entryUSDT);
     l.exitPriceUSDT = formatBinanceUSDTPrice(exitUSDT);
     l.notionalUSDT = Number(l.notionalUSDT) || 50.00;
-    l.type = l.type || 'EXIT';
+    l.type = String(l.type || l.Type || 'EXIT').trim().toUpperCase();
     l.regime = l.regime || 'BALANCED';
     l.volatilityPct = typeof l.volatilityPct === 'number' ? l.volatilityPct : 4.5;
 
-    map.set(l.id, l);
+    // Deduplicate by pair + timestamp ID
+    const dedupKey = `${l.pair}_${l.id}`;
+    map.set(dedupKey, l);
   });
 
   return Array.from(map.values()).sort((a, b) => b.id - a.id);
@@ -682,11 +703,12 @@ function reconcileRollingTradeQuotaFromHistory() {
 
 function saveStateToDisk() {
   try {
+    const cleanLogs = sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 500);
     const dataToSave = {
       portfolio: State.portfolio,
       activePositions: State.activePositions,
       recoveryBags: State.recoveryBags,
-      tradeLogs: State.tradeLogs.slice(0, 500),
+      tradeLogs: cleanLogs,
       autopilotEnabled: State.autopilotEnabled,
       cooldowns: State.cooldowns,
       tradeFrequencyController: State.tradeFrequencyController,
@@ -697,21 +719,13 @@ function saveStateToDisk() {
     fs.writeFileSync(STATE_FILE, JSON.stringify(dataToSave, null, 2), 'utf-8');
     State.subsystems.persistence.totalDiskSaves++;
     State.subsystems.persistence.lastSaveTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-    State.subsystems.persistence.retainedTradesCount = State.tradeLogs.length;
+    State.subsystems.persistence.retainedTradesCount = cleanLogs.length;
     State.subsystems.persistence.status = 'SYNCED';
-
-    // NOTE: Removed backupStateToGoogleDrive() here to prevent creating blank rows in the Google Sheet.
   } catch (err) {
     State.subsystems.persistence.status = 'ERROR';
   }
 }
 
-async function backupStateToGoogleDrive() {
-  // Disabled: Google Apps Script expects trade logs; sending state dumps appends empty rows.
-  return;
-}
-
-// Helper to normalize trade objects coming from Google Sheets (which may have varied column headers)
 function normalizeSheetTrade(raw) {
   if (!raw || typeof raw !== 'object') return null;
   
@@ -725,7 +739,7 @@ function normalizeSheetTrade(raw) {
   };
 
   const rawPair = String(getField(['pair', 'Pair', 'symbol', 'Symbol', 'asset', 'Asset'])).trim().toUpperCase();
-  if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair === 'UNKNOWN/USDT' || rawPair.includes('CRYPTO') || !rawPair.includes('USDT')) {
+  if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair.includes('CRYPTO') || rawPair === 'UNKNOWN/USDT' || !rawPair.includes('USDT')) {
     return null;
   }
 
@@ -779,10 +793,12 @@ async function syncWithGoogleDrive() {
         const validSheetTrades = [];
         rawList.forEach(item => {
           const normalized = normalizeSheetTrade(item);
-          if (normalized) validSheetTrades.push(normalized);
+          if (normalized && isValidTradeRecord(normalized)) {
+            validSheetTrades.push(normalized);
+          }
         });
 
-        // Deduplicate and retain only verified trades
+        // Deduplicate and retain only strictly verified trades
         State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
         recalculateTrueRealizedPnL();
         reconcileRollingTradeQuotaFromHistory();
@@ -800,11 +816,7 @@ async function appendTradeToGoogleDrive(tradeLog) {
   if (!targetUrl || !tradeLog) return;
   
   // Strict guard: Never write empty or placeholder records to Google Sheets
-  const pair = String(tradeLog.pair || '').trim().toUpperCase();
-  if (!pair || pair.includes('CRYPTO') || pair === 'UNKNOWN/USDT' || !pair.includes('USDT')) return;
-  const entry = Number(tradeLog.entryPriceUSDT || 0);
-  const exit = Number(tradeLog.exitPriceUSDT || 0);
-  if (entry <= 0 || exit <= 0) return;
+  if (!isValidTradeRecord(tradeLog)) return;
 
   try {
     const controller = new AbortController();
@@ -823,73 +835,14 @@ async function appendTradeToGoogleDrive(tradeLog) {
     }
   } catch (err) {}
 }
-function sanitizeAndAuditTradeHistory(logs) {
-  if (!Array.isArray(logs)) return [];
-  
-  const map = new Map();
-  logs.forEach(l => {
-    if (!l || typeof l !== 'object') return;
 
-    // Strict validation: Reject empty rows, placeholder rows, and invalid assets
-    const rawPair = String(l.pair || l.symbol || '').trim().toUpperCase();
-    if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair.includes('CRYPTO') || rawPair === 'UNKNOWN/USDT' || !rawPair.includes('USDT')) {
-      return;
-    }
-
-    let entryUSDT = Number(l.entryPriceUSDT || l.entryPrice || 0);
-    let exitUSDT = Number(l.exitPriceUSDT || l.exitPrice || 0);
-
-    // Reject non-positive entries
-    if (isNaN(entryUSDT) || entryUSDT <= 0 || isNaN(exitUSDT) || exitUSDT <= 0) {
-      return;
-    }
-
-    const parsedEpoch = parseTradeTimestamp(l);
-    let id = parsedEpoch > 0 ? parsedEpoch : Number(l.id);
-    if (!id || isNaN(id) || id < 1000000) {
-      id = Date.now() - (25 * 60 * 60 * 1000);
-    }
-    l.id = id;
-
-    const { date, time } = cleanAndNormalizeDateString(l.date, l.time, id);
-    l.date = date;
-    l.time = time;
-    l.pair = rawPair.endsWith('USDT') && !rawPair.includes('/') ? `${rawPair.replace('USDT', '')}/USDT` : rawPair;
-
-    let pnlUSDT = 0;
-    if (typeof l.pnlUSDT === 'number' && !isNaN(l.pnlUSDT)) {
-      pnlUSDT = l.pnlUSDT;
-    } else if (typeof l.pnlINR === 'number' && !isNaN(l.pnlINR)) {
-      pnlUSDT = l.pnlINR / State.usdtToInrRate;
-    } else {
-      pnlUSDT = (exitUSDT - entryUSDT) * ((Number(l.notionalUSDT) || 50.00) / entryUSDT);
-    }
-
-    if (Math.abs(pnlUSDT) > 5.0) {
-      pnlUSDT = pnlUSDT / State.usdtToInrRate;
-    }
-
-    if (l.pair && l.pair.includes('PEPE') && exitUSDT > 0.001) {
-      exitUSDT = exitUSDT / State.usdtToInrRate;
-      entryUSDT = entryUSDT / State.usdtToInrRate;
-    }
-
-    l.pnlUSDT = Number(pnlUSDT.toFixed(4));
-    l.pnlINR = Number((pnlUSDT * State.usdtToInrRate).toFixed(2));
-    l.entryPriceUSDT = formatBinanceUSDTPrice(entryUSDT);
-    l.exitPriceUSDT = formatBinanceUSDTPrice(exitUSDT);
-    l.notionalUSDT = Number(l.notionalUSDT) || 50.00;
-    l.type = l.type || 'EXIT';
-    l.regime = l.regime || 'BALANCED';
-    l.volatilityPct = typeof l.volatilityPct === 'number' ? l.volatilityPct : 4.5;
-
-    // Deduplicate by trade ID or pair + timestamp
-    const dedupKey = `${l.pair}_${l.id}`;
-    map.set(dedupKey, l);
-  });
-
-  return Array.from(map.values()).sort((a, b) => b.id - a.id);
-}
+function loadStateFromDisk() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const raw = fs.readFileSync(STATE_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed.portfolio && typeof parsed.portfolio === 'object') {
+        State.portfolio = { ...State.portfolio, ...parsed.portfolio };
       }
       if (parsed.activePositions && typeof parsed.activePositions === 'object') {
         State.activePositions = parsed.activePositions;
@@ -1973,13 +1926,14 @@ async function syncLiveBinancePrices() {
 }
 
 function broadcastState() {
+  const cleanLogs = sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 100);
   const payload = JSON.stringify({
     type: 'STATE_UPDATE',
     portfolio: State.portfolio,
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
     universe: State.universe,
-    tradeLogs: State.tradeLogs.slice(0, 100),
+    tradeLogs: cleanLogs,
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
     activeThresholds: State.activeThresholds,
@@ -2041,7 +1995,7 @@ wss.on('connection', ws => {
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
     universe: State.universe,
-    tradeLogs: State.tradeLogs.slice(0, 100),
+    tradeLogs: sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 100),
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
     activeThresholds: State.activeThresholds,
@@ -2085,7 +2039,6 @@ wss.on('connection', ws => {
           broadcastState();
         }
       } else if (data.type === 'RECONCILE_QUOTA') {
-        // Scrub trade history on demand
         State.tradeLogs = sanitizeAndAuditTradeHistory(State.tradeLogs);
         recalculateTrueRealizedPnL();
         reconcileRollingTradeQuotaFromHistory();
@@ -2219,7 +2172,7 @@ app.get('/api/state', (req, res) => {
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
     universe: State.universe,
-    tradeLogs: State.tradeLogs.slice(0, 100),
+    tradeLogs: sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 100),
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
     activeThresholds: State.activeThresholds,
@@ -2272,29 +2225,25 @@ app.get('/api/settings/googlesheet/sync', async (req, res) => {
 
     if (response.ok) {
       const data = await response.json();
-      if (data && Array.isArray(data.trades)) {
-        const validSheetTrades = data.trades.filter(t => {
-          if (!t || typeof t !== 'object') return false;
-          const p = String(t.pair || t.symbol || '').trim().toUpperCase();
-          const entry = Number(t.entryPriceUSDT || t.entryPrice || 0);
-          const exit = Number(t.exitPriceUSDT || t.exitPrice || 0);
-          return p && p !== 'CRYPTO/USDT' && p !== 'UNKNOWN/USDT' && entry > 0 && exit > 0;
-        });
+      const rawTrades = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
+      
+      const validSheetTrades = [];
+      rawTrades.forEach(t => {
+        const norm = normalizeSheetTrade(t);
+        if (norm && isValidTradeRecord(norm)) validSheetTrades.push(norm);
+      });
 
-        const merged = sanitizeAndAuditTradeHistory([...validSheetTrades, ...State.tradeLogs]);
-        State.tradeLogs = merged;
-        recalculateTrueRealizedPnL();
-        State.subsystems.persistence.googleSheetSync = 'ACTIVE';
-        saveStateToDisk();
-        broadcastState();
-        return res.json({
-          success: true,
-          count: validSheetTrades.length,
-          totalRetained: State.tradeLogs.length,
-          trades: State.tradeLogs
-        });
-      }
-      return res.json({ success: true, count: 0, trades: State.tradeLogs });
+      State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
+      recalculateTrueRealizedPnL();
+      State.subsystems.persistence.googleSheetSync = 'ACTIVE';
+      saveStateToDisk();
+      broadcastState();
+      return res.json({
+        success: true,
+        count: State.tradeLogs.length,
+        totalRetained: State.tradeLogs.length,
+        trades: State.tradeLogs
+      });
     } else {
       return res.status(response.status).json({ success: false, message: `Google Sheet returned HTTP ${response.status}` });
     }
