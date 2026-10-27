@@ -700,34 +700,62 @@ function saveStateToDisk() {
     State.subsystems.persistence.retainedTradesCount = State.tradeLogs.length;
     State.subsystems.persistence.status = 'SYNCED';
 
-    backupStateToGoogleDrive();
+    // NOTE: Removed backupStateToGoogleDrive() here to prevent creating blank rows in the Google Sheet.
   } catch (err) {
     State.subsystems.persistence.status = 'ERROR';
   }
 }
 
 async function backupStateToGoogleDrive() {
-  const targetUrl = State.googleSheetUrl;
-  if (!targetUrl) return;
+  // Disabled: Google Apps Script expects trade logs; sending state dumps appends empty rows.
+  return;
+}
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    await fetch(targetUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'BACKUP_STATE',
-        timestamp: Date.now(),
-        portfolio: State.portfolio,
-        recoveryBags: State.recoveryBags,
-        activePositions: State.activePositions
-      }),
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-  } catch (e) {}
+// Helper to normalize trade objects coming from Google Sheets (which may have varied column headers)
+function normalizeSheetTrade(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  
+  const getField = (keys) => {
+    for (const k of keys) {
+      if (raw[k] !== undefined && raw[k] !== null && String(raw[k]).trim() !== '') {
+        return raw[k];
+      }
+    }
+    return '';
+  };
+
+  const rawPair = String(getField(['pair', 'Pair', 'symbol', 'Symbol', 'asset', 'Asset'])).trim().toUpperCase();
+  if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair === 'UNKNOWN/USDT' || rawPair.includes('CRYPTO') || !rawPair.includes('USDT')) {
+    return null;
+  }
+
+  const entry = Number(getField(['entryPriceUSDT', 'Entry Price (USDT)', 'entryPrice', 'Entry Price', 'entry', 'Entry']));
+  const exit = Number(getField(['exitPriceUSDT', 'Exit Price (USDT)', 'exitPrice', 'Exit Price', 'exit', 'Exit']));
+
+  if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) {
+    return null;
+  }
+
+  const pnlUSDT = Number(getField(['pnlUSDT', 'PnL (USDT)', 'pnl', 'PnL', 'profit', 'Profit'])) || 0;
+  const pnlINR = Number(getField(['pnlINR', 'PnL (INR)', 'pnlInr'])) || (pnlUSDT * (State.usdtToInrRate || 94.94));
+  const notional = Number(getField(['notionalUSDT', 'Notional (USDT)', 'notional'])) || 50.00;
+  const pair = rawPair.includes('/') ? rawPair : `${rawPair.replace('USDT', '')}/USDT`;
+
+  return {
+    id: Number(getField(['id', 'ID', 'Id'])) || Date.now(),
+    date: String(getField(['date', 'Date', 'tradeDate', 'Trade Date'])) || 'Recent',
+    time: String(getField(['time', 'Time', 'tradeTime', 'Trade Time'])) || '',
+    pair,
+    type: String(getField(['type', 'Type', 'action', 'Action'])) || 'EXIT',
+    entryPriceUSDT: formatBinanceUSDTPrice(entry),
+    exitPriceUSDT: formatBinanceUSDTPrice(exit),
+    notionalUSDT: notional,
+    pnlUSDT: Number(pnlUSDT.toFixed(4)),
+    pnlINR: Number(pnlINR.toFixed(2)),
+    reason: String(getField(['reason', 'Reason', 'notes', 'Notes'])) || 'Settled by quant engine',
+    regime: String(getField(['regime', 'Regime'])) || 'BALANCED',
+    volatilityPct: Number(getField(['volatilityPct', 'Volatility %'])) || 4.5
+  };
 }
 
 async function syncWithGoogleDrive() {
@@ -745,32 +773,19 @@ async function syncWithGoogleDrive() {
     clearTimeout(timeout);
     if (res.ok) {
       const data = await res.json();
-      if (data && Array.isArray(data.trades) && data.trades.length > 0) {
-        // Filter out blank rows upstream before merging
-        const validSheetTrades = data.trades.filter(t => {
-          if (!t || typeof t !== 'object') return false;
-          const p = String(t.pair || t.symbol || '').trim().toUpperCase();
-          const entry = Number(t.entryPriceUSDT || t.entryPrice || 0);
-          const exit = Number(t.exitPriceUSDT || t.exitPrice || 0);
-          return p && p !== 'CRYPTO/USDT' && p !== 'UNKNOWN/USDT' && entry > 0 && exit > 0;
+      const rawList = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
+      
+      if (rawList.length > 0) {
+        const validSheetTrades = [];
+        rawList.forEach(item => {
+          const normalized = normalizeSheetTrade(item);
+          if (normalized) validSheetTrades.push(normalized);
         });
 
-        const merged = sanitizeAndAuditTradeHistory([...validSheetTrades, ...State.tradeLogs]);
-        State.tradeLogs = merged;
+        // Deduplicate and retain only verified trades
+        State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
         recalculateTrueRealizedPnL();
         reconcileRollingTradeQuotaFromHistory();
-      }
-
-      if (data && data.stateBackup) {
-        if (data.stateBackup.recoveryBags && Object.keys(State.recoveryBags).length === 0) {
-          State.recoveryBags = data.stateBackup.recoveryBags;
-        }
-        if (data.stateBackup.portfolio && State.portfolio.cashUSDT === 1000.00) {
-          State.portfolio = data.stateBackup.portfolio;
-        }
-        if (data.stateBackup.activePositions && Object.keys(State.activePositions).length === 0) {
-          State.activePositions = data.stateBackup.activePositions;
-        }
       }
 
       State.subsystems.persistence.googleSheetSync = 'ACTIVE';
@@ -783,7 +798,13 @@ async function syncWithGoogleDrive() {
 async function appendTradeToGoogleDrive(tradeLog) {
   const targetUrl = State.googleSheetUrl;
   if (!targetUrl || !tradeLog) return;
-  if (!tradeLog.pair || tradeLog.pair === 'CRYPTO/USDT' || !tradeLog.entryPriceUSDT) return;
+  
+  // Strict guard: Never write empty or placeholder records to Google Sheets
+  const pair = String(tradeLog.pair || '').trim().toUpperCase();
+  if (!pair || pair.includes('CRYPTO') || pair === 'UNKNOWN/USDT' || !pair.includes('USDT')) return;
+  const entry = Number(tradeLog.entryPriceUSDT || 0);
+  const exit = Number(tradeLog.exitPriceUSDT || 0);
+  if (entry <= 0 || exit <= 0) return;
 
   try {
     const controller = new AbortController();
@@ -802,21 +823,73 @@ async function appendTradeToGoogleDrive(tradeLog) {
     }
   } catch (err) {}
 }
+function sanitizeAndAuditTradeHistory(logs) {
+  if (!Array.isArray(logs)) return [];
+  
+  const map = new Map();
+  logs.forEach(l => {
+    if (!l || typeof l !== 'object') return;
 
-function loadStateFromDisk() {
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-      const parsed = JSON.parse(raw);
-      
-      if (parsed.portfolio) {
-        if (typeof parsed.portfolio.cashUSDT === 'number') {
-          State.portfolio = parsed.portfolio;
-        } else if (typeof parsed.portfolio.cashINR === 'number') {
-          State.portfolio.cashUSDT = Math.round((parsed.portfolio.cashINR / 94.94) * 100) / 100;
-          State.portfolio.holdings = {};
-          State.portfolio.realizedPnL = 0;
-        }
+    // Strict validation: Reject empty rows, placeholder rows, and invalid assets
+    const rawPair = String(l.pair || l.symbol || '').trim().toUpperCase();
+    if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair.includes('CRYPTO') || rawPair === 'UNKNOWN/USDT' || !rawPair.includes('USDT')) {
+      return;
+    }
+
+    let entryUSDT = Number(l.entryPriceUSDT || l.entryPrice || 0);
+    let exitUSDT = Number(l.exitPriceUSDT || l.exitPrice || 0);
+
+    // Reject non-positive entries
+    if (isNaN(entryUSDT) || entryUSDT <= 0 || isNaN(exitUSDT) || exitUSDT <= 0) {
+      return;
+    }
+
+    const parsedEpoch = parseTradeTimestamp(l);
+    let id = parsedEpoch > 0 ? parsedEpoch : Number(l.id);
+    if (!id || isNaN(id) || id < 1000000) {
+      id = Date.now() - (25 * 60 * 60 * 1000);
+    }
+    l.id = id;
+
+    const { date, time } = cleanAndNormalizeDateString(l.date, l.time, id);
+    l.date = date;
+    l.time = time;
+    l.pair = rawPair.endsWith('USDT') && !rawPair.includes('/') ? `${rawPair.replace('USDT', '')}/USDT` : rawPair;
+
+    let pnlUSDT = 0;
+    if (typeof l.pnlUSDT === 'number' && !isNaN(l.pnlUSDT)) {
+      pnlUSDT = l.pnlUSDT;
+    } else if (typeof l.pnlINR === 'number' && !isNaN(l.pnlINR)) {
+      pnlUSDT = l.pnlINR / State.usdtToInrRate;
+    } else {
+      pnlUSDT = (exitUSDT - entryUSDT) * ((Number(l.notionalUSDT) || 50.00) / entryUSDT);
+    }
+
+    if (Math.abs(pnlUSDT) > 5.0) {
+      pnlUSDT = pnlUSDT / State.usdtToInrRate;
+    }
+
+    if (l.pair && l.pair.includes('PEPE') && exitUSDT > 0.001) {
+      exitUSDT = exitUSDT / State.usdtToInrRate;
+      entryUSDT = entryUSDT / State.usdtToInrRate;
+    }
+
+    l.pnlUSDT = Number(pnlUSDT.toFixed(4));
+    l.pnlINR = Number((pnlUSDT * State.usdtToInrRate).toFixed(2));
+    l.entryPriceUSDT = formatBinanceUSDTPrice(entryUSDT);
+    l.exitPriceUSDT = formatBinanceUSDTPrice(exitUSDT);
+    l.notionalUSDT = Number(l.notionalUSDT) || 50.00;
+    l.type = l.type || 'EXIT';
+    l.regime = l.regime || 'BALANCED';
+    l.volatilityPct = typeof l.volatilityPct === 'number' ? l.volatilityPct : 4.5;
+
+    // Deduplicate by trade ID or pair + timestamp
+    const dedupKey = `${l.pair}_${l.id}`;
+    map.set(dedupKey, l);
+  });
+
+  return Array.from(map.values()).sort((a, b) => b.id - a.id);
+}
       }
       if (parsed.activePositions && typeof parsed.activePositions === 'object') {
         State.activePositions = parsed.activePositions;
@@ -2120,6 +2193,21 @@ app.post('/api/trades/sync-strict-sheet', async (req, res) => {
   res.json({
     success: true,
     message: 'Scrubbed ghost trades and refreshed strictly from Google Sheet',
+    count: State.tradeLogs.length,
+    trades: State.tradeLogs
+  });
+});
+
+// Dedicated endpoint to permanently purge all empty/corrupted ghost rows from server storage
+app.post('/api/trades/purge-empty', (req, res) => {
+  State.tradeLogs = sanitizeAndAuditTradeHistory(State.tradeLogs);
+  recalculateTrueRealizedPnL();
+  reconcileRollingTradeQuotaFromHistory();
+  saveStateToDisk();
+  broadcastState();
+  res.json({
+    success: true,
+    message: 'Permanently purged all empty/corrupted rows from disk and memory',
     count: State.tradeLogs.length,
     trades: State.tradeLogs
   });
