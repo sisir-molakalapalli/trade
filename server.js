@@ -700,9 +700,36 @@ function saveStateToDisk() {
     State.subsystems.persistence.lastSaveTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
     State.subsystems.persistence.retainedTradesCount = State.tradeLogs.length;
     State.subsystems.persistence.status = 'SYNCED';
+
+    // Backup critical recovery bags & portfolio state to Google Sheet
+    backupStateToGoogleDrive();
   } catch (err) {
     State.subsystems.persistence.status = 'ERROR';
   }
+}
+
+async function backupStateToGoogleDrive() {
+  const targetUrl = State.googleSheetUrl;
+  if (!targetUrl) return;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    await fetch(targetUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'BACKUP_STATE',
+        timestamp: Date.now(),
+        portfolio: State.portfolio,
+        recoveryBags: State.recoveryBags,
+        activePositions: State.activePositions
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+  } catch (e) {}
 }
 
 async function syncWithGoogleDrive() {
@@ -725,11 +752,25 @@ async function syncWithGoogleDrive() {
         State.tradeLogs = merged;
         recalculateTrueRealizedPnL();
         reconcileRollingTradeQuotaFromHistory();
-        State.subsystems.persistence.googleSheetSync = 'ACTIVE';
-        saveStateToDisk();
-        broadcastState();
-        console.log(`[GoogleSheet Sync] Successfully restored ${data.trades.length} trades from Google Drive.`);
       }
+
+      // Restore recovery bags and portfolio if container was just deployed / wiped
+      if (data && data.stateBackup) {
+        if (data.stateBackup.recoveryBags && Object.keys(State.recoveryBags).length === 0) {
+          State.recoveryBags = data.stateBackup.recoveryBags;
+          console.log(`[Cloud Restore] Restored ${Object.keys(State.recoveryBags).length} recovery bags from Google Sheet backup.`);
+        }
+        if (data.stateBackup.portfolio && State.portfolio.cashUSDT === 1000.00) {
+          State.portfolio = data.stateBackup.portfolio;
+        }
+        if (data.stateBackup.activePositions && Object.keys(State.activePositions).length === 0) {
+          State.activePositions = data.stateBackup.activePositions;
+        }
+      }
+
+      State.subsystems.persistence.googleSheetSync = 'ACTIVE';
+      saveStateToDisk();
+      broadcastState();
     }
   } catch (err) {
     console.error('[GoogleSheet Sync Error]', err.message);
