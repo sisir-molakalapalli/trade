@@ -102,7 +102,10 @@ const State = {
     cashUSDT: 1000.00,
     holdings: {},
     realizedPnL: 0.00,
-    bagSubsidyPoolUSDT: 0.00
+    bagSubsidyPoolUSDT: 0.00,
+    sizingMode: 'PERCENTAGE', // 'PERCENTAGE' (Compounding) or 'FIXED'
+    allocationPct: 15.0,      // % of available cash per trade (e.g., 15%)
+    fixedNotionalUSDT: 50.00  // fallback for fixed mode
   },
 
   activePositions: {},
@@ -1392,7 +1395,20 @@ async function evaluateAutopilotEntries(regimeConfig) {
   const cashFloor = State.tradeFrequencyController.cashReserveFloorUSDT || 300.00;
   const maxBags = State.tradeFrequencyController.maxRecoveryBagsLimit || 6;
 
-  if (freeCash < (cashFloor + 50.00)) return;
+  // Calculate dynamic trade notional size based on compounding percentage
+  const sizingMode = State.portfolio.sizingMode || 'PERCENTAGE';
+  const allocPct = Number(State.portfolio.allocationPct || 15);
+  let nextTradeNotional = 50.00;
+
+  if (sizingMode === 'PERCENTAGE') {
+    nextTradeNotional = Math.max(15.00, Math.round((freeCash * (allocPct / 100)) * 100) / 100);
+  } else {
+    nextTradeNotional = Number(State.portfolio.fixedNotionalUSDT || 50.00);
+  }
+
+  // Adaptive reserve floor: does not exceed 30% of current cash
+  const effectiveCashFloor = Math.min(cashFloor, freeCash * 0.30);
+  if (freeCash < (effectiveCashFloor + nextTradeNotional) || freeCash < nextTradeNotional) return;
   if (activeBagsCount >= maxBags) return;
 
   const btcGate = State.subsystems.btcMacroGate || { allowAltcoinEntries: true };
@@ -1487,15 +1503,28 @@ async function evaluateAutopilotEntries(regimeConfig) {
 }
 
 // -------------------------------------------------------------
-// SPOT BUY EXECUTION ($50 FIXED NOTIONAL)
+// SPOT BUY EXECUTION (DYNAMIC COMPOUNDING OR FIXED ALLOCATION)
 // -------------------------------------------------------------
 function executeSpotBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
-  if (State.portfolio.cashUSDT < 50.00) return;
+  const freeCash = Number(State.portfolio.cashUSDT || 0);
+  const sizingMode = State.portfolio.sizingMode || 'PERCENTAGE';
+  const allocPct = Number(State.portfolio.allocationPct || 15);
 
-  const notionalUSDT = 50.00;
+  let notionalUSDT = 50.00;
+  if (sizingMode === 'PERCENTAGE') {
+    // Dynamic fractional compounding sizing based on available cash
+    notionalUSDT = Math.max(15.00, Math.round((freeCash * (allocPct / 100)) * 100) / 100);
+    if (notionalUSDT > freeCash) notionalUSDT = Math.floor(freeCash * 100) / 100;
+  } else {
+    notionalUSDT = Math.min(freeCash, Number(State.portfolio.fixedNotionalUSDT || 50.00));
+  }
+
+  // Guard against insufficient funds or sub-minimum notional
+  if (notionalUSDT < 10.00 || freeCash < notionalUSDT) return;
+
   const qty = notionalUSDT / priceUSDT;
 
-  State.portfolio.cashUSDT -= notionalUSDT;
+  State.portfolio.cashUSDT = Math.max(0, Math.round((State.portfolio.cashUSDT - notionalUSDT) * 100) / 100);
 
   const tp1 = formatBinanceUSDTPrice(priceUSDT * 1.018);
 
@@ -2038,6 +2067,18 @@ wss.on('connection', ws => {
           saveStateToDisk();
           broadcastState();
         }
+      } else if (data.type === 'SET_SIZING_CONFIG') {
+        if (data.sizingMode) State.portfolio.sizingMode = data.sizingMode;
+        const pct = parseFloat(data.allocationPct);
+        if (!isNaN(pct) && pct >= 1 && pct <= 100) {
+          State.portfolio.allocationPct = Math.round(pct * 10) / 10;
+        }
+        const fixed = parseFloat(data.fixedNotionalUSDT);
+        if (!isNaN(fixed) && fixed >= 15) {
+          State.portfolio.fixedNotionalUSDT = fixed;
+        }
+        saveStateToDisk();
+        broadcastState();
       } else if (data.type === 'RECONCILE_QUOTA') {
         State.tradeLogs = sanitizeAndAuditTradeHistory(State.tradeLogs);
         recalculateTrueRealizedPnL();
@@ -2135,6 +2176,28 @@ app.post('/api/portfolio/cash', (req, res) => {
   }
 
   res.status(400).json({ success: false, message: 'Invalid cash value provided' });
+});
+
+// Endpoint to update position sizing mode (% compounding vs fixed $)
+app.post('/api/portfolio/sizing', (req, res) => {
+  const { sizingMode, allocationPct, fixedNotionalUSDT } = req.body || {};
+  if (sizingMode) State.portfolio.sizingMode = sizingMode;
+  const pct = parseFloat(allocationPct);
+  if (!isNaN(pct) && pct >= 1 && pct <= 100) {
+    State.portfolio.allocationPct = Math.round(pct * 10) / 10;
+  }
+  const fixed = parseFloat(fixedNotionalUSDT);
+  if (!isNaN(fixed) && fixed >= 15) {
+    State.portfolio.fixedNotionalUSDT = fixed;
+  }
+  saveStateToDisk();
+  broadcastState();
+  res.json({
+    success: true,
+    sizingMode: State.portfolio.sizingMode,
+    allocationPct: State.portfolio.allocationPct,
+    fixedNotionalUSDT: State.portfolio.fixedNotionalUSDT
+  });
 });
 
 // -------------------------------------------------------------
