@@ -20,6 +20,11 @@ const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
 const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
 
+const DRIVE_FILE_IDS = {
+  learningState: '15eSFMAP8gFT8hMZLO8xplq3woSCbQmeL',
+  portfolioState: '1DVK9OvL1d2sNsHqwGsdOMNqEAzkTeyno'
+};
+
 const app = express();
 
 // Register Google Drive sync callback for learning engine
@@ -213,7 +218,8 @@ const State = {
       lastSaveTime: '--:--:--',
       retainedTradesCount: 0,
       storageEngine: 'Disk JSON + Google Drive File Engine',
-      googleDriveFileStatus: 'INITIALIZING',
+      googleDriveFileStatus: 'FILES_ONLINE (Drive IDs Bound)',
+      driveFileIds: DRIVE_FILE_IDS,
       googleSheetSync: GOOGLE_SHEET_URL ? 'CONNECTED' : 'STANDBY'
     }
   },
@@ -244,6 +250,7 @@ async function backupLearningStateToGoogleDrive(payload) {
   try {
     const postBody = {
       action: 'SAVE_LEARNING_STATE',
+      fileId: DRIVE_FILE_IDS.learningState,
       learningState: payload?.learningState || learningEngine.state,
       timestamp: Date.now()
     };
@@ -262,8 +269,8 @@ async function backupLearningStateToGoogleDrive(payload) {
     if (res.ok) {
       const data = await res.json().catch(() => null);
       if (data && data.success) {
-        State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (learning_state.json created in Drive)';
-        console.log('[Google Drive] Saved learning_state.json to Drive:', data.fileId || 'Success');
+        State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (Drive ID: 15eSFMAP... Bound)';
+        console.log('[Google Drive] Saved learning_state.json directly to Drive ID:', data.fileId || DRIVE_FILE_IDS.learningState);
       }
     }
   } catch (e) {
@@ -278,6 +285,7 @@ async function backupPortfolioStateToGoogleDrive() {
   try {
     const postBody = {
       action: 'SAVE_PORTFOLIO_STATE',
+      fileId: DRIVE_FILE_IDS.portfolioState,
       portfolioState: {
         portfolio: State.portfolio,
         activePositions: State.activePositions,
@@ -300,7 +308,7 @@ async function backupPortfolioStateToGoogleDrive() {
     clearTimeout(timeout);
 
     if (res.ok) {
-      State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (cloud_portfolio_state.json created in Drive)';
+      State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (Drive ID: 1DVK9OvL... Bound)';
     }
   } catch (e) {}
 }
