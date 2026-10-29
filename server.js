@@ -153,13 +153,15 @@ const State = {
       activePositionsMonitored: 0,
       recoveryBagsMonitored: 0,
       trailingLocksActive: 0,
-      architecture: 'High-Sustain Confluence + Zero Realized Loss Recovery Bag'
+      hardDisasterFloorPct: -6.50,
+      architecture: '4-Point Loss Prevention + Spot Recovery Bag'
     },
     recoveryManager: {
       status: 'ONLINE',
       activeRecoveryBagsCount: 0,
       totalRecoveryCapitalUSDT: 0.00,
-      meanReversionTargetRate: 'Dynamic Stepped Target (+0.30% -> 0.00% -> -0.75%)',
+      meanReversionTargetRate: 'Dynamic Stepped Target + Hard -6.50% Disaster Cap',
+      hardDisasterCutsCount: 0,
       bagsResolvedWinCount: 0,
       subsidyPoolUSDT: 0.00,
       bagsSubsidizedCount: 0
@@ -1071,6 +1073,11 @@ async function runDynamicMarketScreener() {
       const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
       const vwapPremiumPct = vwapPrice > 0 ? ((lastPrice - vwapPrice) / vwapPrice) * 100 : 0;
 
+      if (lastPrice <= 0 || highPrice <= lowPrice) continue;
+
+      // 4-Point Loss Prevention: Block Parabolic Climax Tops (>18% 24h pump or apex >0.90 of range)
+      if (priceChangePct >= 18.0 || pricePositionInRange >= 0.90) continue;
+
       let requiredFloor = 10000000;
       if (priceChangePct >= 5.0 && vwapPremiumPct >= 2.5 && pricePositionInRange >= 0.72) {
         requiredFloor = 3500000;
@@ -1430,20 +1437,31 @@ async function evaluateAutopilotEntries(regimeConfig) {
 
     if (sym !== 'BTCUSDT' && !btcGate.allowAltcoinEntries) continue;
 
+    // 1. Anti-Churn Serial Re-entry Lockout (90-Minute Cooldown after position closure)
     if (State.cooldowns[sym]) {
       const cdObj = typeof State.cooldowns[sym] === 'object'
         ? State.cooldowns[sym]
-        : { until: Number(State.cooldowns[sym]) || 0 };
+        : { until: Number(State.cooldowns[sym]) || 0, reason: 'Cooldown' };
       const remaining = cdObj.until - Date.now();
       if (remaining > 0) continue;
       delete State.cooldowns[sym];
     }
 
+    // 2. Parabolic Extension & Climax Top Filter (e.g., HAEDAL +35% pump-and-dump trap)
+    if (coin.priceChangePct >= 18.0 || (coin.pricePositionInRange !== undefined && coin.pricePositionInRange >= 0.90)) {
+      continue;
+    }
+
     const book = await fetchRealOrderBookDepth(sym);
     if (!book) continue;
 
-    const isApexChasing = (coin.change15mPct >= 3.8 && (coin.pricePositionInRange || 0.8) > 0.88 && book.obi < 0.60);
+    // 3. Retest-Only Confirmation Gate (Never buy the apex of a green expansion candle)
+    const isApexChasing = (coin.change15mPct >= 3.0 && (coin.pricePositionInRange || 0.8) > 0.85 && book.obi < 0.60);
     if (isApexChasing) continue;
+
+    if (coin.change15mPct >= 2.5 && coin.vwapPremiumPct > 2.5 && book.obi < 0.62) {
+      continue; // Wait for pullback/retest of VWAP support before entry
+    }
 
     const isMacroDowntrend = (coin.change1hPct < -0.8 && coin.change4hPct < -3.5);
     if (isMacroDowntrend) continue;
@@ -1607,6 +1625,12 @@ function settleRecoveryBag(pairKey, exitPriceUSDT, reason) {
   delete State.portfolio.holdings[pairKey];
   delete State.recoveryBags[pairKey];
 
+  // Enforce 90-Minute Anti-Churn Serial Re-entry Lockout
+  State.cooldowns[pairKey] = {
+    until: Date.now() + (90 * 60 * 1000),
+    reason: `90m Anti-Churn Lockout after Recovery Exit`
+  };
+
   State.subsystems.recoveryManager.bagsResolvedWinCount++;
   State.subsystems.recoveryManager.activeRecoveryBagsCount = Object.keys(State.recoveryBags).length;
 
@@ -1720,6 +1744,12 @@ function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
   delete State.portfolio.holdings[pairKey];
   delete State.activePositions[pairKey];
 
+  // Enforce 90-Minute Anti-Churn Serial Re-entry Lockout
+  State.cooldowns[pairKey] = {
+    until: Date.now() + (90 * 60 * 1000),
+    reason: `90m Anti-Churn Lockout after ${exitType}`
+  };
+
   const now = new Date();
   const istTime = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
   const istDate = now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
@@ -1799,6 +1829,29 @@ async function monitorOpenPositionsHealth() {
     bag.targetExitPriceUSDT = formatBinanceUSDTPrice(dynamicTargetPrice);
     bag.targetStep = stepName;
 
+    // -------------------------------------------------------------
+    // 4. HARD DISASTER CAP (-6.50%): PREVENTS -21.90% HAEDAL TRAPS
+    // -------------------------------------------------------------
+    if (gainFromEntryPct <= -6.50) {
+      State.subsystems.recoveryManager.hardDisasterCutsCount = (State.subsystems.recoveryManager.hardDisasterCutsCount || 0) + 1;
+      settleRecoveryBag(
+        sym,
+        live,
+        `🚨 Hard Disaster Cap Executed: Cut at ${gainFromEntryPct.toFixed(2)}% to prevent deep capital lockup (capped loss)`
+      );
+      continue;
+    }
+
+    // Dynamic 15m VWAP Relief Exit for stale bags (>6h held)
+    if (ageHours >= 6 && live >= bag.entryPriceUSDT * 0.990) {
+      settleRecoveryBag(
+        sym,
+        live,
+        `Dynamic VWAP Relief Exit: Recycled after ${ageHours.toFixed(1)}h on relief bounce (${gainFromEntryPct >= 0 ? '+' : ''}${gainFromEntryPct.toFixed(2)}%)`
+      );
+      continue;
+    }
+
     if (live >= bag.targetExitPriceUSDT) {
       settleRecoveryBag(sym, live, `Stepped Target ${stepName} filled on relief bounce (${gainFromEntryPct >= 0 ? '+' : ''}${gainFromEntryPct.toFixed(2)}%)`);
       continue;
@@ -1854,6 +1907,12 @@ async function monitorOpenPositionsHealth() {
         continue;
       }
     } else {
+      // Hard Disaster Stop for active positions (-5.0% Emergency Safety Floor)
+      if (gainPct <= -5.00) {
+        settlePosition(sym, 'DISASTER STOP (-5.0%)', livePriceUSDT, `🚨 Hard active disaster stop triggered at ${gainPct.toFixed(2)}%`);
+        continue;
+      }
+
       const book = await fetchRealOrderBookDepth(sym);
       const isStrongSupport = Boolean(book && book.obi >= 0.46);
 
