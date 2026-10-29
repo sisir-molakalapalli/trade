@@ -156,6 +156,24 @@ const State = {
       hardDisasterFloorPct: -6.50,
       architecture: '4-Point Loss Prevention + Spot Recovery Bag'
     },
+    timeMachine: {
+      status: 'ONLINE',
+      lastEvaluatedSymbol: '--',
+      lastWinOddsPct: 0,
+      replaysCompleted: 0,
+      blockedCount: 0,
+      minOddsRequiredPct: 45
+    },
+    entryTimer: {
+      status: 'ONLINE',
+      closedBarEnforced: true,
+      maxWickRatio: 0.40
+    },
+    volatilityBudget: {
+      status: 'ONLINE',
+      baselineVolPct: 4.5,
+      lastAdjustmentFactor: 1.0
+    },
     recoveryManager: {
       status: 'ONLINE',
       activeRecoveryBagsCount: 0,
@@ -374,6 +392,127 @@ async function fetchShortTermMomentum(symbol) {
     }
   } catch (e) {}
   return { change15mPct: 0, change1hPct: 0, change4hPct: 0, rvol: 1.0 };
+}
+
+// -------------------------------------------------------------
+// INNOVATION 1: "TIME MACHINE" BREAKOUT ODDS REPLAY ENGINE
+// -------------------------------------------------------------
+async function evaluateTimeMachineBreakoutOdds(symbol) {
+  try {
+    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
+    if (!Array.isArray(klines) || klines.length < 20) {
+      return { pass: true, winOddsPct: 55, setupsTested: 0, reason: 'Insufficient history, bypass' };
+    }
+
+    let setupsTested = 0;
+    let wins = 0;
+    let losses = 0;
+
+    // Scan the historical 15m bars for breakout ignition triggers
+    for (let i = 4; i < klines.length - 4; i++) {
+      const open = parseFloat(klines[i][1]) || 0;
+      const high = parseFloat(klines[i][2]) || 0;
+      const low = parseFloat(klines[i][3]) || 0;
+      const close = parseFloat(klines[i][4]) || 0;
+      const vol = parseFloat(klines[i][5]) || 0;
+
+      const prevVol = (parseFloat(klines[i - 1][5]) + parseFloat(klines[i - 2][5])) / 2;
+      const barGainPct = open > 0 ? ((close - open) / open) * 100 : 0;
+
+      // Identify breakout candles (gain >= 1.2% with volume >= 1.3x baseline)
+      if (barGainPct >= 1.20 && vol >= prevVol * 1.3) {
+        setupsTested++;
+        let reachedTarget = false;
+        let reachedInvalidation = false;
+
+        // Replay next 4 to 6 candles (1 to 1.5 hours forward)
+        for (let f = i + 1; f <= Math.min(i + 5, klines.length - 1); f++) {
+          const forwardHigh = parseFloat(klines[f][2]) || close;
+          const forwardLow = parseFloat(klines[f][3]) || close;
+
+          const gainFromBreakout = ((forwardHigh - close) / close) * 100;
+          const dropFromBreakout = ((forwardLow - close) / close) * 100;
+
+          if (gainFromBreakout >= 1.80) {
+            reachedTarget = true;
+            break;
+          }
+          if (dropFromBreakout <= -2.80) {
+            reachedInvalidation = true;
+            break;
+          }
+        }
+
+        if (reachedTarget) wins++;
+        else if (reachedInvalidation) losses++;
+      }
+    }
+
+    const winOddsPct = setupsTested > 0 ? Math.round((wins / setupsTested) * 100) : 60;
+    State.subsystems.timeMachine.lastEvaluatedSymbol = symbol;
+    State.subsystems.timeMachine.lastWinOddsPct = winOddsPct;
+    State.subsystems.timeMachine.replaysCompleted++;
+
+    if (setupsTested >= 2 && winOddsPct < 45) {
+      State.subsystems.timeMachine.blockedCount++;
+      return {
+        pass: false,
+        winOddsPct,
+        setupsTested,
+        reason: `Time Machine Win Odds too low (${winOddsPct}% < 45% over ${setupsTested} historical breakouts)`
+      };
+    }
+
+    return { pass: true, winOddsPct, setupsTested, reason: `Time Machine Odds Verified (${winOddsPct}%)` };
+  } catch (err) {
+    return { pass: true, winOddsPct: 50, setupsTested: 0, reason: 'Time Machine error bypass' };
+  }
+}
+
+// -------------------------------------------------------------
+// INNOVATION 2: CONFIRMED CLOSED-BAR & UPPER-WICK REJECTION GATE
+// -------------------------------------------------------------
+async function checkConfirmedClosedBar(symbol) {
+  try {
+    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=3`);
+    if (!Array.isArray(klines) || klines.length < 2) {
+      return { pass: true, reason: 'Bypass on insufficient bars' };
+    }
+
+    const prevClosed = klines[klines.length - 2];
+    const open = parseFloat(prevClosed[1]) || 0;
+    const high = parseFloat(prevClosed[2]) || 0;
+    const low = parseFloat(prevClosed[3]) || 0;
+    const close = parseFloat(prevClosed[4]) || 0;
+
+    const totalRange = high - low;
+    if (totalRange <= 0) return { pass: true };
+
+    const upperWick = high - Math.max(open, close);
+    const upperWickRatio = upperWick / totalRange;
+
+    // Reject candles where upper wick is > 40% of the entire candle (shooting star/rejection)
+    if (upperWickRatio > 0.40) {
+      return {
+        pass: false,
+        upperWickRatio: Number(upperWickRatio.toFixed(2)),
+        reason: `Upper wick rejection trap (${Math.round(upperWickRatio * 100)}% wick > 40% ceiling)`
+      };
+    }
+
+    // Must have closed positive or tight consolidation
+    if (close < open && Math.abs((close - open) / open) > 0.012) {
+      return {
+        pass: false,
+        upperWickRatio: Number(upperWickRatio.toFixed(2)),
+        reason: `Previous 15m candle closed red (-${(((open - close) / open) * 100).toFixed(2)}%)`
+      };
+    }
+
+    return { pass: true, upperWickRatio: Number(upperWickRatio.toFixed(2)), reason: 'Confirmed Bullish Close' };
+  } catch (err) {
+    return { pass: true, reason: 'Bypass on check error' };
+  }
 }
 
 async function evaluateBtcMacroStatus() {
@@ -1481,12 +1620,28 @@ async function evaluateAutopilotEntries(regimeConfig) {
     if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
     if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
 
+    // -------------------------------------------------------------
+    // INNOVATION 2 INTEGRATION: CONFIRMED CLOSED BAR GATE
+    // -------------------------------------------------------------
+    const closedBarCheck = await checkConfirmedClosedBar(sym);
+    if (!closedBarCheck.pass) {
+      continue; // Block entry into upper-wick exhaustion candles
+    }
+
+    // -------------------------------------------------------------
+    // INNOVATION 1 INTEGRATION: TIME MACHINE WIN-ODDS REPLAY
+    // -------------------------------------------------------------
+    const timeMachineCheck = await evaluateTimeMachineBreakoutOdds(sym);
+    if (!timeMachineCheck.pass) {
+      continue; // Block coins with poor historical breakout continuation
+    }
+
     const mtfConfirmed = (coin.change1hPct >= 0.2 || coin.vwapPremiumPct >= 1.0);
     if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold && mtfConfirmed) {
       executeSpotBuy(
         sym, 
         coin.priceUSDT, 
-        `High-Sustain Confluence (${config.regime}: Score ${coin.score} >= ${config.scoreThreshold}, OBI ${(book.obi * 100).toFixed(0)}%, 15m +${(coin.change15mPct || 0).toFixed(1)}%, 1h +${(coin.change1hPct || 0).toFixed(1)}%)`,
+        `High-Sustain Confluence (Odds: ${timeMachineCheck.winOddsPct}%, Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%, 15m +${(coin.change15mPct || 0).toFixed(1)}%)`,
         false
       );
       break;
@@ -1497,7 +1652,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
       executeSpotBuy(
         sym,
         coin.priceUSDT,
-        `🚀 High-Sustain Ignition (${sym}: 15m +${(coin.change15mPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x, OBI ${(book.obi * 100).toFixed(0)}%)`,
+        `🚀 High-Sustain Ignition (${sym}: Odds ${timeMachineCheck.winOddsPct}%, 15m +${(coin.change15mPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x)`,
         false
       );
       break;
@@ -1511,7 +1666,7 @@ async function evaluateAutopilotEntries(regimeConfig) {
         executeSpotBuy(
           sym,
           coin.priceUSDT,
-          `⚡ VIP Alpha Override: God-Candle Breakout! Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%`,
+          `⚡ VIP Alpha Override: God-Candle Breakout! Score ${coin.score}, Odds ${timeMachineCheck.winOddsPct}%`,
           true
         );
         break;
@@ -1521,21 +1676,33 @@ async function evaluateAutopilotEntries(regimeConfig) {
 }
 
 // -------------------------------------------------------------
-// SPOT BUY EXECUTION (DYNAMIC COMPOUNDING OR FIXED ALLOCATION)
+// SPOT BUY EXECUTION WITH INNOVATION 3: VOLATILITY-NORMALIZED SIZING
 // -------------------------------------------------------------
 function executeSpotBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
   const freeCash = Number(State.portfolio.cashUSDT || 0);
   const sizingMode = State.portfolio.sizingMode || 'PERCENTAGE';
   const allocPct = Number(State.portfolio.allocationPct || 15);
 
-  let notionalUSDT = 50.00;
+  let baseNotional = 50.00;
   if (sizingMode === 'PERCENTAGE') {
-    // Dynamic fractional compounding sizing based on available cash
-    notionalUSDT = Math.max(15.00, Math.round((freeCash * (allocPct / 100)) * 100) / 100);
-    if (notionalUSDT > freeCash) notionalUSDT = Math.floor(freeCash * 100) / 100;
+    baseNotional = Math.max(15.00, Math.round((freeCash * (allocPct / 100)) * 100) / 100);
+    if (baseNotional > freeCash) baseNotional = Math.floor(freeCash * 100) / 100;
   } else {
-    notionalUSDT = Math.min(freeCash, Number(State.portfolio.fixedNotionalUSDT || 50.00));
+    baseNotional = Math.min(freeCash, Number(State.portfolio.fixedNotionalUSDT || 50.00));
   }
+
+  // -------------------------------------------------------------
+  // INNOVATION 3: VOLATILITY-NORMALIZED RISK BUDGETING
+  // Scale down hyper-volatile tokens, scale up stable trends
+  // -------------------------------------------------------------
+  const baselineVol = State.activeThresholds?.marketAvgRange || 4.5;
+  const coinVol = State.universe[pairKey]?.intradayRangePct || baselineVol;
+  const volFactor = Number(Math.min(1.25, Math.max(0.40, baselineVol / Math.max(2.5, coinVol))).toFixed(2));
+
+  let notionalUSDT = Math.round(baseNotional * volFactor * 100) / 100;
+  notionalUSDT = Math.max(15.00, Math.min(freeCash, notionalUSDT));
+
+  State.subsystems.volatilityBudget.lastAdjustmentFactor = volFactor;
 
   // Guard against insufficient funds or sub-minimum notional
   if (notionalUSDT < 10.00 || freeCash < notionalUSDT) return;
@@ -1552,6 +1719,7 @@ function executeSpotBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
     entryPriceUSDT: priceUSDT,
     qty,
     notionalUSDT,
+    volFactor,
     tp1,
     sl: formatBinanceUSDTPrice(priceUSDT * 0.95),
     openedAt: Date.now(),
