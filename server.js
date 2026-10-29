@@ -4,6 +4,9 @@ const path = require('path');
 const fs = require('fs');
 const { WebSocketServer, WebSocket } = require('ws');
 
+// Import the Autonomous Self-Learning Quant Engine
+const learningEngine = require('./learning_engine');
+
 process.on('uncaughtException', (err) => {
   console.error('[Process UncaughtException]', err.message);
 });
@@ -18,6 +21,11 @@ const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4qu
 const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL || '';
 
 const app = express();
+
+// Register Google Drive sync callback for learning engine
+learningEngine.setGoogleDriveSyncCallback((payload) => {
+  backupLearningStateToGoogleDrive(payload).catch(() => {});
+});
 
 // -------------------------------------------------------------
 // CORS & PRE-FLIGHT HEADERS
@@ -103,9 +111,9 @@ const State = {
     holdings: {},
     realizedPnL: 0.00,
     bagSubsidyPoolUSDT: 0.00,
-    sizingMode: 'PERCENTAGE', // 'PERCENTAGE' (Compounding) or 'FIXED'
-    allocationPct: 15.0,      // % of available cash per trade (e.g., 15%)
-    fixedNotionalUSDT: 50.00  // fallback for fixed mode
+    sizingMode: 'PERCENTAGE',
+    allocationPct: 15.0,
+    fixedNotionalUSDT: 50.00
   },
 
   activePositions: {},
@@ -204,7 +212,8 @@ const State = {
       totalDiskSaves: 0,
       lastSaveTime: '--:--:--',
       retainedTradesCount: 0,
-      storageEngine: 'Disk JSON + Google Drive Ledger',
+      storageEngine: 'Disk JSON + Google Drive File Engine',
+      googleDriveFileStatus: 'INITIALIZING',
       googleSheetSync: GOOGLE_SHEET_URL ? 'CONNECTED' : 'STANDBY'
     }
   },
@@ -218,631 +227,161 @@ const State = {
     riskCadence: 'Every 2.5 Seconds',
     persistenceStatus: 'ACTIVE (Non-Destructive)',
     p2pRateStatus: 'Binance P2P Daily Sync Active',
-    regimeReasoning: 'Eliminated stop-out losses entirely. Retest pullbacks transfer to Spot Recovery Bags with standing breakeven targets while active slots trade without interruption.'
+    regimeReasoning: 'Eliminated stop-out losses entirely. Dips transfer to Recovery Bags while active slots trade without interruption.'
   },
 
   universe: { ...DEFAULT_UNIVERSE },
   tradeLogs: []
 };
 
-let screenerIntervalMs = 90 * 1000;
-let nextScreenerTargetTimestamp = Date.now() + screenerIntervalMs;
-let screenerTimerHandle = null;
+// -------------------------------------------------------------
+// GOOGLE DRIVE JSON FILE SYNC & PERSISTENCE ENGINE
+// -------------------------------------------------------------
+async function backupLearningStateToGoogleDrive(payload) {
+  const targetUrl = State.googleSheetUrl;
+  if (!targetUrl) return;
 
-async function fetchFromBinance(endpoint) {
-  const base = 'https://data-api.binance.vision';
-  const url = `${base}${endpoint}`;
   try {
+    const postBody = {
+      action: 'SAVE_LEARNING_STATE',
+      learningState: payload?.learningState || learningEngine.state,
+      timestamp: Date.now()
+    };
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    const res = await fetch(url, {
-      headers: { 'X-MBX-APIKEY': BINANCE_API_KEY },
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(postBody),
       signal: controller.signal
     });
     clearTimeout(timeout);
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (err) {
-    return null;
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.success) {
+        State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (learning_state.json created in Drive)';
+        console.log('[Google Drive] Saved learning_state.json to Drive:', data.fileId || 'Success');
+      }
+    }
+  } catch (e) {
+    State.subsystems.persistence.googleDriveFileStatus = 'DRIVE_SYNC_RETRY';
   }
 }
 
-async function syncBinanceP2PUsdtInrRate() {
+async function backupPortfolioStateToGoogleDrive() {
+  const targetUrl = State.googleSheetUrl;
+  if (!targetUrl) return;
+
   try {
-    let rateFound = 0;
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 7000);
-      const p2pRes = await fetch('https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          asset: 'USDT',
-          fiat: 'INR',
-          tradeType: 'BUY',
-          page: 1,
-          rows: 5,
-          payTypes: ['UPI', 'IMPS'],
-          publisherType: 'merchant'
-        }),
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-
-      if (p2pRes.ok) {
-        const body = await p2pRes.json();
-        if (body && Array.isArray(body.data) && body.data.length > 0) {
-          const prices = [];
-          body.data.forEach(item => {
-            const p = parseFloat(item?.adv?.price);
-            if (p && p >= 85 && p <= 125) prices.push(p);
-          });
-          if (prices.length > 0) {
-            prices.sort((a, b) => a - b);
-            rateFound = prices[Math.floor(prices.length / 2)];
-          }
-        }
+    const postBody = {
+      action: 'SAVE_PORTFOLIO_STATE',
+      portfolioState: {
+        portfolio: State.portfolio,
+        activePositions: State.activePositions,
+        recoveryBags: State.recoveryBags,
+        cooldowns: State.cooldowns,
+        tradeFrequencyController: State.tradeFrequencyController,
+        timestamp: Date.now()
       }
-    } catch (e) {}
+    };
 
-    if (!rateFound) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 6000);
-        const refRes = await fetch('https://www.binance.com/api/v3/ticker/price?symbol=USDTINR', {
-          signal: controller.signal
-        });
-        clearTimeout(timeout);
-        if (refRes.ok) {
-          const data = await refRes.json();
-          const p = parseFloat(data.price);
-          if (p && p >= 85 && p <= 125) rateFound = p;
-        }
-      } catch (e) {}
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(postBody),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    if (res.ok) {
+      State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (cloud_portfolio_state.json created in Drive)';
     }
+  } catch (e) {}
+}
 
-    if (!rateFound) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        const fxRes = await fetch('https://open.er-api.com/v6/latest/USD', { signal: controller.signal });
-        clearTimeout(timeout);
-        if (fxRes.ok) {
-          const fx = await fxRes.json();
-          const inr = fx?.rates?.INR;
-          if (inr && inr > 75) {
-            rateFound = Math.round((inr * 1.065) * 100) / 100;
+async function syncWithGoogleDrive() {
+  const targetUrl = State.googleSheetUrl;
+  if (!targetUrl) return;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(`${targetUrl}?action=GET_ALL`, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    if (res.ok) {
+      const data = await res.json();
+      
+      // 1. Restore Learning State from Google Drive file
+      if (data && data.learningState) {
+        learningEngine.restoreFromDrivePayload(data);
+        console.log('[Google Drive] Restored learning_state.json from Google Drive successfully.');
+      }
+
+      // 2. Restore Portfolio State from Google Drive file
+      if (data && data.portfolioState && typeof data.portfolioState === 'object') {
+        const ps = data.portfolioState;
+        if (ps.portfolio) State.portfolio = { ...State.portfolio, ...ps.portfolio };
+        if (ps.activePositions) State.activePositions = ps.activePositions;
+        if (ps.recoveryBags) State.recoveryBags = ps.recoveryBags;
+        if (ps.cooldowns) State.cooldowns = ps.cooldowns;
+      }
+
+      // 3. Restore Sheet Trades
+      const rawList = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
+      if (rawList.length > 0) {
+        const validSheetTrades = [];
+        rawList.forEach(item => {
+          const normalized = normalizeSheetTrade(item);
+          if (normalized && isValidTradeRecord(normalized)) {
+            validSheetTrades.push(normalized);
           }
-        }
-      } catch (e) {}
-    }
+        });
+        State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
+        recalculateTrueRealizedPnL();
+        reconcileRollingTradeQuotaFromHistory();
+      }
 
-    if (rateFound && rateFound >= 85 && rateFound <= 125) {
-      const roundedRate = Math.round(rateFound * 100) / 100;
-      State.usdtToInrRate = roundedRate;
-      State.p2pLastUpdated = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-      State.quantTelemetry.p2pRateStatus = `Live Binance P2P: ₹${roundedRate} (Synced at ${State.p2pLastUpdated})`;
-
-      Object.keys(State.universe).forEach(k => {
-        if (State.universe[k].priceUSDT) {
-          State.universe[k].priceINR = calculateAccurateINRPrice(State.universe[k].priceUSDT, roundedRate);
-        }
-      });
-
+      State.subsystems.persistence.googleSheetSync = 'ACTIVE';
+      State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
       saveStateToDisk();
-      broadcastPricesOnly();
+      broadcastState();
+    }
+  } catch (err) {
+    console.error('[Google Drive Sync Error]', err.message);
+  }
+}
+
+async function appendTradeToGoogleDrive(tradeLog) {
+  const targetUrl = State.googleSheetUrl;
+  if (!targetUrl || !tradeLog) return;
+  
+  if (!isValidTradeRecord(tradeLog)) return;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tradeLog),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    
+    if (res.ok) {
+      State.subsystems.persistence.googleSheetSync = 'SYNCED';
     }
   } catch (err) {}
-}
-
-async function fetchRealOrderBookDepth(symbol) {
-  try {
-    const data = await fetchFromBinance(`/api/v3/depth?symbol=${symbol}&limit=20`);
-    if (data && Array.isArray(data.bids) && Array.isArray(data.asks) && data.bids.length > 0 && data.asks.length > 0) {
-      let bidVol = 0;
-      let askVol = 0;
-      data.bids.forEach(b => { bidVol += parseFloat(b[1]) || 0; });
-      data.asks.forEach(a => { askVol += parseFloat(a[1]) || 0; });
-      const total = bidVol + askVol;
-      const obi = total > 0 ? bidVol / total : 0.50;
-
-      const bestBid = parseFloat(data.bids[0][0]);
-      const bestAsk = parseFloat(data.asks[0][0]);
-      const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0;
-
-      return { obi, spreadPct, bestBid, bestAsk, bidVol, askVol };
-    }
-  } catch (e) {}
-  return null;
-}
-
-async function fetchShortTermMomentum(symbol) {
-  try {
-    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=16`);
-    if (Array.isArray(klines) && klines.length >= 6) {
-      const latest = klines[klines.length - 1];
-      const prev15m = klines[klines.length - 2];
-      const prev1h = klines[Math.max(0, klines.length - 5)];
-      const prev4h = klines[0];
-
-      const currentClose = parseFloat(latest[4]) || 0;
-      const open15m = parseFloat(prev15m[1]) || currentClose;
-      const open1h = parseFloat(prev1h[1]) || currentClose;
-      const open4h = parseFloat(prev4h[1]) || currentClose;
-
-      const change15mPct = open15m > 0 ? ((currentClose - open15m) / open15m) * 100 : 0;
-      const change1hPct = open1h > 0 ? ((currentClose - open1h) / open1h) * 100 : 0;
-      const change4hPct = open4h > 0 ? ((currentClose - open4h) / open4h) * 100 : 0;
-
-      const recentVolAvg = ((parseFloat(latest[7]) || 0) + (parseFloat(prev15m[7]) || 0)) / 2;
-      let baselineSum = 0;
-      const baselineCount = klines.length - 2;
-      for (let i = 0; i < baselineCount; i++) {
-        baselineSum += (parseFloat(klines[i][7]) || 0);
-      }
-      const baselineVolAvg = baselineCount > 0 ? (baselineSum / baselineCount) : 1;
-      const rvol = baselineVolAvg > 0 ? (recentVolAvg / baselineVolAvg) : 1.0;
-
-      return {
-        change15mPct: Number(change15mPct.toFixed(2)),
-        change1hPct: Number(change1hPct.toFixed(2)),
-        change4hPct: Number(change4hPct.toFixed(2)),
-        rvol: Number(Math.min(15, Math.max(0.2, rvol)).toFixed(2))
-      };
-    }
-  } catch (e) {}
-  return { change15mPct: 0, change1hPct: 0, change4hPct: 0, rvol: 1.0 };
-}
-
-// -------------------------------------------------------------
-// INNOVATION 1: "TIME MACHINE" BREAKOUT ODDS REPLAY ENGINE
-// -------------------------------------------------------------
-async function evaluateTimeMachineBreakoutOdds(symbol) {
-  try {
-    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
-    if (!Array.isArray(klines) || klines.length < 20) {
-      return { pass: true, winOddsPct: 55, setupsTested: 0, reason: 'Insufficient history, bypass' };
-    }
-
-    let setupsTested = 0;
-    let wins = 0;
-    let losses = 0;
-
-    // Scan the historical 15m bars for breakout ignition triggers
-    for (let i = 4; i < klines.length - 4; i++) {
-      const open = parseFloat(klines[i][1]) || 0;
-      const high = parseFloat(klines[i][2]) || 0;
-      const low = parseFloat(klines[i][3]) || 0;
-      const close = parseFloat(klines[i][4]) || 0;
-      const vol = parseFloat(klines[i][5]) || 0;
-
-      const prevVol = (parseFloat(klines[i - 1][5]) + parseFloat(klines[i - 2][5])) / 2;
-      const barGainPct = open > 0 ? ((close - open) / open) * 100 : 0;
-
-      // Identify breakout candles (gain >= 1.2% with volume >= 1.3x baseline)
-      if (barGainPct >= 1.20 && vol >= prevVol * 1.3) {
-        setupsTested++;
-        let reachedTarget = false;
-        let reachedInvalidation = false;
-
-        // Replay next 4 to 6 candles (1 to 1.5 hours forward)
-        for (let f = i + 1; f <= Math.min(i + 5, klines.length - 1); f++) {
-          const forwardHigh = parseFloat(klines[f][2]) || close;
-          const forwardLow = parseFloat(klines[f][3]) || close;
-
-          const gainFromBreakout = ((forwardHigh - close) / close) * 100;
-          const dropFromBreakout = ((forwardLow - close) / close) * 100;
-
-          if (gainFromBreakout >= 1.80) {
-            reachedTarget = true;
-            break;
-          }
-          if (dropFromBreakout <= -2.80) {
-            reachedInvalidation = true;
-            break;
-          }
-        }
-
-        if (reachedTarget) wins++;
-        else if (reachedInvalidation) losses++;
-      }
-    }
-
-    const winOddsPct = setupsTested > 0 ? Math.round((wins / setupsTested) * 100) : 60;
-    State.subsystems.timeMachine.lastEvaluatedSymbol = symbol;
-    State.subsystems.timeMachine.lastWinOddsPct = winOddsPct;
-    State.subsystems.timeMachine.replaysCompleted++;
-
-    if (setupsTested >= 2 && winOddsPct < 45) {
-      State.subsystems.timeMachine.blockedCount++;
-      return {
-        pass: false,
-        winOddsPct,
-        setupsTested,
-        reason: `Time Machine Win Odds too low (${winOddsPct}% < 45% over ${setupsTested} historical breakouts)`
-      };
-    }
-
-    return { pass: true, winOddsPct, setupsTested, reason: `Time Machine Odds Verified (${winOddsPct}%)` };
-  } catch (err) {
-    return { pass: true, winOddsPct: 50, setupsTested: 0, reason: 'Time Machine error bypass' };
-  }
-}
-
-// -------------------------------------------------------------
-// INNOVATION 2: CONFIRMED CLOSED-BAR & UPPER-WICK REJECTION GATE
-// -------------------------------------------------------------
-async function checkConfirmedClosedBar(symbol) {
-  try {
-    const klines = await fetchFromBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=3`);
-    if (!Array.isArray(klines) || klines.length < 2) {
-      return { pass: true, reason: 'Bypass on insufficient bars' };
-    }
-
-    const prevClosed = klines[klines.length - 2];
-    const open = parseFloat(prevClosed[1]) || 0;
-    const high = parseFloat(prevClosed[2]) || 0;
-    const low = parseFloat(prevClosed[3]) || 0;
-    const close = parseFloat(prevClosed[4]) || 0;
-
-    const totalRange = high - low;
-    if (totalRange <= 0) return { pass: true };
-
-    const upperWick = high - Math.max(open, close);
-    const upperWickRatio = upperWick / totalRange;
-
-    // Reject candles where upper wick is > 40% of the entire candle (shooting star/rejection)
-    if (upperWickRatio > 0.40) {
-      return {
-        pass: false,
-        upperWickRatio: Number(upperWickRatio.toFixed(2)),
-        reason: `Upper wick rejection trap (${Math.round(upperWickRatio * 100)}% wick > 40% ceiling)`
-      };
-    }
-
-    // Must have closed positive or tight consolidation
-    if (close < open && Math.abs((close - open) / open) > 0.012) {
-      return {
-        pass: false,
-        upperWickRatio: Number(upperWickRatio.toFixed(2)),
-        reason: `Previous 15m candle closed red (-${(((open - close) / open) * 100).toFixed(2)}%)`
-      };
-    }
-
-    return { pass: true, upperWickRatio: Number(upperWickRatio.toFixed(2)), reason: 'Confirmed Bullish Close' };
-  } catch (err) {
-    return { pass: true, reason: 'Bypass on check error' };
-  }
-}
-
-async function evaluateBtcMacroStatus() {
-  try {
-    const [shortTerm, book] = await Promise.all([
-      fetchShortTermMomentum('BTCUSDT'),
-      fetchRealOrderBookDepth('BTCUSDT')
-    ]);
-
-    const vwapPremium = State.universe['BTCUSDT']?.vwapPremiumPct || 0;
-    const c15m = shortTerm?.change15mPct || 0;
-    const c1h = shortTerm?.change1hPct || 0;
-    const obi = book ? book.obi : 0.52;
-
-    let allowAltcoins = true;
-    let reason = 'BTC trend healthy';
-
-    if (c15m <= -0.35 && c1h < 0) {
-      allowAltcoins = false;
-      reason = `BTC 15m flush (${c15m >= 0 ? '+' : ''}${c15m}%) - Altcoin gate locked`;
-    } else if (c1h <= -1.00) {
-      allowAltcoins = false;
-      reason = `BTC 1h macro downtrend (${c1h}%) - Altcoin gate locked`;
-    } else if (obi < 0.40 && c15m < -0.15) {
-      allowAltcoins = false;
-      reason = `BTC bid book thin (${Math.round(obi * 100)}% OBI) - Sympathetic drop caution`;
-    }
-
-    State.subsystems.btcMacroGate = {
-      status: allowAltcoins ? 'NORMAL' : 'BLOCKED',
-      btcChange15m: c15m,
-      btcChange1h: c1h,
-      btcVwapPremium: vwapPremium,
-      allowAltcoinEntries: allowAltcoins,
-      reason,
-      lastChecked: Date.now()
-    };
-    return State.subsystems.btcMacroGate;
-  } catch (e) {
-    return { allowAltcoinEntries: true, reason: 'BTC check bypass on network glitch' };
-  }
-}
-
-function calculateAccurateINRPrice(usdtPrice, rate) {
-  const rawINR = usdtPrice * rate;
-  if (rawINR >= 100) return Math.round(rawINR * 100) / 100;
-  if (rawINR >= 1) return Math.round(rawINR * 10000) / 10000;
-  return Number(rawINR.toFixed(8));
-}
-
-function formatBinanceUSDTPrice(usdtPrice) {
-  const num = Number(usdtPrice) || 0;
-  if (num >= 100) return Number(num.toFixed(2));
-  if (num >= 1) return Number(num.toFixed(4));
-  return Number(num.toFixed(8));
-}
-
-const MONTH_MAP = {
-  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
-  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
-};
-
-function parseIstDateTimeToEpoch(dateStr, timeStr) {
-  let day, month, year;
-  const dClean = String(dateStr || '').trim();
-
-  const alphaMatch = dClean.match(/([a-zA-Z]{3,9})/);
-  if (alphaMatch) {
-    const monthKey = alphaMatch[1].slice(0, 3).toLowerCase();
-    if (MONTH_MAP[monthKey] !== undefined) {
-      month = MONTH_MAP[monthKey];
-      const numbers = dClean.match(/\d+/g);
-      if (numbers && numbers.length >= 2) {
-        if (numbers[0].length === 4) {
-          year = parseInt(numbers[0], 10);
-          day = parseInt(numbers[1], 10);
-        } else {
-          day = parseInt(numbers[0], 10);
-          year = parseInt(numbers[1].length === 4 ? numbers[1] : (numbers[2] || numbers[1]), 10);
-        }
-      }
-    }
-  } else if (dClean.includes('/') || dClean.includes('-')) {
-    const parts = dClean.split(/[\/\-]/);
-    if (parts.length === 3) {
-      if (parts[0].length === 4) {
-        year = parseInt(parts[0], 10);
-        month = parseInt(parts[1], 10) - 1;
-        day = parseInt(parts[2], 10);
-      } else {
-        day = parseInt(parts[0], 10);
-        month = parseInt(parts[1], 10) - 1;
-        year = parseInt(parts[2], 10);
-      }
-    }
-  }
-
-  if (!year || isNaN(year) || !day || isNaN(day) || month === undefined || isNaN(month)) {
-    return 0;
-  }
-  if (year < 100) year += 2000;
-
-  let hours = 0, minutes = 0, seconds = 0;
-  const tClean = String(timeStr || '').trim().toUpperCase();
-  const isPM = tClean.includes('PM');
-  const isAM = tClean.includes('AM');
-  const timeNums = tClean.match(/\d+/g);
-  if (timeNums && timeNums.length >= 2) {
-    hours = parseInt(timeNums[0], 10);
-    minutes = parseInt(timeNums[1], 10);
-    if (timeNums.length >= 3) {
-      seconds = parseInt(timeNums[2], 10);
-    }
-    if (isPM && hours < 12) hours += 12;
-    if (isAM && hours === 12) hours = 0;
-  }
-
-  const istOffsetMs = (5 * 60 + 30) * 60 * 1000;
-  return Date.UTC(year, month, day, hours, minutes, seconds) - istOffsetMs;
-}
-
-function parseTradeTimestamp(trade) {
-  if (!trade) return 0;
-
-  if (trade.date && typeof trade.date === 'string') {
-    const dateClean = trade.date.trim();
-    const timeClean = String(trade.time || '12:00:00 AM').trim();
-
-    if (!dateClean.includes('1899') && !dateClean.includes('1970')) {
-      const parsedMs = parseIstDateTimeToEpoch(dateClean, timeClean);
-      if (parsedMs > 1700000000000 && parsedMs < 2500000000000) {
-        return parsedMs;
-      }
-    }
-  }
-
-  let numId = Number(String(trade.id || '').replace(/[^0-9]/g, ''));
-  if (!isNaN(numId) && numId > 1700000000000 && numId < 2500000000000) {
-    return numId;
-  }
-
-  if (!isNaN(numId) && numId > 1700000000 && numId < 2500000000) {
-    return numId * 1000;
-  }
-
-  return 0;
-}
-
-function cleanAndNormalizeDateString(rawDate, rawTime, timestampId) {
-  const dateStr = String(rawDate || '').trim();
-  const timeStr = String(rawTime || '').trim();
-
-  const isCorrupted = !dateStr || 
-    dateStr.includes('1899') || 
-    dateStr.includes('1970') || 
-    dateStr.includes('GMT') || 
-    dateStr.length > 25;
-
-  let validTimestamp = Number(timestampId);
-  const isProperEpochMs = !isNaN(validTimestamp) && validTimestamp > 1700000000000 && validTimestamp < 2100000000000;
-
-  if (isCorrupted || !isProperEpochMs) {
-    const fallbackDate = isProperEpochMs ? new Date(validTimestamp) : new Date();
-    
-    const formattedDate = fallbackDate.toLocaleDateString('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric'
-    });
-
-    const formattedTime = timeStr && !timeStr.includes('1899') && !timeStr.includes('GMT') 
-      ? timeStr 
-      : fallbackDate.toLocaleTimeString('en-IN', {
-          timeZone: 'Asia/Kolkata',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hour12: true
-        });
-
-    return { date: formattedDate, time: formattedTime };
-  }
-
-  if (dateStr.includes('T') || dateStr.includes('-')) {
-    const parsed = new Date(dateStr);
-    if (!isNaN(parsed.getTime()) && parsed.getFullYear() > 2020) {
-      const cleanDate = parsed.toLocaleDateString('en-IN', {
-        timeZone: 'Asia/Kolkata',
-        day: '2-digit',
-        month: 'short',
-        year: 'numeric'
-      });
-      return { date: cleanDate, time: timeStr || parsed.toLocaleTimeString('en-IN') };
-    }
-  }
-
-  return { date: dateStr, time: timeStr };
-}
-
-// -------------------------------------------------------------
-// STRICT 5-POINT TRADE RECORD VALIDATOR (ZERO-GHOST GATE)
-// -------------------------------------------------------------
-function isValidTradeRecord(t) {
-  if (!t || typeof t !== 'object') return false;
-
-  const rawPair = String(t.pair || t.Pair || t.symbol || t.Symbol || t.asset || '').trim().toUpperCase();
-  // Reject missing, non-USDT, or generic placeholder tokens
-  if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair.includes('CRYPTO') || rawPair === 'UNKNOWN/USDT' || rawPair === 'UNDEFINED/USDT' || !rawPair.includes('USDT')) {
-    return false;
-  }
-
-  const entry = Number(t.entryPriceUSDT || t['Entry Price (USDT)'] || t.entryPrice || t.entry || 0);
-  const exit = Number(t.exitPriceUSDT || t['Exit Price (USDT)'] || t.exitPrice || t.exit || 0);
-
-  // Reject zero/negative prices
-  if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) {
-    return false;
-  }
-
-  // Reject entries without any valid action/type
-  const rawType = String(t.type || t.Type || t.action || '').trim().toUpperCase();
-  if (!rawType || rawType === 'UNDEFINED' || rawType === 'NULL') {
-    return false;
-  }
-
-  return true;
-}
-
-// -------------------------------------------------------------
-// STRICT TRADE HISTORY SANITIZATION & GHOST-ROW PURGER
-// -------------------------------------------------------------
-function sanitizeAndAuditTradeHistory(logs) {
-  if (!Array.isArray(logs)) return [];
-  
-  const map = new Map();
-  logs.forEach(l => {
-    if (!isValidTradeRecord(l)) return;
-
-    const rawPair = String(l.pair || l.Pair || l.symbol || l.Symbol || l.asset || '').trim().toUpperCase();
-    let entryUSDT = Number(l.entryPriceUSDT || l['Entry Price (USDT)'] || l.entryPrice || l.entry || 0);
-    let exitUSDT = Number(l.exitPriceUSDT || l['Exit Price (USDT)'] || l.exitPrice || l.exit || 0);
-
-    const parsedEpoch = parseTradeTimestamp(l);
-    let id = parsedEpoch > 0 ? parsedEpoch : Number(l.id);
-    if (!id || isNaN(id) || id < 1000000) {
-      id = Date.now() - (25 * 60 * 60 * 1000);
-    }
-    l.id = id;
-
-    const { date, time } = cleanAndNormalizeDateString(l.date, l.time, id);
-    l.date = date;
-    l.time = time;
-    l.pair = rawPair.endsWith('USDT') && !rawPair.includes('/') ? `${rawPair.replace('USDT', '')}/USDT` : rawPair;
-
-    let pnlUSDT = 0;
-    if (typeof l.pnlUSDT === 'number' && !isNaN(l.pnlUSDT)) {
-      pnlUSDT = l.pnlUSDT;
-    } else if (typeof l.pnlINR === 'number' && !isNaN(l.pnlINR)) {
-      pnlUSDT = l.pnlINR / State.usdtToInrRate;
-    } else {
-      pnlUSDT = (exitUSDT - entryUSDT) * ((Number(l.notionalUSDT) || 50.00) / entryUSDT);
-    }
-
-    if (Math.abs(pnlUSDT) > 5.0) {
-      pnlUSDT = pnlUSDT / State.usdtToInrRate;
-    }
-
-    if (l.pair && l.pair.includes('PEPE') && exitUSDT > 0.001) {
-      exitUSDT = exitUSDT / State.usdtToInrRate;
-      entryUSDT = entryUSDT / State.usdtToInrRate;
-    }
-
-    l.pnlUSDT = Number(pnlUSDT.toFixed(4));
-    l.pnlINR = Number((pnlUSDT * State.usdtToInrRate).toFixed(2));
-    l.entryPriceUSDT = formatBinanceUSDTPrice(entryUSDT);
-    l.exitPriceUSDT = formatBinanceUSDTPrice(exitUSDT);
-    l.notionalUSDT = Number(l.notionalUSDT) || 50.00;
-    l.type = String(l.type || l.Type || 'EXIT').trim().toUpperCase();
-    l.regime = l.regime || 'BALANCED';
-    l.volatilityPct = typeof l.volatilityPct === 'number' ? l.volatilityPct : 4.5;
-
-    // Deduplicate by pair + timestamp ID
-    const dedupKey = `${l.pair}_${l.id}`;
-    map.set(dedupKey, l);
-  });
-
-  return Array.from(map.values()).sort((a, b) => b.id - a.id);
-}
-
-function recalculateTrueRealizedPnL() {
-  let trueSumUSDT = 0;
-  State.tradeLogs.forEach(l => {
-    if (typeof l.pnlUSDT === 'number' && !isNaN(l.pnlUSDT)) {
-      trueSumUSDT += l.pnlUSDT;
-    }
-  });
-  State.portfolio.realizedPnL = Number(trueSumUSDT.toFixed(4));
-}
-
-function reconcileRollingTradeQuotaFromHistory() {
-  const now = Date.now();
-  const dayAgo = now - (24 * 60 * 60 * 1000);
-  const timestamps = new Set();
-  const vipTimestamps = new Set();
-
-  State.tradeLogs.forEach(l => {
-    const tradeTs = parseTradeTimestamp(l);
-    if (tradeTs > 0 && tradeTs > dayAgo && tradeTs <= now) {
-      timestamps.add(tradeTs);
-      if (l.type && l.type.includes('VIP')) {
-        vipTimestamps.add(tradeTs);
-      }
-    }
-  });
-
-  Object.values(State.activePositions || {}).forEach(pos => {
-    const openTs = Number(pos.openedAt);
-    if (!isNaN(openTs) && openTs > dayAgo && openTs <= now) {
-      timestamps.add(openTs);
-      if (pos.isVipAlpha) {
-        vipTimestamps.add(openTs);
-      }
-    }
-  });
-
-  State.tradeFrequencyController.rollingTrades24h = Array.from(timestamps).sort((a, b) => a - b);
-  State.tradeFrequencyController.vipTrades24h = Array.from(vipTimestamps).sort((a, b) => a - b);
-
-  syncRollingTradeQuota();
 }
 
 function saveStateToDisk() {
@@ -865,119 +404,12 @@ function saveStateToDisk() {
     State.subsystems.persistence.lastSaveTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
     State.subsystems.persistence.retainedTradesCount = cleanLogs.length;
     State.subsystems.persistence.status = 'SYNCED';
+
+    // Periodically back up portfolio JSON to Google Drive
+    backupPortfolioStateToGoogleDrive().catch(() => {});
   } catch (err) {
     State.subsystems.persistence.status = 'ERROR';
   }
-}
-
-function normalizeSheetTrade(raw) {
-  if (!raw || typeof raw !== 'object') return null;
-  
-  const getField = (keys) => {
-    for (const k of keys) {
-      if (raw[k] !== undefined && raw[k] !== null && String(raw[k]).trim() !== '') {
-        return raw[k];
-      }
-    }
-    return '';
-  };
-
-  const rawPair = String(getField(['pair', 'Pair', 'symbol', 'Symbol', 'asset', 'Asset'])).trim().toUpperCase();
-  if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair.includes('CRYPTO') || rawPair === 'UNKNOWN/USDT' || !rawPair.includes('USDT')) {
-    return null;
-  }
-
-  const entry = Number(getField(['entryPriceUSDT', 'Entry Price (USDT)', 'entryPrice', 'Entry Price', 'entry', 'Entry']));
-  const exit = Number(getField(['exitPriceUSDT', 'Exit Price (USDT)', 'exitPrice', 'Exit Price', 'exit', 'Exit']));
-
-  if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) {
-    return null;
-  }
-
-  const pnlUSDT = Number(getField(['pnlUSDT', 'PnL (USDT)', 'pnl', 'PnL', 'profit', 'Profit'])) || 0;
-  const pnlINR = Number(getField(['pnlINR', 'PnL (INR)', 'pnlInr'])) || (pnlUSDT * (State.usdtToInrRate || 94.94));
-  const notional = Number(getField(['notionalUSDT', 'Notional (USDT)', 'notional'])) || 50.00;
-  const pair = rawPair.includes('/') ? rawPair : `${rawPair.replace('USDT', '')}/USDT`;
-
-  return {
-    id: Number(getField(['id', 'ID', 'Id'])) || Date.now(),
-    date: String(getField(['date', 'Date', 'tradeDate', 'Trade Date'])) || 'Recent',
-    time: String(getField(['time', 'Time', 'tradeTime', 'Trade Time'])) || '',
-    pair,
-    type: String(getField(['type', 'Type', 'action', 'Action'])) || 'EXIT',
-    entryPriceUSDT: formatBinanceUSDTPrice(entry),
-    exitPriceUSDT: formatBinanceUSDTPrice(exit),
-    notionalUSDT: notional,
-    pnlUSDT: Number(pnlUSDT.toFixed(4)),
-    pnlINR: Number(pnlINR.toFixed(2)),
-    reason: String(getField(['reason', 'Reason', 'notes', 'Notes'])) || 'Settled by quant engine',
-    regime: String(getField(['regime', 'Regime'])) || 'BALANCED',
-    volatilityPct: Number(getField(['volatilityPct', 'Volatility %'])) || 4.5
-  };
-}
-
-async function syncWithGoogleDrive() {
-  const targetUrl = State.googleSheetUrl;
-  if (!targetUrl) return;
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    const res = await fetch(targetUrl, {
-      method: 'GET',
-      redirect: 'follow',
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-    if (res.ok) {
-      const data = await res.json();
-      const rawList = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
-      
-      if (rawList.length > 0) {
-        const validSheetTrades = [];
-        rawList.forEach(item => {
-          const normalized = normalizeSheetTrade(item);
-          if (normalized && isValidTradeRecord(normalized)) {
-            validSheetTrades.push(normalized);
-          }
-        });
-
-        // Deduplicate and retain only strictly verified trades
-        State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
-        recalculateTrueRealizedPnL();
-        reconcileRollingTradeQuotaFromHistory();
-      }
-
-      State.subsystems.persistence.googleSheetSync = 'ACTIVE';
-      saveStateToDisk();
-      broadcastState();
-    }
-  } catch (err) {}
-}
-
-async function appendTradeToGoogleDrive(tradeLog) {
-  const targetUrl = State.googleSheetUrl;
-  if (!targetUrl || !tradeLog) return;
-  
-  // Strict guard: Never write empty or placeholder records to Google Sheets
-  if (!isValidTradeRecord(tradeLog)) return;
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-    const res = await fetch(targetUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(tradeLog),
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-    
-    if (res.ok) {
-      State.subsystems.persistence.googleSheetSync = 'SYNCED';
-    }
-  } catch (err) {}
 }
 
 function loadStateFromDisk() {
@@ -985,1250 +417,40 @@ function loadStateFromDisk() {
     if (fs.existsSync(STATE_FILE)) {
       const raw = fs.readFileSync(STATE_FILE, 'utf-8');
       const parsed = JSON.parse(raw);
-      if (parsed.portfolio && typeof parsed.portfolio === 'object') {
-        State.portfolio = { ...State.portfolio, ...parsed.portfolio };
-      }
-      if (parsed.activePositions && typeof parsed.activePositions === 'object') {
-        State.activePositions = parsed.activePositions;
-      }
-      if (parsed.recoveryBags && typeof parsed.recoveryBags === 'object') {
-        State.recoveryBags = parsed.recoveryBags;
-      }
-      if (Array.isArray(parsed.tradeLogs)) {
-        State.tradeLogs = sanitizeAndAuditTradeHistory(parsed.tradeLogs);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.portfolio) State.portfolio = { ...State.portfolio, ...parsed.portfolio };
+        if (parsed.activePositions) State.activePositions = parsed.activePositions;
+        if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
+        if (Array.isArray(parsed.tradeLogs)) {
+          State.tradeLogs = sanitizeAndAuditTradeHistory(parsed.tradeLogs);
+        }
+        if (parsed.cooldowns) State.cooldowns = parsed.cooldowns;
+        if (parsed.tradeFrequencyController) {
+          State.tradeFrequencyController = { ...State.tradeFrequencyController, ...parsed.tradeFrequencyController };
+        }
+        if (parsed.autopilotEnabled !== undefined) State.autopilotEnabled = parsed.autopilotEnabled;
+        if (parsed.usdtToInrRate) State.usdtToInrRate = parsed.usdtToInrRate;
+        if (parsed.googleSheetUrl) State.googleSheetUrl = parsed.googleSheetUrl;
+
         recalculateTrueRealizedPnL();
-      }
-      if (typeof parsed.autopilotEnabled === 'boolean') {
-        State.autopilotEnabled = parsed.autopilotEnabled;
-      }
-      if (parsed.cooldowns && typeof parsed.cooldowns === 'object') {
-        State.cooldowns = parsed.cooldowns;
-      }
-      if (parsed.tradeFrequencyController && Array.isArray(parsed.tradeFrequencyController.rollingTrades24h)) {
-        State.tradeFrequencyController = parsed.tradeFrequencyController;
-      }
-      if (typeof parsed.usdtToInrRate === 'number' && parsed.usdtToInrRate >= 85) {
-        State.usdtToInrRate = parsed.usdtToInrRate;
-      }
-      if (parsed.p2pLastUpdated) {
-        State.p2pLastUpdated = parsed.p2pLastUpdated;
-      }
-      if (parsed.googleSheetUrl) {
-        State.googleSheetUrl = parsed.googleSheetUrl;
+        reconcileRollingTradeQuotaFromHistory();
+        console.log(`[Disk Loader] Restored ${State.tradeLogs.length} verified trades from disk.`);
       }
     }
-    reconcileRollingTradeQuotaFromHistory();
-  } catch (err) {}
-}
-
-loadStateFromDisk();
-syncWithGoogleDrive();
-syncBinanceP2PUsdtInrRate();
-
-// -------------------------------------------------------------
-// 24-HOUR ROLLING TRADE QUOTA MANAGER
-// -------------------------------------------------------------
-function syncRollingTradeQuota() {
-  const now = Date.now();
-  const dayAgo = now - (24 * 60 * 60 * 1000);
-  
-  State.tradeFrequencyController.rollingTrades24h = (State.tradeFrequencyController.rollingTrades24h || [])
-    .filter(ts => typeof ts === 'number' && !isNaN(ts) && ts > dayAgo && ts <= now)
-    .sort((a, b) => a - b);
-
-  State.tradeFrequencyController.vipTrades24h = (State.tradeFrequencyController.vipTrades24h || [])
-    .filter(ts => typeof ts === 'number' && !isNaN(ts) && ts > dayAgo && ts <= now)
-    .sort((a, b) => a - b);
-
-  const isBypassActive = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
-  const isDynamicGovernor = Boolean(State.tradeFrequencyController.dynamicGovernorEnabled);
-
-  const freeCash = Number(State.portfolio.cashUSDT || 0);
-  const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
-  const cashFloor = State.tradeFrequencyController.cashReserveFloorUSDT || 300.00;
-  const maxBags = State.tradeFrequencyController.maxRecoveryBagsLimit || 6;
-
-  let governorTier = 'UNLIMITED_SPRINT';
-  let canExecuteTrades = true;
-
-  if (freeCash < cashFloor || activeBagsCount >= maxBags) {
-    governorTier = 'LIQUIDITY_FREEZE';
-    canExecuteTrades = false;
-  } else if (freeCash < 600 || activeBagsCount >= 4) {
-    governorTier = 'SOFT_THROTTLE';
-    canExecuteTrades = true;
-  } else {
-    governorTier = 'UNLIMITED_SPRINT';
-    canExecuteTrades = true;
-  }
-
-  State.tradeFrequencyController.governorTier = governorTier;
-
-  let currentStreak = 0;
-  let rollingNetGainUSDT = 0;
-  const recentLogs24h = State.tradeLogs.filter(l => {
-    const ts = parseTradeTimestamp(l);
-    return ts > dayAgo && ts <= now;
-  });
-
-  for (const log of recentLogs24h) {
-    const pnl = Number(log.pnlUSDT || 0);
-    rollingNetGainUSDT += pnl;
-    if (pnl > 0.05) {
-      currentStreak++;
-    } else if (pnl < -0.05) {
-      break;
-    }
-  }
-
-  let bonusSlots = 0;
-  let streakReason = 'BASELINE';
-
-  if (currentStreak >= 5 && rollingNetGainUSDT >= 2.00) {
-    bonusSlots = 4;
-    streakReason = 'SUPER_STREAK (+4 SLOTS)';
-  } else if (currentStreak >= 3 && rollingNetGainUSDT >= 0.80) {
-    bonusSlots = 2;
-    streakReason = 'HOT_STREAK (+2 SLOTS)';
-  } else {
-    bonusSlots = 0;
-    streakReason = 'BASELINE';
-  }
-
-  const isUncapped = isBypassActive || isDynamicGovernor;
-  const baseMax = State.tradeFrequencyController.baseMaxTradesPer24h || 8;
-  const dynamicMaxAllowed = isUncapped ? 9999 : (baseMax + bonusSlots);
-
-  State.tradeFrequencyController.bonusSlotsEarned = bonusSlots;
-  State.tradeFrequencyController.consecutiveWinStreak = currentStreak;
-  State.tradeFrequencyController.streakBonusReason = streakReason;
-  State.tradeFrequencyController.maxTradesPer24h = dynamicMaxAllowed;
-
-  const count = State.tradeFrequencyController.rollingTrades24h.length;
-  const remaining = isUncapped 
-    ? (canExecuteTrades ? 999 : 0) 
-    : Math.max(0, dynamicMaxAllowed - count);
-
-  const vipUsed = State.tradeFrequencyController.vipTrades24h.length;
-  const vipMax = State.tradeFrequencyController.vipAlphaSlotsAllowed || 2;
-  const vipRemaining = isUncapped ? 999 : Math.max(0, vipMax - vipUsed);
-  State.tradeFrequencyController.vipAlphaSlotsUsed24h = vipUsed;
-
-  let resetTimeMin = 0;
-  let nextReleaseTimestamp = 0;
-  let formattedReset = isUncapped 
-    ? `GOVERNOR: ${governorTier} (Cash: $${freeCash.toFixed(0)}, Bags: ${activeBagsCount}/${maxBags})` 
-    : 'All Slots Open';
-
-  if (count > 0 && !isUncapped) {
-    const oldest = Math.min(...State.tradeFrequencyController.rollingTrades24h);
-    nextReleaseTimestamp = oldest + (24 * 60 * 60 * 1000);
-    const msRemaining = Math.max(0, nextReleaseTimestamp - now);
-    resetTimeMin = Math.ceil(msRemaining / 60000);
-    const hrs = Math.floor(resetTimeMin / 60);
-    const mins = resetTimeMin % 60;
-    
-    if (msRemaining <= 0) {
-      formattedReset = 'Slot Freeing Up...';
-    } else if (remaining === 0) {
-      formattedReset = hrs > 0 ? `Next Slot in ${hrs}h ${mins}m` : `Next Slot in ${mins}m`;
-    } else {
-      formattedReset = hrs > 0 ? `+1 Slot in ${hrs}h ${mins}m (${remaining} open)` : `+1 Slot in ${mins}m (${remaining} open)`;
-    }
-  }
-
-  State.tradeFrequencyController.nextSlotReleaseTimestamp = nextReleaseTimestamp;
-  State.tradeFrequencyController.globalCircuitBreakerUntil = 0;
-
-  if (isUncapped) {
-    State.tradeFrequencyController.circuitBreakerReason = canExecuteTrades ? 'NORMAL' : 'LIQUIDITY_FLOOR_HOLD';
-    State.subsystems.quotaManager.status = governorTier;
-  } else if (remaining === 0 && vipRemaining > 0) {
-    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
-    State.subsystems.quotaManager.status = 'VIP_ALPHA_SNIPER_ACTIVE';
-  } else if (remaining === 0 && vipRemaining === 0) {
-    State.tradeFrequencyController.circuitBreakerReason = 'QUOTA_EXHAUSTED';
-    State.subsystems.quotaManager.status = 'QUOTA_FILLED';
-  } else {
-    State.tradeFrequencyController.circuitBreakerReason = 'NORMAL';
-    State.subsystems.quotaManager.status = 'NORMAL';
-  }
-
-  State.subsystems.quotaManager.quotaBypassEnabled = isUncapped;
-  State.subsystems.quotaManager.dynamicGovernorEnabled = isDynamicGovernor;
-  State.subsystems.quotaManager.governorTier = governorTier;
-  State.subsystems.quotaManager.cashReserveFloorUSDT = cashFloor;
-  State.subsystems.quotaManager.maxRecoveryBagsLimit = maxBags;
-  State.subsystems.quotaManager.executed24hCount = count;
-  State.subsystems.quotaManager.maxAllowed = isUncapped ? 'UNLIMITED' : dynamicMaxAllowed;
-  State.subsystems.quotaManager.baseMaxAllowed = baseMax;
-  State.subsystems.quotaManager.bonusSlotsEarned = bonusSlots;
-  State.subsystems.quotaManager.consecutiveWinStreak = currentStreak;
-  State.subsystems.quotaManager.streakBonusReason = streakReason;
-  State.subsystems.quotaManager.quotaRemaining = isUncapped ? (canExecuteTrades ? '∞' : '0 (HOLD)') : remaining;
-  State.subsystems.quotaManager.vipSlotsRemaining = isUncapped ? '∞' : vipRemaining;
-  State.subsystems.quotaManager.vipSlotsUsed = vipUsed;
-  State.subsystems.quotaManager.resetOldestSlotInMin = resetTimeMin;
-  State.subsystems.quotaManager.nextSlotReleaseTimestamp = nextReleaseTimestamp;
-  State.subsystems.quotaManager.formattedReset = formattedReset;
-  State.subsystems.quotaManager.circuitBreakerRemainingSec = 0;
-}
-
-// -------------------------------------------------------------
-// DISCOVERY SCREENER
-// -------------------------------------------------------------
-async function runDynamicMarketScreener() {
-  State.subsystems.screener.status = 'SCANNING';
-  try {
-    const tickers = await fetchFromBinance('/api/v3/ticker/24hr');
-    if (!Array.isArray(tickers) || tickers.length === 0) {
-      State.subsystems.screener.status = 'IDLE';
-      scheduleNextScreenerRun();
-      return;
-    }
-
-    State.subsystems.screener.scannedPairsCount = tickers.length;
-    const candidates = [];
-    const activeSymbols = [...Object.keys(State.activePositions), ...Object.keys(State.recoveryBags)];
-
-    const isCompression = (State.marketRegime === 'COMPRESSION');
-    const isStarved = (State.tradeFrequencyController.pacingMode === 'STARVED');
-
-    for (const t of tickers) {
-      if (!t.symbol.endsWith('USDT')) continue;
-      const base = t.symbol.slice(0, -4);
-      if (['UP', 'DOWN', 'BEAR', 'BULL', 'USDC', 'FDUSD', 'TUSD', 'EUR', 'DAI', 'USDP', 'BUSD', 'PAXG', 'WBTC'].includes(base)) continue;
-
-      const quoteVol = parseFloat(t.quoteVolume) || 0;
-      const lastPrice = parseFloat(t.lastPrice) || 0;
-      const priceChangePct = parseFloat(t.priceChangePercent) || 0;
-      const highPrice = parseFloat(t.highPrice) || 0;
-      const lowPrice = parseFloat(t.lowPrice) || 0;
-      const vwapPrice = parseFloat(t.weightedAvgPrice) || lastPrice;
-
-      if (lastPrice <= 0 || highPrice <= lowPrice) continue;
-
-      const pricePositionInRange = (lastPrice - lowPrice) / (highPrice - lowPrice);
-      const intradayRangePct = ((highPrice - lowPrice) / lowPrice) * 100;
-      const vwapPremiumPct = vwapPrice > 0 ? ((lastPrice - vwapPrice) / vwapPrice) * 100 : 0;
-
-      if (lastPrice <= 0 || highPrice <= lowPrice) continue;
-
-      // 4-Point Loss Prevention: Block Parabolic Climax Tops (>18% 24h pump or apex >0.90 of range)
-      if (priceChangePct >= 18.0 || pricePositionInRange >= 0.90) continue;
-
-      let requiredFloor = 10000000;
-      if (priceChangePct >= 5.0 && vwapPremiumPct >= 2.5 && pricePositionInRange >= 0.72) {
-        requiredFloor = 3500000;
-      } else if (priceChangePct >= 2.5 || vwapPremiumPct >= 1.5) {
-        requiredFloor = 5000000;
-      } else if (isCompression || isStarved) {
-        requiredFloor = 4500000;
-      }
-
-      if (quoteVol >= requiredFloor) {
-        const minPositionRatio = (isCompression || isStarved) ? 0.48 : 0.54;
-        if (pricePositionInRange < minPositionRatio) continue;
-
-        const liquidityDensityScore = Math.min(22, Math.log10(quoteVol) * 3.0);
-        const rangeProximityBoost = pricePositionInRange * 16;
-        const directionalMomentum = Math.max(0, priceChangePct) * 2.4;
-        const vwapBreakoutBoost = Math.max(0, vwapPremiumPct) * 3.2;
-
-        const breakoutScore = directionalMomentum + vwapBreakoutBoost + liquidityDensityScore + rangeProximityBoost;
-
-        candidates.push({
-          symbol: t.symbol,
-          baseAsset: base,
-          priceUSDT: formatBinanceUSDTPrice(lastPrice),
-          priceINR: calculateAccurateINRPrice(lastPrice, State.usdtToInrRate),
-          priceChangePct,
-          vwapPremiumPct: Number(vwapPremiumPct.toFixed(2)),
-          intradayRangePct,
-          pricePositionInRange,
-          volumeM: Number((quoteVol / 1000000).toFixed(1)),
-          breakoutScore,
-          isActive: activeSymbols.includes(t.symbol)
-        });
-      }
-    }
-
-    State.subsystems.screener.qualifiedCandidatesCount = candidates.length;
-    State.subsystems.screener.liquidityFloorUSD = 'High-Sustain ($3.5M-$12M)';
-
-    const activeCandidates = candidates.filter(c => c.isActive);
-    const nonActiveSorted = candidates
-      .filter(c => !c.isActive)
-      .sort((a, b) => b.breakoutScore - a.breakoutScore);
-
-    const stage2PoolSize = Math.max(0, 15 - activeCandidates.length);
-    const stage2Pool = [...activeCandidates, ...nonActiveSorted.slice(0, stage2PoolSize)];
-
-    for (const p of stage2Pool) {
-      const shortTerm = await fetchShortTermMomentum(p.symbol);
-      p.change15mPct = shortTerm.change15mPct;
-      p.change1hPct = shortTerm.change1hPct;
-      p.change4hPct = shortTerm.change4hPct;
-      p.rvol = shortTerm.rvol;
-
-      if (p.change4hPct < -4.0 && p.change15mPct > 0) {
-        p.breakoutScore -= 12;
-      }
-
-      if (p.change15mPct >= 1.5 && p.change1hPct >= 0) p.breakoutScore += (p.change15mPct * 4.5);
-      if (p.change1hPct >= 1.0) p.breakoutScore += (p.change1hPct * 2.5);
-      if (p.change4hPct >= 2.0) p.breakoutScore += (p.change4hPct * 1.2);
-      if (p.rvol >= 1.8 && (p.change15mPct > 0.5 || p.change1hPct > 1.0)) {
-        p.breakoutScore += Math.min(18, (p.rvol - 1.0) * 5.0);
-      }
-    }
-
-    stage2Pool.sort((a, b) => b.breakoutScore - a.breakoutScore);
-    const topPicks = stage2Pool.slice(0, 10);
-
-    if (topPicks.length > 0) {
-      const updatedUniverse = {};
-
-      activeSymbols.forEach(sym => {
-        if (State.universe[sym]) {
-          updatedUniverse[sym] = { ...State.universe[sym] };
-        } else {
-          const pos = State.activePositions[sym] || State.recoveryBags[sym];
-          if (pos) {
-            const base = pos.pairSymbol || sym.replace('USDT', '');
-            updatedUniverse[sym] = {
-              name: base,
-              symbol: base,
-              priceUSDT: pos.livePriceUSDT || pos.entryPriceUSDT,
-              priceINR: calculateAccurateINRPrice(pos.livePriceUSDT || pos.entryPriceUSDT, State.usdtToInrRate),
-              score: 80,
-              direction: 'BUY',
-              obi: 0.55,
-              cvd: 3.5,
-              volumeM: 10,
-              source: 'ACTIVE_HOLD_ANCHOR',
-              reasoning: 'Active or Recovery position anchored in universe',
-              verifiedAt: Date.now()
-            };
-          }
-        }
-      });
-
-      topPicks.forEach(c => {
-        if (!updatedUniverse[c.symbol]) {
-          const existing = State.universe[c.symbol];
-          const isSpike = (c.change15mPct >= 2.0 || c.change1hPct >= 4.0) && c.rvol >= 1.6;
-          updatedUniverse[c.symbol] = {
-            name: c.baseAsset,
-            symbol: c.baseAsset,
-            priceUSDT: c.priceUSDT,
-            priceINR: c.priceINR,
-            priceChangePct: c.priceChangePct,
-            vwapPremiumPct: c.vwapPremiumPct || 0,
-            change15mPct: c.change15mPct || 0,
-            change1hPct: c.change1hPct || 0,
-            change4hPct: c.change4hPct || 0,
-            rvol: c.rvol || 1.0,
-            isSpikeCandidate: isSpike,
-            intradayRangePct: c.intradayRangePct,
-            pricePositionInRange: c.pricePositionInRange,
-            volumeM: c.volumeM,
-            score: existing ? existing.score : 78,
-            direction: existing ? existing.direction : 'BUY',
-            obi: existing ? existing.obi : 0.55,
-            cvd: existing ? existing.cvd : 3.5,
-            source: 'QUANT_ALGO',
-            reasoning: `${isSpike ? '🚀 SPIKE IGNITION | ' : ''}15m: ${c.change15mPct >= 0 ? '+' : ''}${(c.change15mPct || 0).toFixed(1)}%, 1h: ${c.change1hPct >= 0 ? '+' : ''}${(c.change1hPct || 0).toFixed(1)}%, RVOL: ${(c.rvol || 1).toFixed(1)}x ($${c.volumeM}M Vol)`,
-            verifiedAt: Date.now()
-          };
-        }
-      });
-
-      State.universe = updatedUniverse;
-      broadcastPricesOnly();
-    }
-
-    State.subsystems.screener.status = 'ACTIVE';
-    State.subsystems.screener.lastRunTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-
-    await runPureQuantScoring();
   } catch (err) {
-    State.subsystems.screener.status = 'ERROR';
-  } finally {
-    scheduleNextScreenerRun();
+    console.error('[Disk Loader Error]', err.message);
   }
-}
-
-function scheduleNextScreenerRun() {
-  if (screenerTimerHandle) clearTimeout(screenerTimerHandle);
-  nextScreenerTargetTimestamp = Date.now() + screenerIntervalMs;
-  screenerTimerHandle = setTimeout(runDynamicMarketScreener, screenerIntervalMs);
-}
-
-// -------------------------------------------------------------
-// VOLATILITY REGIME & MICROSTRUCTURE SCORING
-// -------------------------------------------------------------
-function calculateMarketVolatilityRegime() {
-  const ranges = Object.values(State.universe)
-    .map(u => Number(u.intradayRangePct) || 4.5)
-    .filter(r => r > 0)
-    .sort((a, b) => a - b);
-
-  let medianRange = 4.5;
-  if (ranges.length > 0) {
-    const mid = Math.floor(ranges.length / 2);
-    medianRange = ranges.length % 2 !== 0 ? ranges[mid] : (ranges[mid - 1] + ranges[mid]) / 2;
-  }
-  medianRange = Number(medianRange.toFixed(2));
-
-  const now = Date.now();
-  const sixHoursAgo = now - (6 * 60 * 60 * 1000);
-  const twelveHoursAgo = now - (12 * 60 * 60 * 1000);
-  const tradesLast6h = (State.tradeFrequencyController.rollingTrades24h || []).filter(ts => ts > sixHoursAgo).length;
-  const tradesLast12h = (State.tradeFrequencyController.rollingTrades24h || []).filter(ts => ts > twelveHoursAgo).length;
-
-  let pacingMode = 'BALANCED';
-  let pacingGateOffset = 0;
-
-  if (tradesLast6h === 0) {
-    pacingMode = 'STARVED';
-    pacingGateOffset = -2;
-    screenerIntervalMs = 60 * 1000;
-  } else if (tradesLast12h >= 5) {
-    pacingMode = 'SATURATED';
-    pacingGateOffset = 2;
-    screenerIntervalMs = 120 * 1000;
-  } else {
-    pacingMode = 'BALANCED';
-    pacingGateOffset = 0;
-    screenerIntervalMs = 75 * 1000;
-  }
-
-  State.tradeFrequencyController.pacingMode = pacingMode;
-  State.subsystems.quotaManager.pacingMode = pacingMode;
-  State.subsystems.screener.cadenceSec = Math.round(screenerIntervalMs / 1000);
-
-  let regime = 'BALANCED';
-  let baseScore = 80;
-  let baseObi = 0.55;
-  let maxSpread = 0.10;
-
-  if (medianRange <= 4.0) {
-    regime = 'COMPRESSION';
-    baseScore = 78;
-    baseObi = 0.54;
-    maxSpread = 0.10;
-  } else if (medianRange >= 9.5) {
-    regime = 'TURBULENT';
-    baseScore = 83;
-    baseObi = 0.57;
-    maxSpread = 0.08;
-  }
-
-  const finalScoreGate = Math.max(75, Math.min(86, baseScore + pacingGateOffset));
-
-  State.marketRegime = regime;
-  State.activeThresholds = {
-    regime,
-    pacingMode,
-    scoreThreshold: finalScoreGate,
-    obiThreshold: baseObi,
-    maxSpread,
-    cooldownMinutes: 15,
-    marketAvgRange: medianRange,
-    pacingGateOffset,
-    vipScoreThreshold: 87,
-    vipObiThreshold: 0.58
-  };
-
-  State.subsystems.regimeController = {
-    status: 'CALIBRATED',
-    currentRegime: regime,
-    marketAvgVolatilityPct: medianRange,
-    liveScoreGate: finalScoreGate,
-    liveObiGatePct: Math.round(baseObi * 100),
-    liveMaxSpreadPct: maxSpread,
-    lastAdjustmentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
-  };
-
-  return State.activeThresholds;
-}
-
-async function runPureQuantScoring() {
-  try {
-    const regimeConfig = calculateMarketVolatilityRegime();
-    const symbols = Object.keys(State.universe);
-
-    for (const sym of symbols) {
-      const coin = State.universe[sym];
-      if (!coin) continue;
-
-      const [book, shortTerm] = await Promise.all([
-        fetchRealOrderBookDepth(sym),
-        fetchShortTermMomentum(sym)
-      ]);
-
-      const obi = book ? book.obi : (coin.obi || 0.55);
-      const spreadPct = book ? book.spreadPct : 0.05;
-
-      coin.obi = Number(obi.toFixed(2));
-      coin.spreadPct = Number(spreadPct.toFixed(3));
-      coin.change15mPct = shortTerm.change15mPct;
-      coin.change1hPct = shortTerm.change1hPct;
-      coin.change4hPct = shortTerm.change4hPct;
-      coin.rvol = shortTerm.rvol;
-
-      const sObi = Math.max(0, Math.min(40, (obi - 0.40) * 145));
-
-      const c24 = Number(coin.priceChangePct) || 0;
-      const c1h = Number(coin.change1hPct) || 0;
-      const c15m = Number(coin.change15mPct) || 0;
-      const effectiveMom = Math.max(
-        c24,
-        (c1h * 2.4) + (c15m * 3.8),
-        (c15m * 5.0)
-      );
-      const sMom = Math.max(0, Math.min(38, (effectiveMom + 2.5) * 3.6));
-
-      const volM = Math.max(1, Number(coin.volumeM) || 5);
-      const rvolBoost = coin.rvol >= 1.5 ? Math.min(10, (coin.rvol - 1.0) * 4.5) : 0;
-      const sVol = Math.min(25, (Math.log10(volM) * 7.2) + rvolBoost);
-
-      const isSpike = (c15m >= 1.8 || c1h >= 3.8) && coin.rvol >= 1.6;
-      const spikeBonus = isSpike ? 6 : 0;
-      coin.isSpikeCandidate = isSpike;
-
-      const rawScore = Math.round(sObi + sMom + sVol + spikeBonus);
-      coin.score = Math.max(45, Math.min(98, rawScore));
-      coin.cvd = Number(((obi - 0.50) * 120 + (c15m * 2.5)).toFixed(1));
-
-      if (coin.score >= 82) coin.direction = 'STRONG BUY';
-      else if (coin.score >= 74) coin.direction = 'BUY';
-      else if (coin.score >= 60) coin.direction = 'NEUTRAL';
-      else coin.direction = 'WEAK';
-
-      coin.reasoning = `${isSpike ? '🚀 SPIKE IGNITION | ' : ''}15m: ${c15m >= 0 ? '+' : ''}${c15m.toFixed(1)}%, 1h: ${c1h >= 0 ? '+' : ''}${c1h.toFixed(1)}%, RVOL: ${coin.rvol.toFixed(1)}x, OBI: ${Math.round(obi * 100)}% ($${coin.volumeM}M Vol)`;
-      coin.verifiedAt = Date.now();
-    }
-
-    const nowStr = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-    State.subsystems.microstructure.cyclesCompleted++;
-    State.subsystems.microstructure.lastCycleTime = nowStr;
-    State.subsystems.microstructure.evaluatedUniverseSize = symbols.length;
-    State.quantTelemetry.lastAnalysisTime = nowStr;
-
-    await evaluateBtcMacroStatus();
-    await evaluateAutopilotEntries(regimeConfig);
-    broadcastPricesOnly();
-  } catch (err) {}
-}
-
-// -------------------------------------------------------------
-// AUTOPILOT ENTRY MATRIX
-// -------------------------------------------------------------
-async function evaluateAutopilotEntries(regimeConfig) {
-  if (!State.autopilotEnabled) return;
-
-  syncRollingTradeQuota();
-
-  const currentActiveCount = Object.keys(State.activePositions).length;
-  if (currentActiveCount >= (State.tradeFrequencyController.maxConcurrentPositions || 2)) return;
-
-  if (State.warmupCycles < 1) return;
-
-  const freeCash = Number(State.portfolio.cashUSDT || 0);
-  const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
-  const cashFloor = State.tradeFrequencyController.cashReserveFloorUSDT || 300.00;
-  const maxBags = State.tradeFrequencyController.maxRecoveryBagsLimit || 6;
-
-  // Calculate dynamic trade notional size based on compounding percentage
-  const sizingMode = State.portfolio.sizingMode || 'PERCENTAGE';
-  const allocPct = Number(State.portfolio.allocationPct || 15);
-  let nextTradeNotional = 50.00;
-
-  if (sizingMode === 'PERCENTAGE') {
-    nextTradeNotional = Math.max(15.00, Math.round((freeCash * (allocPct / 100)) * 100) / 100);
-  } else {
-    nextTradeNotional = Number(State.portfolio.fixedNotionalUSDT || 50.00);
-  }
-
-  // Adaptive reserve floor: does not exceed 30% of current cash
-  const effectiveCashFloor = Math.min(cashFloor, freeCash * 0.30);
-  if (freeCash < (effectiveCashFloor + nextTradeNotional) || freeCash < nextTradeNotional) return;
-  if (activeBagsCount >= maxBags) return;
-
-  const btcGate = State.subsystems.btcMacroGate || { allowAltcoinEntries: true };
-  const config = regimeConfig || State.activeThresholds;
-  const isBypassActive = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
-  const isDynamicGov = Boolean(State.tradeFrequencyController.dynamicGovernorEnabled);
-  const standardQuotaAvailable = isBypassActive || isDynamicGov || (State.subsystems.quotaManager.quotaRemaining > 0);
-  const vipSlotsRemaining = (isBypassActive || isDynamicGov) ? 999 : (State.subsystems.quotaManager.vipSlotsRemaining || 0);
-
-  if (!standardQuotaAvailable && vipSlotsRemaining <= 0) return;
-
-  const sortedCandidates = Object.keys(State.universe)
-    .filter(k => !State.activePositions[k] && !State.recoveryBags[k])
-    .sort((a, b) => (State.universe[b].score || 0) - (State.universe[a].score || 0));
-
-  for (const sym of sortedCandidates) {
-    const coin = State.universe[sym];
-    if (!coin || !coin.score) continue;
-
-    if (sym !== 'BTCUSDT' && !btcGate.allowAltcoinEntries) continue;
-
-    // 1. Anti-Churn Serial Re-entry Lockout (90-Minute Cooldown after position closure)
-    if (State.cooldowns[sym]) {
-      const cdObj = typeof State.cooldowns[sym] === 'object'
-        ? State.cooldowns[sym]
-        : { until: Number(State.cooldowns[sym]) || 0, reason: 'Cooldown' };
-      const remaining = cdObj.until - Date.now();
-      if (remaining > 0) continue;
-      delete State.cooldowns[sym];
-    }
-
-    // 2. Parabolic Extension & Climax Top Filter (e.g., HAEDAL +35% pump-and-dump trap)
-    if (coin.priceChangePct >= 18.0 || (coin.pricePositionInRange !== undefined && coin.pricePositionInRange >= 0.90)) {
-      continue;
-    }
-
-    const book = await fetchRealOrderBookDepth(sym);
-    if (!book) continue;
-
-    // 3. Retest-Only Confirmation Gate (Never buy the apex of a green expansion candle)
-    const isApexChasing = (coin.change15mPct >= 3.0 && (coin.pricePositionInRange || 0.8) > 0.85 && book.obi < 0.60);
-    if (isApexChasing) continue;
-
-    if (coin.change15mPct >= 2.5 && coin.vwapPremiumPct > 2.5 && book.obi < 0.62) {
-      continue; // Wait for pullback/retest of VWAP support before entry
-    }
-
-    const isMacroDowntrend = (coin.change1hPct < -0.8 && coin.change4hPct < -3.5);
-    if (isMacroDowntrend) continue;
-
-    if (coin.vwapPremiumPct !== undefined && coin.vwapPremiumPct < -0.5) continue;
-
-    const isSubCent = (coin.priceUSDT && coin.priceUSDT < 0.01);
-    const isLowDollarAlt = (coin.priceUSDT && coin.priceUSDT >= 0.01 && coin.priceUSDT < 1.50);
-    const isHighVelocitySpike = Boolean(coin.isSpikeCandidate || coin.change15mPct >= 2.0 || coin.change1hPct >= 4.0);
-
-    let allowedSpread = config.maxSpread;
-    if (isSubCent) allowedSpread = 0.35;
-    else if (isHighVelocitySpike) allowedSpread = 0.25;
-    else if (isLowDollarAlt) allowedSpread = 0.20;
-
-    if (book.spreadPct > allowedSpread) continue;
-    if (!coin.priceUSDT || coin.priceUSDT <= 0) continue;
-    if (!coin.verifiedAt || (Date.now() - coin.verifiedAt) > 30000) continue;
-
-    // -------------------------------------------------------------
-    // INNOVATION 2 INTEGRATION: CONFIRMED CLOSED BAR GATE
-    // -------------------------------------------------------------
-    const closedBarCheck = await checkConfirmedClosedBar(sym);
-    if (!closedBarCheck.pass) {
-      continue; // Block entry into upper-wick exhaustion candles
-    }
-
-    // -------------------------------------------------------------
-    // INNOVATION 1 INTEGRATION: TIME MACHINE WIN-ODDS REPLAY
-    // -------------------------------------------------------------
-    const timeMachineCheck = await evaluateTimeMachineBreakoutOdds(sym);
-    if (!timeMachineCheck.pass) {
-      continue; // Block coins with poor historical breakout continuation
-    }
-
-    const mtfConfirmed = (coin.change1hPct >= 0.2 || coin.vwapPremiumPct >= 1.0);
-    if (standardQuotaAvailable && coin.score >= config.scoreThreshold && book.obi >= config.obiThreshold && mtfConfirmed) {
-      executeSpotBuy(
-        sym, 
-        coin.priceUSDT, 
-        `High-Sustain Confluence (Odds: ${timeMachineCheck.winOddsPct}%, Score ${coin.score}, OBI ${(book.obi * 100).toFixed(0)}%, 15m +${(coin.change15mPct || 0).toFixed(1)}%)`,
-        false
-      );
-      break;
-    }
-
-    const isVerifiedIgnition = isHighVelocitySpike && (coin.rvol || 1) >= 1.8 && (coin.pricePositionInRange || 0.6) >= 0.70 && (coin.change15mPct <= 5.5);
-    if (standardQuotaAvailable && isVerifiedIgnition && coin.score >= (config.scoreThreshold - 2) && book.obi >= 0.54) {
-      executeSpotBuy(
-        sym,
-        coin.priceUSDT,
-        `🚀 High-Sustain Ignition (${sym}: Odds ${timeMachineCheck.winOddsPct}%, 15m +${(coin.change15mPct || 0).toFixed(1)}%, RVOL ${(coin.rvol || 1).toFixed(1)}x)`,
-        false
-      );
-      break;
-    }
-
-    if (!standardQuotaAvailable && vipSlotsRemaining > 0) {
-      const isExtremeMomentum = (coin.change15mPct >= 3.0 && coin.change1hPct >= 4.0 && coin.priceChangePct >= 10.0);
-      const isExtremeConfluence = (coin.score >= (config.vipScoreThreshold || 88) && book.obi >= (config.vipObiThreshold || 0.60));
-
-      if (isExtremeMomentum && isExtremeConfluence) {
-        executeSpotBuy(
-          sym,
-          coin.priceUSDT,
-          `⚡ VIP Alpha Override: God-Candle Breakout! Score ${coin.score}, Odds ${timeMachineCheck.winOddsPct}%`,
-          true
-        );
-        break;
-      }
-    }
-  }
-}
-
-// -------------------------------------------------------------
-// SPOT BUY EXECUTION WITH INNOVATION 3: VOLATILITY-NORMALIZED SIZING
-// -------------------------------------------------------------
-function executeSpotBuy(pairKey, priceUSDT, reason, isVipAlpha = false) {
-  const freeCash = Number(State.portfolio.cashUSDT || 0);
-  const sizingMode = State.portfolio.sizingMode || 'PERCENTAGE';
-  const allocPct = Number(State.portfolio.allocationPct || 15);
-
-  let baseNotional = 50.00;
-  if (sizingMode === 'PERCENTAGE') {
-    baseNotional = Math.max(15.00, Math.round((freeCash * (allocPct / 100)) * 100) / 100);
-    if (baseNotional > freeCash) baseNotional = Math.floor(freeCash * 100) / 100;
-  } else {
-    baseNotional = Math.min(freeCash, Number(State.portfolio.fixedNotionalUSDT || 50.00));
-  }
-
-  // -------------------------------------------------------------
-  // INNOVATION 3: VOLATILITY-NORMALIZED RISK BUDGETING
-  // Scale down hyper-volatile tokens, scale up stable trends
-  // -------------------------------------------------------------
-  const baselineVol = State.activeThresholds?.marketAvgRange || 4.5;
-  const coinVol = State.universe[pairKey]?.intradayRangePct || baselineVol;
-  const volFactor = Number(Math.min(1.25, Math.max(0.40, baselineVol / Math.max(2.5, coinVol))).toFixed(2));
-
-  let notionalUSDT = Math.round(baseNotional * volFactor * 100) / 100;
-  notionalUSDT = Math.max(15.00, Math.min(freeCash, notionalUSDT));
-
-  State.subsystems.volatilityBudget.lastAdjustmentFactor = volFactor;
-
-  // Guard against insufficient funds or sub-minimum notional
-  if (notionalUSDT < 10.00 || freeCash < notionalUSDT) return;
-
-  const qty = notionalUSDT / priceUSDT;
-
-  State.portfolio.cashUSDT = Math.max(0, Math.round((State.portfolio.cashUSDT - notionalUSDT) * 100) / 100);
-
-  const tp1 = formatBinanceUSDTPrice(priceUSDT * 1.018);
-
-  State.activePositions[pairKey] = {
-    pairKey,
-    pairSymbol: State.universe[pairKey]?.symbol || pairKey.replace('USDT', ''),
-    entryPriceUSDT: priceUSDT,
-    qty,
-    notionalUSDT,
-    volFactor,
-    tp1,
-    sl: formatBinanceUSDTPrice(priceUSDT * 0.95),
-    openedAt: Date.now(),
-    isTrailingActive: false,
-    tp1Secured: false,
-    highWatermarkUSDT: priceUSDT,
-    retestGraceUntil: Date.now() + (20 * 60 * 1000),
-    isVipAlpha
-  };
-
-  State.portfolio.holdings[pairKey] = {
-    symbol: State.universe[pairKey]?.symbol || pairKey.replace('USDT', ''),
-    qty,
-    avgBuyPriceUSDT: priceUSDT,
-    totalCostUSDT: notionalUSDT
-  };
-
-  State.tradeFrequencyController.rollingTrades24h.push(Date.now());
-  if (isVipAlpha) {
-    State.tradeFrequencyController.vipTrades24h.push(Date.now());
-  }
-
-  syncRollingTradeQuota();
-  saveStateToDisk();
-  broadcastState();
-}
-
-// -------------------------------------------------------------
-// SPOT RECOVERY BAG TRANSFER (ZERO REALIZED LOSS)
-// -------------------------------------------------------------
-function moveToRecoveryBag(pairKey, transferReason) {
-  const pos = State.activePositions[pairKey];
-  if (!pos) return;
-
-  const targetExitPriceUSDT = formatBinanceUSDTPrice(pos.entryPriceUSDT * 1.0030);
-
-  State.recoveryBags[pairKey] = {
-    pairKey,
-    pairSymbol: pos.pairSymbol || pairKey.replace('USDT', ''),
-    entryPriceUSDT: pos.entryPriceUSDT,
-    qty: pos.qty,
-    notionalUSDT: pos.notionalUSDT,
-    targetExitPriceUSDT,
-    initialTargetPriceUSDT: targetExitPriceUSDT,
-    targetStep: 'STEP 1 (+0.30%)',
-    movedAt: Date.now(),
-    livePriceUSDT: pos.livePriceUSDT || pos.entryPriceUSDT,
-    gainPct: pos.gainPct || 0,
-    unrealizedPnLUSDT: pos.unrealizedPnLUSDT || 0,
-    ageHours: 0,
-    reason: transferReason
-  };
-
-  delete State.activePositions[pairKey];
-  State.subsystems.recoveryManager.activeRecoveryBagsCount = Object.keys(State.recoveryBags).length;
-
-  saveStateToDisk();
-  broadcastState();
-}
-
-function settleRecoveryBag(pairKey, exitPriceUSDT, reason) {
-  const bag = State.recoveryBags[pairKey];
-  if (!bag) return;
-
-  const finalValueUSDT = bag.qty * exitPriceUSDT;
-  const pnlUSDT = Number((finalValueUSDT - bag.notionalUSDT).toFixed(4));
-
-  State.portfolio.cashUSDT += finalValueUSDT;
-  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + pnlUSDT).toFixed(4));
-
-  delete State.portfolio.holdings[pairKey];
-  delete State.recoveryBags[pairKey];
-
-  // Enforce 90-Minute Anti-Churn Serial Re-entry Lockout
-  State.cooldowns[pairKey] = {
-    until: Date.now() + (90 * 60 * 1000),
-    reason: `90m Anti-Churn Lockout after Recovery Exit`
-  };
-
-  State.subsystems.recoveryManager.bagsResolvedWinCount++;
-  State.subsystems.recoveryManager.activeRecoveryBagsCount = Object.keys(State.recoveryBags).length;
-
-  const now = new Date();
-  const istTime = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-  const istDate = now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
-
-  const symbolClean = bag.pairSymbol || pairKey.replace('USDT', '');
-  const logEntry = {
-    id: Date.now(),
-    type: 'RECOVERY EXIT (ZERO LOSS)',
-    pair: `${symbolClean}/USDT`,
-    entryPriceUSDT: formatBinanceUSDTPrice(bag.entryPriceUSDT),
-    exitPriceUSDT: formatBinanceUSDTPrice(exitPriceUSDT),
-    notionalUSDT: bag.notionalUSDT,
-    pnlUSDT: pnlUSDT,
-    pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2)),
-    reason: reason || `Mean-reversion bounce filled target (+${(((exitPriceUSDT - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100).toFixed(2)}%)`,
-    time: istTime,
-    date: istDate,
-    regime: State.activeThresholds?.regime || 'BALANCED',
-    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
-  };
-
-  State.tradeLogs.unshift(logEntry);
-  if (State.tradeLogs.length > 500) State.tradeLogs.pop();
-
-  recalculateTrueRealizedPnL();
-  appendTradeToGoogleDrive(logEntry);
-  saveStateToDisk();
-  broadcastState();
-}
-
-function settlePartialPosition(pairKey, exitPriceUSDT, exitReason) {
-  const pos = State.activePositions[pairKey];
-  if (!pos || pos.tp1Secured) return;
-
-  const halfQty = pos.qty / 2;
-  const halfNotional = pos.notionalUSDT / 2;
-  const halfValUSDT = halfQty * exitPriceUSDT;
-  const pnlUSDT = Number((halfValUSDT - halfNotional).toFixed(4));
-
-  State.portfolio.cashUSDT += halfValUSDT;
-  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + pnlUSDT).toFixed(4));
-
-  if (pnlUSDT > 0.05) {
-    const contribution = Number((pnlUSDT * 0.35).toFixed(4));
-    State.portfolio.bagSubsidyPoolUSDT = Number(((State.portfolio.bagSubsidyPoolUSDT || 0) + contribution).toFixed(4));
-    State.subsystems.recoveryManager.subsidyPoolUSDT = State.portfolio.bagSubsidyPoolUSDT;
-  }
-
-  pos.qty = halfQty;
-  pos.notionalUSDT = halfNotional;
-  pos.tp1Secured = true;
-  pos.isTrailingActive = true;
-  pos.sl = pos.entryPriceUSDT * 1.0025;
-  pos.highWatermarkUSDT = Math.max(pos.highWatermarkUSDT || exitPriceUSDT, exitPriceUSDT);
-
-  if (State.portfolio.holdings[pairKey]) {
-    State.portfolio.holdings[pairKey].qty = halfQty;
-    State.portfolio.holdings[pairKey].totalCostUSDT = halfNotional;
-  }
-
-  const now = new Date();
-  const istTime = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-  const istDate = now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
-
-  const symbolClean = pos.pairSymbol || pairKey.replace('USDT', '');
-  const logEntry = {
-    id: Date.now(),
-    type: 'TP1 (50% BANKED)',
-    pair: `${symbolClean}/USDT`,
-    entryPriceUSDT: formatBinanceUSDTPrice(pos.entryPriceUSDT),
-    exitPriceUSDT: formatBinanceUSDTPrice(exitPriceUSDT),
-    notionalUSDT: halfNotional,
-    pnlUSDT,
-    pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2)),
-    reason: exitReason,
-    time: istTime,
-    date: istDate,
-    regime: State.activeThresholds?.regime || 'BALANCED',
-    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
-  };
-
-  State.tradeLogs.unshift(logEntry);
-  if (State.tradeLogs.length > 500) State.tradeLogs.pop();
-
-  recalculateTrueRealizedPnL();
-  appendTradeToGoogleDrive(logEntry);
-  syncRollingTradeQuota();
-  saveStateToDisk();
-  broadcastState();
-}
-
-function settlePosition(pairKey, exitType, exitPriceUSDT, exitReason) {
-  const pos = State.activePositions[pairKey];
-  if (!pos) return;
-
-  const finalValueUSDT = pos.qty * exitPriceUSDT;
-  const pnlUSDT = Number((finalValueUSDT - pos.notionalUSDT).toFixed(4));
-
-  State.portfolio.cashUSDT += finalValueUSDT;
-  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + pnlUSDT).toFixed(4));
-
-  if (pnlUSDT > 0.05) {
-    const contribution = Number((pnlUSDT * 0.35).toFixed(4));
-    State.portfolio.bagSubsidyPoolUSDT = Number(((State.portfolio.bagSubsidyPoolUSDT || 0) + contribution).toFixed(4));
-    State.subsystems.recoveryManager.subsidyPoolUSDT = State.portfolio.bagSubsidyPoolUSDT;
-  }
-
-  delete State.portfolio.holdings[pairKey];
-  delete State.activePositions[pairKey];
-
-  // Enforce 90-Minute Anti-Churn Serial Re-entry Lockout
-  State.cooldowns[pairKey] = {
-    until: Date.now() + (90 * 60 * 1000),
-    reason: `90m Anti-Churn Lockout after ${exitType}`
-  };
-
-  const now = new Date();
-  const istTime = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-  const istDate = now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
-
-  const symbolClean = pos.pairSymbol || pairKey.replace('USDT', '');
-  const logEntry = {
-    id: Date.now(),
-    type: exitType,
-    pair: `${symbolClean}/USDT`,
-    entryPriceUSDT: formatBinanceUSDTPrice(pos.entryPriceUSDT),
-    exitPriceUSDT: formatBinanceUSDTPrice(exitPriceUSDT),
-    notionalUSDT: pos.notionalUSDT,
-    pnlUSDT,
-    pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2)),
-    reason: exitReason,
-    time: istTime,
-    date: istDate,
-    regime: State.activeThresholds?.regime || 'BALANCED',
-    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5
-  };
-
-  State.tradeLogs.unshift(logEntry);
-  if (State.tradeLogs.length > 500) State.tradeLogs.pop();
-
-  recalculateTrueRealizedPnL();
-  syncRollingTradeQuota();
-
-  appendTradeToGoogleDrive(logEntry);
-  saveStateToDisk();
-  broadcastState();
-}
-
-// -------------------------------------------------------------
-// SENTRY & RISK MONITOR
-// -------------------------------------------------------------
-async function monitorOpenPositionsHealth() {
-  const openKeys = Object.keys(State.activePositions);
-  const recoveryKeys = Object.keys(State.recoveryBags);
-
-  State.subsystems.predictiveSentry.lastMonitorTick = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-  State.subsystems.predictiveSentry.activePositionsMonitored = openKeys.length;
-  State.subsystems.predictiveSentry.recoveryBagsMonitored = recoveryKeys.length;
-  State.subsystems.recoveryManager.activeRecoveryBagsCount = recoveryKeys.length;
-  State.subsystems.recoveryManager.subsidyPoolUSDT = State.portfolio.bagSubsidyPoolUSDT || 0;
-
-  let totalRecoveryCap = 0;
-  recoveryKeys.forEach(k => {
-    totalRecoveryCap += (State.recoveryBags[k]?.notionalUSDT || 50);
-  });
-  State.subsystems.recoveryManager.totalRecoveryCapitalUSDT = totalRecoveryCap;
-
-  for (const sym of recoveryKeys) {
-    const bag = State.recoveryBags[sym];
-    if (!bag) continue;
-
-    const ageHours = (Date.now() - (bag.movedAt || Date.now())) / (1000 * 60 * 60);
-    let live = bag.livePriceUSDT || State.universe[sym]?.priceUSDT || bag.entryPriceUSDT;
-    const gainFromEntryPct = ((live - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100;
-    bag.gainPct = Number(gainFromEntryPct.toFixed(2));
-    bag.unrealizedPnLUSDT = Number(((live - bag.entryPriceUSDT) * bag.qty).toFixed(4));
-    bag.ageHours = Number(ageHours.toFixed(1));
-
-    let dynamicTargetPrice = bag.entryPriceUSDT * 1.0030;
-    let stepName = 'STEP 1 (+0.30%)';
-
-    if (ageHours >= 24) {
-      dynamicTargetPrice = bag.entryPriceUSDT * 0.9850;
-      stepName = 'STEP 4 (-1.50% RECYCLE)';
-    } else if (ageHours >= 12) {
-      dynamicTargetPrice = bag.entryPriceUSDT * 0.9925;
-      stepName = 'STEP 3 (-0.75% RELIEF)';
-    } else if (ageHours >= 4) {
-      dynamicTargetPrice = bag.entryPriceUSDT * 1.0000;
-      stepName = 'STEP 2 (0.00% BREAKEVEN)';
-    }
-
-    bag.targetExitPriceUSDT = formatBinanceUSDTPrice(dynamicTargetPrice);
-    bag.targetStep = stepName;
-
-    // -------------------------------------------------------------
-    // 4. HARD DISASTER CAP (-6.50%): PREVENTS -21.90% HAEDAL TRAPS
-    // -------------------------------------------------------------
-    if (gainFromEntryPct <= -6.50) {
-      State.subsystems.recoveryManager.hardDisasterCutsCount = (State.subsystems.recoveryManager.hardDisasterCutsCount || 0) + 1;
-      settleRecoveryBag(
-        sym,
-        live,
-        `🚨 Hard Disaster Cap Executed: Cut at ${gainFromEntryPct.toFixed(2)}% to prevent deep capital lockup (capped loss)`
-      );
-      continue;
-    }
-
-    // Dynamic 15m VWAP Relief Exit for stale bags (>6h held)
-    if (ageHours >= 6 && live >= bag.entryPriceUSDT * 0.990) {
-      settleRecoveryBag(
-        sym,
-        live,
-        `Dynamic VWAP Relief Exit: Recycled after ${ageHours.toFixed(1)}h on relief bounce (${gainFromEntryPct >= 0 ? '+' : ''}${gainFromEntryPct.toFixed(2)}%)`
-      );
-      continue;
-    }
-
-    if (live >= bag.targetExitPriceUSDT) {
-      settleRecoveryBag(sym, live, `Stepped Target ${stepName} filled on relief bounce (${gainFromEntryPct >= 0 ? '+' : ''}${gainFromEntryPct.toFixed(2)}%)`);
-      continue;
-    }
-
-    const deficitUSDT = Math.abs(Math.min(0, bag.unrealizedPnLUSDT));
-    const subsidyPool = Number(State.portfolio.bagSubsidyPoolUSDT || 0);
-
-    if (ageHours >= 6 && deficitUSDT > 0 && subsidyPool >= deficitUSDT) {
-      State.portfolio.bagSubsidyPoolUSDT = Number((subsidyPool - deficitUSDT).toFixed(4));
-      State.subsystems.recoveryManager.bagsSubsidizedCount = (State.subsystems.recoveryManager.bagsSubsidizedCount || 0) + 1;
-      State.subsystems.recoveryManager.subsidyPoolUSDT = State.portfolio.bagSubsidyPoolUSDT;
-
-      settleRecoveryBag(
-        sym, 
-        live, 
-        `Self-Healing Subsidization: Stagnant bag cleared after ${ageHours.toFixed(1)}h using $${deficitUSDT.toFixed(2)} winner profits`
-      );
-      continue;
-    }
-  }
-
-  if (openKeys.length === 0) {
-    State.subsystems.predictiveSentry.trailingLocksActive = 0;
-    return;
-  }
-
-  for (const sym of openKeys) {
-    const pos = State.activePositions[sym];
-    if (!pos) continue;
-
-    let livePriceUSDT = pos.livePriceUSDT || State.universe[sym]?.priceUSDT || pos.entryPriceUSDT;
-    const gainPct = ((livePriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
-    pos.gainPct = Number(gainPct.toFixed(2));
-    pos.unrealizedPnLUSDT = Number(((livePriceUSDT - pos.entryPriceUSDT) * pos.qty).toFixed(4));
-    const holdSeconds = (Date.now() - pos.openedAt) / 1000;
-
-    if (!pos.highWatermarkUSDT || livePriceUSDT > pos.highWatermarkUSDT) {
-      pos.highWatermarkUSDT = livePriceUSDT;
-    }
-
-    if (livePriceUSDT >= pos.tp1 && !pos.tp1Secured) {
-      settlePartialPosition(sym, livePriceUSDT, `TP1 Banked (+${gainPct.toFixed(2)}%), runner active`);
-      continue;
-    }
-
-    if (pos.tp1Secured) {
-      const runnerTrailPrice = pos.highWatermarkUSDT * (1 - 0.012);
-      pos.sl = Math.max(pos.entryPriceUSDT * 1.0025, runnerTrailPrice);
-
-      if (livePriceUSDT <= pos.sl) {
-        settlePosition(sym, 'RUNNER EXIT', livePriceUSDT, `Runner trailed from peak ${formatBinanceUSDTPrice(pos.highWatermarkUSDT)} (+${gainPct.toFixed(2)}%)`);
-        continue;
-      }
-    } else {
-      // Hard Disaster Stop for active positions (-5.0% Emergency Safety Floor)
-      if (gainPct <= -5.00) {
-        settlePosition(sym, 'DISASTER STOP (-5.0%)', livePriceUSDT, `🚨 Hard active disaster stop triggered at ${gainPct.toFixed(2)}%`);
-        continue;
-      }
-
-      const book = await fetchRealOrderBookDepth(sym);
-      const isStrongSupport = Boolean(book && book.obi >= 0.46);
-
-      if (gainPct <= -3.20 || (gainPct <= -2.50 && !isStrongSupport)) {
-        pos.adverseDipTicks = (pos.adverseDipTicks || 0) + 1;
-        if (pos.adverseDipTicks >= 3) {
-          moveToRecoveryBag(sym, `Confirmed structural breakdown (${gainPct.toFixed(2)}%, OBI ${book ? Math.round(book.obi * 100) : 40}%) - Shifted to Recovery Bag`);
-          continue;
-        }
-      } else {
-        pos.adverseDipTicks = 0;
-      }
-
-      const isHealthyConsolidation = (gainPct >= -0.80 && gainPct < 0.30);
-      const stagnationLimitSec = isHealthyConsolidation ? 2700 : 1800;
-
-      if (holdSeconds >= stagnationLimitSec) {
-        moveToRecoveryBag(sym, `Stagnation after ${Math.round(holdSeconds / 60)}m (${gainPct.toFixed(2)}%) - Shifted to Recovery Bag`);
-        continue;
-      }
-    }
-  }
-}
-
-// -------------------------------------------------------------
-// LIVE BINANCE PRICE FEED
-// -------------------------------------------------------------
-async function syncLiveBinancePrices() {
-  try {
-    const list = await fetchFromBinance('/api/v3/ticker/price');
-    if (!Array.isArray(list)) return;
-
-    const priceMap = {};
-    list.forEach(i => { priceMap[i.symbol] = parseFloat(i.price); });
-
-    const openKeys = [...Object.keys(State.activePositions), ...Object.keys(State.recoveryBags)];
-    openKeys.forEach(sym => {
-      const live = priceMap[sym];
-      if (live && live > 0) {
-        const formatted = formatBinanceUSDTPrice(live);
-        const inr = calculateAccurateINRPrice(live, State.usdtToInrRate);
-
-        if (!State.universe[sym]) {
-          const base = sym.replace('USDT', '');
-          State.universe[sym] = {
-            name: base,
-            symbol: base,
-            priceUSDT: formatted,
-            priceINR: inr,
-            score: 80,
-            direction: 'BUY',
-            obi: 0.55,
-            cvd: 3.5,
-            volumeM: 10,
-            source: 'ACTIVE_HOLD_ANCHOR',
-            reasoning: 'Position retained in universe',
-            verifiedAt: Date.now()
-          };
-        } else {
-          State.universe[sym].priceUSDT = formatted;
-          State.universe[sym].priceINR = inr;
-          State.universe[sym].verifiedAt = Date.now();
-        }
-
-        const activePos = State.activePositions[sym];
-        if (activePos) {
-          activePos.livePriceUSDT = formatted;
-          activePos.unrealizedPnLUSDT = Number(((live - activePos.entryPriceUSDT) * activePos.qty).toFixed(4));
-          activePos.gainPct = Number((((live - activePos.entryPriceUSDT) / activePos.entryPriceUSDT) * 100).toFixed(2));
-        }
-
-        const bag = State.recoveryBags[sym];
-        if (bag) {
-          bag.livePriceUSDT = formatted;
-          bag.unrealizedPnLUSDT = Number(((live - bag.entryPriceUSDT) * bag.qty).toFixed(4));
-          bag.gainPct = Number((((live - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100).toFixed(2));
-        }
-      }
-    });
-
-    Object.keys(State.universe).forEach(sym => {
-      if (priceMap[sym]) {
-        const usdt = priceMap[sym];
-        State.universe[sym].priceUSDT = formatBinanceUSDTPrice(usdt);
-        State.universe[sym].priceINR = calculateAccurateINRPrice(usdt, State.usdtToInrRate);
-        State.universe[sym].verifiedAt = Date.now();
-      }
-    });
-
-    State.warmupCycles++;
-    await monitorOpenPositionsHealth();
-    syncRollingTradeQuota();
-
-    const remainingSec = Math.max(0, Math.round((nextScreenerTargetTimestamp - Date.now()) / 1000));
-    State.subsystems.screener.nextRunCountdownSec = remainingSec;
-
-    broadcastPricesOnly();
-  } catch (e) {}
 }
 
 function broadcastState() {
-  const cleanLogs = sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 100);
+  if (wss.clients.size === 0) return;
   const payload = JSON.stringify({
     type: 'STATE_UPDATE',
     portfolio: State.portfolio,
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
     universe: State.universe,
-    tradeLogs: cleanLogs,
-    quantTelemetry: State.quantTelemetry,
-    marketRegime: State.marketRegime,
-    activeThresholds: State.activeThresholds,
-    tradeFrequencyController: State.tradeFrequencyController,
-    subsystems: State.subsystems,
-    usdtToInrRate: State.usdtToInrRate,
-    p2pLastUpdated: State.p2pLastUpdated
-  });
-
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(payload);
-  });
-}
-
-function broadcastPricesOnly() {
-  const priceData = {};
-  Object.keys(State.universe).forEach(k => {
-    priceData[k] = {
-      priceINR: State.universe[k].priceINR,
-      priceUSDT: State.universe[k].priceUSDT,
-      score: State.universe[k].score,
-      direction: State.universe[k].direction,
-      obi: State.universe[k].obi,
-      change15mPct: State.universe[k].change15mPct || 0,
-      change1hPct: State.universe[k].change1hPct || 0,
-      rvol: State.universe[k].rvol || 1.0,
-      isSpikeCandidate: Boolean(State.universe[k].isSpikeCandidate),
-      volumeM: State.universe[k].volumeM || 0,
-      source: State.universe[k].source,
-      reasoning: State.universe[k].reasoning
-    };
-  });
-
-  const payload = JSON.stringify({
-    type: 'PRICE_TICK',
-    prices: priceData,
-    activePositions: State.activePositions,
-    recoveryBags: State.recoveryBags,
-    portfolio: State.portfolio,
+    tradeLogs: sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 80),
     quantTelemetry: State.quantTelemetry,
     marketRegime: State.marketRegime,
     activeThresholds: State.activeThresholds,
@@ -2236,113 +458,242 @@ function broadcastPricesOnly() {
     subsystems: State.subsystems,
     usdtToInrRate: State.usdtToInrRate,
     p2pLastUpdated: State.p2pLastUpdated,
-    syncTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
+    googleSheetUrl: State.googleSheetUrl,
+    learningEngineState: learningEngine.state
   });
 
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(payload);
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
   });
 }
 
-wss.on('connection', ws => {
-  ws.send(JSON.stringify({
-    type: 'INIT',
-    portfolio: State.portfolio,
-    activePositions: State.activePositions,
-    recoveryBags: State.recoveryBags,
-    universe: State.universe,
-    tradeLogs: sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 100),
-    quantTelemetry: State.quantTelemetry,
-    marketRegime: State.marketRegime,
-    activeThresholds: State.activeThresholds,
-    tradeFrequencyController: State.tradeFrequencyController,
-    subsystems: State.subsystems,
-    usdtToInrRate: State.usdtToInrRate,
-    p2pLastUpdated: State.p2pLastUpdated
-  }));
+// -------------------------------------------------------------
+// STRICT RECORD VALIDATOR & SANITIZER
+// -------------------------------------------------------------
+function isValidTradeRecord(t) {
+  if (!t || typeof t !== 'object') return false;
 
-  ws.on('message', msg => {
-    try {
-      const data = JSON.parse(msg.toString());
-      if (data.type === 'TOGGLE_AUTOPILOT') {
-        State.autopilotEnabled = Boolean(data.enabled);
-        saveStateToDisk();
-        broadcastState();
-      } else if (data.type === 'TOGGLE_QUOTA_BYPASS') {
-        State.tradeFrequencyController.quotaBypassEnabled = Boolean(data.bypass);
-        syncRollingTradeQuota();
-        saveStateToDisk();
-        broadcastState();
-      } else if (data.type === 'SET_DYNAMIC_GOVERNOR') {
-        State.tradeFrequencyController.dynamicGovernorEnabled = Boolean(data.enabled);
-        syncRollingTradeQuota();
-        saveStateToDisk();
-        broadcastState();
-      } else if (data.type === 'SET_CASH') {
-        const val = parseFloat(data.cashUSDT);
-        if (!isNaN(val) && val >= 0) {
-          State.portfolio.cashUSDT = Math.round(val * 100) / 100;
-          syncRollingTradeQuota();
-          saveStateToDisk();
-          broadcastState();
-        }
-      } else if (data.type === 'ADD_CASH') {
-        const delta = parseFloat(data.addUSDT);
-        if (!isNaN(delta)) {
-          State.portfolio.cashUSDT = Math.max(0, Math.round((State.portfolio.cashUSDT + delta) * 100) / 100);
-          syncRollingTradeQuota();
-          saveStateToDisk();
-          broadcastState();
-        }
-      } else if (data.type === 'SET_SIZING_CONFIG') {
-        if (data.sizingMode) State.portfolio.sizingMode = data.sizingMode;
-        const pct = parseFloat(data.allocationPct);
-        if (!isNaN(pct) && pct >= 1 && pct <= 100) {
-          State.portfolio.allocationPct = Math.round(pct * 10) / 10;
-        }
-        const fixed = parseFloat(data.fixedNotionalUSDT);
-        if (!isNaN(fixed) && fixed >= 15) {
-          State.portfolio.fixedNotionalUSDT = fixed;
-        }
-        saveStateToDisk();
-        broadcastState();
-      } else if (data.type === 'RECONCILE_QUOTA') {
-        State.tradeLogs = sanitizeAndAuditTradeHistory(State.tradeLogs);
-        recalculateTrueRealizedPnL();
-        reconcileRollingTradeQuotaFromHistory();
-        saveStateToDisk();
-        broadcastState();
-      } else if (data.type === 'CLOSE_POSITION' && data.pairKey) {
-        const livePriceUSDT = State.universe[data.pairKey]?.priceUSDT || State.activePositions[data.pairKey]?.entryPriceUSDT;
-        if (livePriceUSDT) settlePosition(data.pairKey, 'MANUAL EXIT', livePriceUSDT, 'Closed by user command');
-      } else if (data.type === 'CLOSE_RECOVERY_BAG' && data.pairKey) {
-        const livePriceUSDT = State.universe[data.pairKey]?.priceUSDT || State.recoveryBags[data.pairKey]?.entryPriceUSDT;
-        if (livePriceUSDT) settleRecoveryBag(data.pairKey, livePriceUSDT, 'Manual recovery exit by user command');
-      } else if (data.type === 'SYNC_P2P_RATE') {
-        syncBinanceP2PUsdtInrRate();
-      } else if (data.type === 'SET_GOOGLE_SHEET_URL' && data.url) {
-        State.googleSheetUrl = data.url.trim();
-        State.subsystems.persistence.googleSheetSync = 'CONNECTED';
-        saveStateToDisk();
-        syncWithGoogleDrive();
-      }
-    } catch (e) {}
+  const rawPair = String(t.pair || t.Pair || t.symbol || t.Symbol || t.asset || '').trim().toUpperCase();
+  if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair.includes('CRYPTO') || rawPair === 'UNKNOWN/USDT' || rawPair === 'UNDEFINED/USDT' || !rawPair.includes('USDT')) {
+    return false;
+  }
+
+  const entry = Number(t.entryPriceUSDT || t['Entry Price (USDT)'] || t.entryPrice || t.entry || 0);
+  const exit = Number(t.exitPriceUSDT || t['Exit Price (USDT)'] || t.exitPrice || t.exit || 0);
+
+  if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) {
+    return false;
+  }
+
+  const rawType = String(t.type || t.Type || t.action || '').trim().toUpperCase();
+  if (!rawType || rawType === 'UNDEFINED' || rawType === 'NULL') {
+    return false;
+  }
+
+  return true;
+}
+
+function sanitizeAndAuditTradeHistory(logs) {
+  if (!Array.isArray(logs)) return [];
+  
+  const map = new Map();
+  logs.forEach(l => {
+    if (!isValidTradeRecord(l)) return;
+
+    const rawPair = String(l.pair || l.Pair || l.symbol || l.Symbol || l.asset || '').trim().toUpperCase();
+    let entryUSDT = Number(l.entryPriceUSDT || l['Entry Price (USDT)'] || l.entryPrice || l.entry || 0);
+    let exitUSDT = Number(l.exitPriceUSDT || l['Exit Price (USDT)'] || l.exitPrice || l.exit || 0);
+
+    let id = Number(l.id) || Date.now();
+    l.id = id;
+    l.pair = rawPair.endsWith('USDT') && !rawPair.includes('/') ? `${rawPair.replace('USDT', '')}/USDT` : rawPair;
+
+    let pnlUSDT = 0;
+    if (typeof l.pnlUSDT === 'number' && !isNaN(l.pnlUSDT)) {
+      pnlUSDT = l.pnlUSDT;
+    } else if (typeof l.pnlINR === 'number' && !isNaN(l.pnlINR)) {
+      pnlUSDT = l.pnlINR / State.usdtToInrRate;
+    } else {
+      pnlUSDT = (exitUSDT - entryUSDT) * ((Number(l.notionalUSDT) || 50.00) / entryUSDT);
+    }
+
+    l.pnlUSDT = Number(pnlUSDT.toFixed(4));
+    l.pnlINR = Number((pnlUSDT * State.usdtToInrRate).toFixed(2));
+    l.entryPriceUSDT = formatBinanceUSDTPrice(entryUSDT);
+    l.exitPriceUSDT = formatBinanceUSDTPrice(exitUSDT);
+    l.notionalUSDT = Number(l.notionalUSDT) || 50.00;
+    l.type = String(l.type || l.Type || 'EXIT').trim().toUpperCase();
+
+    const dedupKey = `${l.pair}_${l.id}`;
+    map.set(dedupKey, l);
   });
+
+  return Array.from(map.values()).sort((a, b) => b.id - a.id);
+}
+
+function recalculateTrueRealizedPnL() {
+  let trueSumUSDT = 0;
+  State.tradeLogs.forEach(l => {
+    if (typeof l.pnlUSDT === 'number' && !isNaN(l.pnlUSDT)) {
+      trueSumUSDT += l.pnlUSDT;
+    }
+  });
+  State.portfolio.realizedPnL = Number(trueSumUSDT.toFixed(4));
+}
+
+function formatBinanceUSDTPrice(usdtPrice) {
+  const num = Number(usdtPrice) || 0;
+  if (num >= 100) return Number(num.toFixed(2));
+  if (num >= 1) return Number(num.toFixed(4));
+  return Number(num.toFixed(8));
+}
+
+function reconcileRollingTradeQuotaFromHistory() {
+  const now = Date.now();
+  const dayAgo = now - (24 * 60 * 60 * 1000);
+  const timestamps = new Set();
+
+  State.tradeLogs.forEach(l => {
+    const tradeTs = Number(l.id);
+    if (tradeTs > 0 && tradeTs > dayAgo && tradeTs <= now) {
+      timestamps.add(tradeTs);
+    }
+  });
+
+  State.tradeFrequencyController.rollingTrades24h = Array.from(timestamps).sort((a, b) => a - b);
+}
+
+function normalizeSheetTrade(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const getField = (keys) => {
+    for (const k of keys) {
+      if (raw[k] !== undefined && raw[k] !== null && String(raw[k]).trim() !== '') return raw[k];
+    }
+    return '';
+  };
+
+  const rawPair = String(getField(['pair', 'Pair', 'symbol', 'Symbol', 'asset'])).trim().toUpperCase();
+  if (!rawPair || rawPair === 'CRYPTO/USDT' || rawPair.includes('CRYPTO') || !rawPair.includes('USDT')) return null;
+
+  const entry = Number(getField(['entryPriceUSDT', 'Entry Price (USDT)', 'entryPrice', 'entry']));
+  const exit = Number(getField(['exitPriceUSDT', 'Exit Price (USDT)', 'exitPrice', 'exit']));
+  if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) return null;
+
+  const pnlUSDT = Number(getField(['pnlUSDT', 'PnL (USDT)', 'pnl'])) || 0;
+  const pnlINR = Number(getField(['pnlINR', 'PnL (INR)'])) || (pnlUSDT * (State.usdtToInrRate || 94.94));
+  const notional = Number(getField(['notionalUSDT', 'Notional (USDT)'])) || 50.00;
+  const pair = rawPair.includes('/') ? rawPair : `${rawPair.replace('USDT', '')}/USDT`;
+
+  return {
+    id: Number(getField(['id', 'ID'])) || Date.now(),
+    date: String(getField(['date', 'Date'])) || 'Recent',
+    time: String(getField(['time', 'Time'])) || '',
+    pair,
+    type: String(getField(['type', 'Type'])) || 'EXIT',
+    entryPriceUSDT: formatBinanceUSDTPrice(entry),
+    exitPriceUSDT: formatBinanceUSDTPrice(exit),
+    notionalUSDT: notional,
+    pnlUSDT: Number(pnlUSDT.toFixed(4)),
+    pnlINR: Number(pnlINR.toFixed(2)),
+    reason: String(getField(['reason', 'Reason'])) || 'Settled trade',
+    regime: String(getField(['regime', 'Regime'])) || 'BALANCED',
+    volatilityPct: Number(getField(['volatilityPct', 'Volatility %'])) || 4.5
+  };
+}
+
+// -------------------------------------------------------------
+// REST API ENDPOINTS FOR GOOGLE DRIVE FILE CREATION & VERIFICATION
+// -------------------------------------------------------------
+app.get('/api/drive/verify-files', async (req, res) => {
+  const targetUrl = State.googleSheetUrl;
+  if (!targetUrl) {
+    return res.status(400).json({ success: false, message: 'Google Apps Script URL is not set.' });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const response = await fetch(`${targetUrl}?action=TEST_DRIVE_PERMISSION`, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (response.ok) {
+      const data = await response.json();
+      return res.json({
+        success: true,
+        message: 'Google Drive file creation verified! Permissions are active.',
+        data
+      });
+    } else {
+      return res.status(response.status).json({ success: false, message: `HTTP ${response.status} from Google Apps Script` });
+    }
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/drive/sync-files-now', async (req, res) => {
+  try {
+    await backupLearningStateToGoogleDrive({ learningState: learningEngine.state });
+    await backupPortfolioStateToGoogleDrive();
+    res.json({
+      success: true,
+      message: 'Dispatched learning_state.json and cloud_portfolio_state.json to Google Drive!',
+      timestamp: Date.now()
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // -------------------------------------------------------------
-// REST API ENDPOINTS
+// REST API ENDPOINTS FOR TRADE SCRUBBING & PORTFOLIO CONTROLS
 // -------------------------------------------------------------
-app.get('/api/quota/reconcile', (req, res) => {
+app.post('/api/trades/purge-empty', (req, res) => {
   State.tradeLogs = sanitizeAndAuditTradeHistory(State.tradeLogs);
   recalculateTrueRealizedPnL();
   reconcileRollingTradeQuotaFromHistory();
   saveStateToDisk();
   broadcastState();
+  res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs });
+});
+
+app.post('/api/trades/sync-strict-sheet', async (req, res) => {
+  await syncWithGoogleDrive();
+  res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs });
+});
+
+app.post('/api/portfolio/cash', (req, res) => {
+  const { cashUSDT, addUSDT } = req.body;
+  if (typeof cashUSDT === 'number' && cashUSDT >= 0) {
+    State.portfolio.cashUSDT = Number(cashUSDT.toFixed(2));
+  } else if (typeof addUSDT === 'number' && addUSDT > 0) {
+    State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + addUSDT).toFixed(2));
+  }
+  saveStateToDisk();
+  broadcastState();
+  res.json({ success: true, cashUSDT: State.portfolio.cashUSDT });
+});
+
+app.post('/api/portfolio/sizing', (req, res) => {
+  const { sizingMode, allocationPct, fixedNotionalUSDT } = req.body;
+  if (sizingMode) State.portfolio.sizingMode = sizingMode;
+  if (typeof allocationPct === 'number' && allocationPct >= 1 && allocationPct <= 100) {
+    State.portfolio.allocationPct = allocationPct;
+  }
+  if (typeof fixedNotionalUSDT === 'number' && fixedNotionalUSDT >= 10) {
+    State.portfolio.fixedNotionalUSDT = fixedNotionalUSDT;
+  }
+  saveStateToDisk();
+  broadcastState();
+  res.json({ success: true, portfolio: State.portfolio });
+});
+
+app.get('/api/quota/reconcile', (req, res) => {
+  reconcileRollingTradeQuotaFromHistory();
   res.json({
     success: true,
-    totalValidTrades: State.tradeLogs.length,
-    realizedPnL: State.portfolio.realizedPnL,
     rollingTrades24h: State.tradeFrequencyController.rollingTrades24h,
     executed24hCount: State.subsystems.quotaManager.executed24hCount,
     quotaRemaining: State.subsystems.quotaManager.quotaRemaining,
@@ -2350,111 +701,593 @@ app.get('/api/quota/reconcile', (req, res) => {
   });
 });
 
-app.get('/api/quota/toggle-bypass', (req, res) => {
-  const current = Boolean(State.tradeFrequencyController.quotaBypassEnabled);
-  State.tradeFrequencyController.quotaBypassEnabled = !current;
-  syncRollingTradeQuota();
-  saveStateToDisk();
-  broadcastState();
-  res.json({
-    success: true,
-    quotaBypassEnabled: State.tradeFrequencyController.quotaBypassEnabled,
-    status: State.subsystems.quotaManager.status,
-    maxAllowed: State.subsystems.quotaManager.maxAllowed
-  });
+app.get('/api/screener/run', async (req, res) => {
+  await runDynamicScreener();
+  res.json({ success: true, universe: State.universe });
 });
 
-app.post('/api/quota/set-bypass', (req, res) => {
-  const enabled = Boolean(req.body && req.body.enabled);
-  State.tradeFrequencyController.quotaBypassEnabled = enabled;
-  syncRollingTradeQuota();
-  saveStateToDisk();
-  broadcastState();
-  res.json({
-    success: true,
-    quotaBypassEnabled: State.tradeFrequencyController.quotaBypassEnabled,
-    status: State.subsystems.quotaManager.status
-  });
+app.get('/api/p2p/sync', async (req, res) => {
+  await syncLiveP2PRate();
+  res.json({ success: true, rate: State.usdtToInrRate });
 });
 
-app.post('/api/portfolio/cash', (req, res) => {
-  const { cashUSDT, addUSDT } = req.body || {};
-  
-  if (cashUSDT !== undefined) {
-    const val = parseFloat(cashUSDT);
-    if (!isNaN(val) && val >= 0) {
-      State.portfolio.cashUSDT = Math.round(val * 100) / 100;
-      syncRollingTradeQuota();
-      saveStateToDisk();
-      broadcastState();
-      return res.json({ success: true, cashUSDT: State.portfolio.cashUSDT });
-    }
-  }
-
-  if (addUSDT !== undefined) {
-    const delta = parseFloat(addUSDT);
-    if (!isNaN(delta)) {
-      State.portfolio.cashUSDT = Math.max(0, Math.round((State.portfolio.cashUSDT + delta) * 100) / 100);
-      syncRollingTradeQuota();
-      saveStateToDisk();
-      broadcastState();
-      return res.json({ success: true, cashUSDT: State.portfolio.cashUSDT });
-    }
-  }
-
-  res.status(400).json({ success: false, message: 'Invalid cash value provided' });
+app.get('/api/settings/googlesheet/sync', async (req, res) => {
+  await syncWithGoogleDrive();
+  res.json({ success: true, count: State.tradeLogs.length });
 });
 
-// Endpoint to update position sizing mode (% compounding vs fixed $)
-app.post('/api/portfolio/sizing', (req, res) => {
-  const { sizingMode, allocationPct, fixedNotionalUSDT } = req.body || {};
-  if (sizingMode) State.portfolio.sizingMode = sizingMode;
-  const pct = parseFloat(allocationPct);
-  if (!isNaN(pct) && pct >= 1 && pct <= 100) {
-    State.portfolio.allocationPct = Math.round(pct * 10) / 10;
-  }
-  const fixed = parseFloat(fixedNotionalUSDT);
-  if (!isNaN(fixed) && fixed >= 15) {
-    State.portfolio.fixedNotionalUSDT = fixed;
-  }
-  saveStateToDisk();
-  broadcastState();
-  res.json({
-    success: true,
-    sizingMode: State.portfolio.sizingMode,
-    allocationPct: State.portfolio.allocationPct,
-    fixedNotionalUSDT: State.portfolio.fixedNotionalUSDT
+// -------------------------------------------------------------
+// WEBSOCKET COMMUNICATION GATEWAY
+// -------------------------------------------------------------
+wss.on('connection', (ws) => {
+  ws.send(JSON.stringify({
+    type: 'INIT_STATE',
+    portfolio: State.portfolio,
+    activePositions: State.activePositions,
+    recoveryBags: State.recoveryBags,
+    universe: State.universe,
+    tradeLogs: sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 80),
+    quantTelemetry: State.quantTelemetry,
+    marketRegime: State.marketRegime,
+    activeThresholds: State.activeThresholds,
+    tradeFrequencyController: State.tradeFrequencyController,
+    subsystems: State.subsystems,
+    usdtToInrRate: State.usdtToInrRate,
+    p2pLastUpdated: State.p2pLastUpdated,
+    googleSheetUrl: State.googleSheetUrl,
+    learningEngineState: learningEngine.state
+  }));
+
+  ws.on('message', (message) => {
+    try {
+      const msg = JSON.parse(message);
+      if (msg.type === 'TOGGLE_AUTOPILOT') {
+        State.autopilotEnabled = Boolean(msg.enabled);
+        saveStateToDisk();
+        broadcastState();
+      } else if (msg.type === 'SET_CASH') {
+        State.portfolio.cashUSDT = Number(msg.cashUSDT) || 0;
+        saveStateToDisk();
+        broadcastState();
+      } else if (msg.type === 'ADD_CASH') {
+        State.portfolio.cashUSDT += Number(msg.addUSDT) || 0;
+        saveStateToDisk();
+        broadcastState();
+      } else if (msg.type === 'SET_SIZING_CONFIG') {
+        if (msg.sizingMode) State.portfolio.sizingMode = msg.sizingMode;
+        if (msg.allocationPct) State.portfolio.allocationPct = Number(msg.allocationPct);
+        saveStateToDisk();
+        broadcastState();
+      } else if (msg.type === 'SET_DYNAMIC_GOVERNOR') {
+        State.tradeFrequencyController.dynamicGovernorEnabled = Boolean(msg.enabled);
+        saveStateToDisk();
+        broadcastState();
+      } else if (msg.type === 'CLOSE_POSITION' && msg.pairKey) {
+        closeActivePositionManual(msg.pairKey);
+      } else if (msg.type === 'CLOSE_RECOVERY_BAG' && msg.pairKey) {
+        closeRecoveryBagManual(msg.pairKey);
+      } else if (msg.type === 'SYNC_P2P_RATE') {
+        syncLiveP2PRate();
+      } else if (msg.type === 'SET_GOOGLE_SHEET_URL' && msg.url) {
+        State.googleSheetUrl = msg.url.trim();
+        saveStateToDisk();
+        syncWithGoogleDrive();
+      } else if (msg.type === 'RECONCILE_QUOTA') {
+        reconcileRollingTradeQuotaFromHistory();
+        broadcastState();
+      }
+    } catch (e) {}
   });
 });
 
 // -------------------------------------------------------------
-// STRICT GOOGLE SHEET RE-FETCH & CLEAN LOCAL LOGS
+// CORE QUANT SCREENER & ALGORITHMIC EXECUTION ENGINE
 // -------------------------------------------------------------
-app.post('/api/trades/sync-strict-sheet', async (req, res) => {
-  State.tradeLogs = []; // Wipe local server array
-  await syncWithGoogleDrive(); // Pull and strictly validate from Google Sheet
-  res.json({
-    success: true,
-    message: 'Scrubbed ghost trades and refreshed strictly from Google Sheet',
-    count: State.tradeLogs.length,
-    trades: State.tradeLogs
-  });
-});
+async function fetchRealOrderBookDepth(symbol) {
+  try {
+    const res = await fetch(`https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=20`);
+    if (!res.ok) return null;
+    const depth = await res.json();
+    const bids = depth.bids || [];
+    const asks = depth.asks || [];
+    if (bids.length === 0 || asks.length === 0) return null;
 
-// Dedicated endpoint to permanently purge all empty/corrupted ghost rows from server storage
-app.post('/api/trades/purge-empty', (req, res) => {
-  State.tradeLogs = sanitizeAndAuditTradeHistory(State.tradeLogs);
-  recalculateTrueRealizedPnL();
-  reconcileRollingTradeQuotaFromHistory();
+    let bidVol = 0;
+    let askVol = 0;
+    bids.forEach(b => bidVol += parseFloat(b[1]));
+    asks.forEach(a => askVol += parseFloat(a[1]));
+
+    const obi = (bidVol + askVol) > 0 ? (bidVol / (bidVol + askVol)) : 0.5;
+    const bestBid = parseFloat(bids[0][0]);
+    const bestAsk = parseFloat(asks[0][0]);
+    const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0.05;
+
+    return { obi, spreadPct, bestBid, bestAsk };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function checkConfirmedClosedBar(symbol) {
+  try {
+    const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=15m&limit=2`);
+    if (!res.ok) return { passed: true, upperWickRatio: 0.20 };
+    const klines = await res.json();
+    if (!klines || klines.length < 2) return { passed: true, upperWickRatio: 0.20 };
+
+    const prevBar = klines[0];
+    const high = parseFloat(prevBar[2]);
+    const low = parseFloat(prevBar[3]);
+    const open = parseFloat(prevBar[1]);
+    const close = parseFloat(prevBar[4]);
+    const range = high - low;
+
+    if (range <= 0) return { passed: true, upperWickRatio: 0.10 };
+    const upperWick = high - Math.max(open, close);
+    const upperWickRatio = upperWick / range;
+
+    const dynamicCeiling = learningEngine.state.dynamicHurdles?.wickCeiling || 0.40;
+    return {
+      passed: upperWickRatio <= dynamicCeiling,
+      upperWickRatio
+    };
+  } catch (e) {
+    return { passed: true, upperWickRatio: 0.20 };
+  }
+}
+
+async function evaluateTimeMachineBreakoutOdds(symbol) {
+  try {
+    const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
+    if (!res.ok) return { oddsPct: 55, simulatedCount: 0 };
+    const klines = await res.json();
+    if (!klines || klines.length < 20) return { oddsPct: 55, simulatedCount: 0 };
+
+    let setupsDetected = 0;
+    let continuationWins = 0;
+
+    for (let i = 0; i < klines.length - 4; i++) {
+      const open = parseFloat(klines[i][1]);
+      const close = parseFloat(klines[i][4]);
+      const high = parseFloat(klines[i][2]);
+      const low = parseFloat(klines[i][3]);
+      const barGain = open > 0 ? ((close - open) / open) * 100 : 0;
+
+      if (barGain >= 1.20) {
+        setupsDetected++;
+        const target = close * 1.018;
+        const stop = low;
+        let won = false;
+
+        for (let j = i + 1; j < Math.min(i + 5, klines.length); j++) {
+          const fHigh = parseFloat(klines[j][2]);
+          const fLow = parseFloat(klines[j][3]);
+          if (fHigh >= target) { won = true; break; }
+          if (fLow <= stop) { won = false; break; }
+        }
+        if (won) continuationWins++;
+      }
+    }
+
+    if (setupsDetected === 0) return { oddsPct: 52, simulatedCount: 0 };
+    const oddsPct = Math.round((continuationWins / setupsDetected) * 100);
+    return { oddsPct, simulatedCount: setupsDetected };
+  } catch (e) {
+    return { oddsPct: 55, simulatedCount: 0 };
+  }
+}
+
+async function runDynamicScreener() {
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/24hr');
+    if (!res.ok) return;
+    const tickers = await res.json();
+
+    const candidates = [];
+    for (const t of tickers) {
+      const sym = t.symbol;
+      if (!sym.endsWith('USDT')) continue;
+      if (sym.includes('UP') || sym.includes('DOWN') || sym.includes('BEAR') || sym.includes('BULL')) continue;
+      if (['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'EURUSDT'].includes(sym)) continue;
+
+      const volQuote = parseFloat(t.quoteVolume);
+      if (volQuote < 3500000) continue;
+
+      const price = parseFloat(t.lastPrice);
+      const change24h = parseFloat(t.priceChangePercent);
+      const high = parseFloat(t.highPrice);
+      const low = parseFloat(t.lowPrice);
+      const range = (high - low);
+      const posInRange = range > 0 ? (price - low) / range : 0.5;
+
+      // Parabolic top filter
+      if (change24h >= 18.0 || posInRange >= 0.90) continue;
+
+      const score = Math.min(96, Math.max(50, Math.round(55 + (change24h * 1.5) + (posInRange * 20))));
+      candidates.push({
+        pair: sym,
+        symbol: sym.replace('USDT', ''),
+        priceUSDT: price,
+        priceINR: Number((price * State.usdtToInrRate).toFixed(2)),
+        score,
+        change24h,
+        intradayRangePct: low > 0 ? ((high - low) / low) * 100 : 4.5,
+        volumeM: Math.round(volQuote / 1000000),
+        pricePositionInRange: posInRange
+      });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    const top10 = candidates.slice(0, 10);
+    top10.forEach(c => {
+      State.universe[c.pair] = {
+        name: c.symbol,
+        symbol: c.symbol,
+        priceUSDT: c.priceUSDT,
+        priceINR: c.priceINR,
+        score: c.score,
+        direction: c.score >= 80 ? 'STRONG BUY' : 'BUY',
+        obi: 0.56,
+        intradayRangePct: c.intradayRangePct,
+        volumeM: c.volumeM,
+        pricePositionInRange: c.pricePositionInRange,
+        source: 'QUANT_ALGO',
+        verifiedAt: Date.now()
+      };
+    });
+
+    State.subsystems.screener.scannedPairsCount = candidates.length;
+    State.subsystems.screener.lastRunTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+
+    if (State.autopilotEnabled) {
+      await evaluateAutopilotEntries();
+    }
+    broadcastState();
+  } catch (err) {}
+}
+
+async function evaluateAutopilotEntries() {
+  const currentCount = Object.keys(State.activePositions).length;
+  if (currentCount >= State.tradeFrequencyController.maxConcurrentPositions) return;
+
+  const freeCash = State.portfolio.cashUSDT;
+  if (freeCash < 20.00) return;
+
+  const activeBagsCount = Object.keys(State.recoveryBags).length;
+  if (activeBagsCount >= State.tradeFrequencyController.maxRecoveryBagsLimit) return;
+
+  const sortedPairs = Object.keys(State.universe).sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
+
+  for (const pair of sortedPairs) {
+    if (Object.keys(State.activePositions).length >= State.tradeFrequencyController.maxConcurrentPositions) break;
+    if (State.activePositions[pair] || State.recoveryBags[pair]) continue;
+
+    const cd = State.cooldowns[pair];
+    if (cd && cd.until > Date.now()) continue;
+
+    const candidate = State.universe[pair];
+    const eligibility = learningEngine.evaluateCandidateEligibility(pair, candidate, null, State.subsystems.btcMacroGate);
+    if (!eligibility.allowed) continue;
+
+    const effectiveScoreHurdle = State.activeThresholds.scoreThreshold + (eligibility.netScoreHurdleOffset || 0);
+    if ((candidate.score || 0) < effectiveScoreHurdle) continue;
+
+    const closedBarCheck = await checkConfirmedClosedBar(pair);
+    if (!closedBarCheck.passed) continue;
+
+    const tmResult = await evaluateTimeMachineBreakoutOdds(pair);
+    if (tmResult.oddsPct < (eligibility.minRequiredOdds || 45)) continue;
+
+    const book = await fetchRealOrderBookDepth(pair);
+    if (!book || book.obi < State.activeThresholds.obiThreshold || book.spreadPct > State.activeThresholds.maxSpread) continue;
+
+    const baselineVol = 4.5;
+    const tokenVol = Math.max(2.5, candidate.intradayRangePct || baselineVol);
+    const volFactor = Math.min(1.25, Math.max(0.40, baselineVol / tokenVol));
+
+    const entrySnapshot = learningEngine.createEntrySnapshot(pair, candidate, book, null, tmResult.oddsPct, State.subsystems.btcMacroGate);
+    executeSpotBuy(pair, candidate, book, volFactor, entrySnapshot);
+  }
+}
+
+function executeSpotBuy(pair, candidate, book, volFactor, entrySnapshot) {
+  const allocPct = Number(State.portfolio.allocationPct || 15);
+  const baseAllocation = Math.max(15.00, State.portfolio.cashUSDT * (allocPct / 100));
+  const budgetedAllocation = Number((baseAllocation * volFactor).toFixed(2));
+  const finalNotional = Math.min(State.portfolio.cashUSDT, Math.max(15.00, budgetedAllocation));
+
+  if (State.portfolio.cashUSDT < finalNotional) return;
+
+  const entryPrice = book.bestAsk || candidate.priceUSDT;
+  const qty = Number((finalNotional / entryPrice).toFixed(6));
+
+  State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT - finalNotional).toFixed(2));
+
+  State.activePositions[pair] = {
+    pairSymbol: candidate.symbol || pair.replace('USDT', ''),
+    entryPriceUSDT: entryPrice,
+    livePriceUSDT: entryPrice,
+    qty,
+    notionalUSDT: finalNotional,
+    tp1: Number((entryPrice * 1.018).toFixed(6)),
+    tp1Secured: false,
+    sl: Number((entryPrice * 0.95).toFixed(6)),
+    peakPriceUSDT: entryPrice,
+    openedAt: Date.now(),
+    entrySnapshot
+  };
+
   saveStateToDisk();
   broadcastState();
-  res.json({
-    success: true,
-    message: 'Permanently purged all empty/corrupted rows from disk and memory',
-    count: State.tradeLogs.length,
-    trades: State.tradeLogs
+}
+
+function runPredictiveSentry() {
+  const activeKeys = Object.keys(State.activePositions);
+  const bagKeys = Object.keys(State.recoveryBags);
+
+  // Monitor Active Positions
+  activeKeys.forEach(k => {
+    const pos = State.activePositions[k];
+    const live = State.universe[k]?.priceUSDT || pos.livePriceUSDT;
+    pos.livePriceUSDT = live;
+    const gainPct = ((live - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
+    pos.gainPct = Number(gainPct.toFixed(2));
+
+    if (live > pos.peakPriceUSDT) pos.peakPriceUSDT = live;
+
+    // TP1 Hit
+    if (!pos.tp1Secured && gainPct >= 1.80) {
+      pos.tp1Secured = true;
+      const bankedCash = (pos.notionalUSDT * 0.5) * (1 + (gainPct / 100));
+      const profit = bankedCash - (pos.notionalUSDT * 0.5);
+      const subsidy = profit * 0.35;
+
+      State.portfolio.cashUSDT += Number((bankedCash - subsidy).toFixed(2));
+      State.portfolio.bagSubsidyPoolUSDT += Number(subsidy.toFixed(2));
+      pos.qty = Number((pos.qty * 0.5).toFixed(6));
+      pos.notionalUSDT = Number((pos.notionalUSDT * 0.5).toFixed(2));
+      pos.sl = Number((pos.entryPriceUSDT * 1.0025).toFixed(6));
+    }
+
+    // Runner Trailing Stop Hit
+    if (pos.tp1Secured && live <= (pos.peakPriceUSDT * 0.988)) {
+      const exitCash = pos.qty * live;
+      const profit = exitCash - pos.notionalUSDT;
+      State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+      State.portfolio.realizedPnL += Number(profit.toFixed(4));
+
+      State.tradeLogs.unshift({
+        id: Date.now(),
+        date: new Date().toLocaleDateString('en-GB'),
+        time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+        pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+        type: 'RUNNER EXIT',
+        entryPriceUSDT: pos.entryPriceUSDT,
+        exitPriceUSDT: live,
+        notionalUSDT: pos.notionalUSDT,
+        pnlUSDT: Number(profit.toFixed(4)),
+        pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+        reason: 'Trailing runner locked at peak'
+      });
+
+      learningEngine.recordTradeOutcome(k, 'RUNNER', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
+      State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+      delete State.activePositions[k];
+      saveStateToDisk();
+      broadcastState();
+      return;
+    }
+
+    // Emergency Active Cut (-5%)
+    if (gainPct <= -5.00) {
+      const returnCash = pos.qty * live;
+      const loss = returnCash - pos.notionalUSDT;
+      State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
+      State.portfolio.realizedPnL += Number(loss.toFixed(4));
+
+      learningEngine.recordTradeOutcome(k, 'HARD DISASTER', loss, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
+      State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+      delete State.activePositions[k];
+      saveStateToDisk();
+      broadcastState();
+      return;
+    }
+
+    // Transfer to Spot Recovery Bag (-3.20%)
+    if (!pos.tp1Secured && gainPct <= -3.20) {
+      State.recoveryBags[k] = {
+        ...pos,
+        movedAt: Date.now(),
+        targetStep: 'STEP 1 (+0.30%)',
+        targetExitPriceUSDT: Number((pos.entryPriceUSDT * 1.003).toFixed(6))
+      };
+      delete State.activePositions[k];
+      saveStateToDisk();
+      broadcastState();
+    }
   });
-});
+
+  // Monitor Recovery Bags
+  bagKeys.forEach(k => {
+    const bag = State.recoveryBags[k];
+    const live = State.universe[k]?.priceUSDT || bag.livePriceUSDT;
+    bag.livePriceUSDT = live;
+    const gainPct = ((live - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100;
+    bag.gainPct = Number(gainPct.toFixed(2));
+    bag.ageHours = Number(((Date.now() - (bag.movedAt || Date.now())) / 3600000).toFixed(1));
+
+    // Hard Disaster Floor (-6.50%)
+    if (gainPct <= -6.50) {
+      const returnCash = bag.qty * live;
+      const loss = returnCash - bag.notionalUSDT;
+      State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
+      State.portfolio.realizedPnL += Number(loss.toFixed(4));
+
+      State.tradeLogs.unshift({
+        id: Date.now(),
+        date: new Date().toLocaleDateString('en-GB'),
+        time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+        pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+        type: 'HARD DISASTER (-6.50%)',
+        entryPriceUSDT: bag.entryPriceUSDT,
+        exitPriceUSDT: live,
+        notionalUSDT: bag.notionalUSDT,
+        pnlUSDT: Number(loss.toFixed(4)),
+        pnlINR: Number((loss * State.usdtToInrRate).toFixed(2)),
+        reason: 'Hard disaster floor liquidated to preserve cash'
+      });
+
+      learningEngine.recordTradeOutcome(k, 'HARD DISASTER', loss, bag.ageHours, bag.entrySnapshot);
+      State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+      delete State.recoveryBags[k];
+      saveStateToDisk();
+      broadcastState();
+      return;
+    }
+
+    // Step Down Targets
+    if (bag.ageHours >= 24) {
+      bag.targetStep = 'STEP 4 (-1.50%)';
+      bag.targetExitPriceUSDT = Number((bag.entryPriceUSDT * 0.985).toFixed(6));
+    } else if (bag.ageHours >= 12) {
+      bag.targetStep = 'STEP 3 (-0.75%)';
+      bag.targetExitPriceUSDT = Number((bag.entryPriceUSDT * 0.9925).toFixed(6));
+    } else if (bag.ageHours >= 4) {
+      bag.targetStep = 'STEP 2 (0.00%)';
+      bag.targetExitPriceUSDT = Number(bag.entryPriceUSDT.toFixed(6));
+    }
+
+    // Target Filled on Relief Bounce
+    if (live >= bag.targetExitPriceUSDT) {
+      const returnCash = bag.qty * live;
+      const profit = returnCash - bag.notionalUSDT;
+      State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
+      State.portfolio.realizedPnL += Number(profit.toFixed(4));
+
+      State.tradeLogs.unshift({
+        id: Date.now(),
+        date: new Date().toLocaleDateString('en-GB'),
+        time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+        pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+        type: `RECOVERY (${bag.targetStep})`,
+        entryPriceUSDT: bag.entryPriceUSDT,
+        exitPriceUSDT: live,
+        notionalUSDT: bag.notionalUSDT,
+        pnlUSDT: Number(profit.toFixed(4)),
+        pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+        reason: 'Relief bounce filled recovery target'
+      });
+
+      learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, bag.ageHours, bag.entrySnapshot);
+      State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+      delete State.recoveryBags[k];
+      saveStateToDisk();
+      broadcastState();
+      return;
+    }
+
+    // Self-Healing Subsidy Pool Liquidation (>6h)
+    if (bag.ageHours >= 6.0 && gainPct < 0) {
+      const deficit = bag.notionalUSDT - (bag.qty * live);
+      if (deficit > 0 && State.portfolio.bagSubsidyPoolUSDT >= deficit) {
+        State.portfolio.bagSubsidyPoolUSDT -= Number(deficit.toFixed(2));
+        State.portfolio.cashUSDT += Number(bag.notionalUSDT.toFixed(2));
+
+        State.tradeLogs.unshift({
+          id: Date.now(),
+          date: new Date().toLocaleDateString('en-GB'),
+          time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+          pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+          type: 'SUBSIDY CLEAR',
+          entryPriceUSDT: bag.entryPriceUSDT,
+          exitPriceUSDT: live,
+          notionalUSDT: bag.notionalUSDT,
+          pnlUSDT: 0.0000,
+          pnlINR: 0.00,
+          reason: 'Winner subsidy pool absorbed bag deficit'
+        });
+
+        learningEngine.recordTradeOutcome(k, 'RECOVERY', 0, bag.ageHours, bag.entrySnapshot);
+        State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+        delete State.recoveryBags[k];
+        saveStateToDisk();
+        broadcastState();
+      }
+    }
+  });
+}
+
+function closeActivePositionManual(pairKey) {
+  const pos = State.activePositions[pairKey];
+  if (!pos) return;
+  const live = State.universe[pairKey]?.priceUSDT || pos.livePriceUSDT;
+  const returnCash = pos.qty * live;
+  const pnl = returnCash - pos.notionalUSDT;
+  State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
+  State.portfolio.realizedPnL += Number(pnl.toFixed(4));
+
+  State.tradeLogs.unshift({
+    id: Date.now(),
+    date: new Date().toLocaleDateString('en-GB'),
+    time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+    pair: pairKey.includes('/') ? pairKey : `${pairKey.replace('USDT', '')}/USDT`,
+    type: 'MANUAL EXIT',
+    entryPriceUSDT: pos.entryPriceUSDT,
+    exitPriceUSDT: live,
+    notionalUSDT: pos.notionalUSDT,
+    pnlUSDT: Number(pnl.toFixed(4)),
+    pnlINR: Number((pnl * State.usdtToInrRate).toFixed(2)),
+    reason: 'Manual market exit by operator'
+  });
+
+  State.cooldowns[pairKey] = { until: Date.now() + (90 * 60 * 1000) };
+  delete State.activePositions[pairKey];
+  saveStateToDisk();
+  broadcastState();
+}
+
+function closeRecoveryBagManual(pairKey) {
+  const bag = State.recoveryBags[pairKey];
+  if (!bag) return;
+  const live = State.universe[pairKey]?.priceUSDT || bag.livePriceUSDT;
+  const returnCash = bag.qty * live;
+  const pnl = returnCash - bag.notionalUSDT;
+  State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
+  State.portfolio.realizedPnL += Number(pnl.toFixed(4));
+
+  State.tradeLogs.unshift({
+    id: Date.now(),
+    date: new Date().toLocaleDateString('en-GB'),
+    time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+    pair: pairKey.includes('/') ? pairKey : `${pairKey.replace('USDT', '')}/USDT`,
+    type: 'MANUAL RECOVERY EXIT',
+    entryPriceUSDT: bag.entryPriceUSDT,
+    exitPriceUSDT: live,
+    notionalUSDT: bag.notionalUSDT,
+    pnlUSDT: Number(pnl.toFixed(4)),
+    pnlINR: Number((pnl * State.usdtToInrRate).toFixed(2)),
+    reason: 'Manual recovery bag liquidation by operator'
+  });
+
+  State.cooldowns[pairKey] = { until: Date.now() + (90 * 60 * 1000) };
+  delete State.recoveryBags[pairKey];
+  saveStateToDisk();
+  broadcastState();
+}
+
+async function syncLiveP2PRate() {
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=USDTINR');
+    if (res.ok) {
+      const data = await res.json();
+      const p = parseFloat(data.price);
+      if (p > 70 && p < 130) {
+        State.usdtToInrRate = Number(p.toFixed(2));
+        State.p2pLastUpdated = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
+      }
+    }
+  } catch (e) {}
+}
 
 app.get('/api/state', (req, res) => {
   res.json({
@@ -2470,111 +1303,22 @@ app.get('/api/state', (req, res) => {
     subsystems: State.subsystems,
     usdtToInrRate: State.usdtToInrRate,
     p2pLastUpdated: State.p2pLastUpdated,
-    googleSheetUrl: State.googleSheetUrl
-  });
-});
-
-app.get('/api/p2p/sync', async (req, res) => {
-  await syncBinanceP2PUsdtInrRate();
-  res.json({
-    success: true,
-    usdtToInrRate: State.usdtToInrRate,
-    p2pLastUpdated: State.p2pLastUpdated,
-    source: State.p2pSource
-  });
-});
-
-app.post('/api/settings/googlesheet', (req, res) => {
-  const url = req.body && req.body.url ? req.body.url.trim() : '';
-  if (url) {
-    State.googleSheetUrl = url;
-    State.subsystems.persistence.googleSheetSync = 'CONNECTED';
-    saveStateToDisk();
-    syncWithGoogleDrive();
-    res.json({ success: true, googleSheetUrl: url });
-  } else {
-    res.status(400).json({ success: false, message: 'Invalid URL' });
-  }
-});
-
-app.get('/api/settings/googlesheet/sync', async (req, res) => {
-  const targetUrl = State.googleSheetUrl;
-  if (!targetUrl) {
-    return res.status(400).json({ success: false, message: 'GOOGLE_SHEET_URL not configured' });
-  }
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-    const response = await fetch(targetUrl, {
-      method: 'GET',
-      redirect: 'follow',
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-
-    if (response.ok) {
-      const data = await response.json();
-      const rawTrades = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
-      
-      const validSheetTrades = [];
-      rawTrades.forEach(t => {
-        const norm = normalizeSheetTrade(t);
-        if (norm && isValidTradeRecord(norm)) validSheetTrades.push(norm);
-      });
-
-      State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
-      recalculateTrueRealizedPnL();
-      State.subsystems.persistence.googleSheetSync = 'ACTIVE';
-      saveStateToDisk();
-      broadcastState();
-      return res.json({
-        success: true,
-        count: State.tradeLogs.length,
-        totalRetained: State.tradeLogs.length,
-        trades: State.tradeLogs
-      });
-    } else {
-      return res.status(response.status).json({ success: false, message: `Google Sheet returned HTTP ${response.status}` });
-    }
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get('/api/screener/run', async (req, res) => {
-  await runDynamicMarketScreener();
-  res.json({ 
-    success: true, 
-    universeCount: Object.keys(State.universe).length, 
-    subsystem: State.subsystems.screener,
-    universe: State.universe 
-  });
-});
-
-app.get('/api/quant/audit', (req, res) => {
-  res.json({
-    engine: State.quantTelemetry.engine,
-    marketRegime: State.marketRegime,
-    activeThresholds: State.activeThresholds,
-    tradeFrequencyController: State.tradeFrequencyController,
-    subsystems: State.subsystems,
-    activePositionsCount: Object.keys(State.activePositions).length,
-    recoveryBagsCount: Object.keys(State.recoveryBags).length,
-    cooldowns: State.cooldowns,
-    realizedPnL: State.portfolio.realizedPnL,
-    usdtToInrRate: State.usdtToInrRate,
-    p2pLastUpdated: State.p2pLastUpdated
+    googleSheetUrl: State.googleSheetUrl,
+    learningEngineState: learningEngine.state
   });
 });
 
 app.get('/healthz', (req, res) => res.status(200).send('OK'));
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Quant Server] Running on port ${PORT} with Alternative 5: Spot Recovery Bag Architecture`);
+  console.log(`[Quant Server] Running on port ${PORT} with Google Drive File Integration`);
+  loadStateFromDisk();
+  syncWithGoogleDrive();
+  syncLiveP2PRate();
+  runDynamicScreener();
 
-  setTimeout(runDynamicMarketScreener, 2000);
-  setInterval(runPureQuantScoring, 15 * 1000);
-  setInterval(syncLiveBinancePrices, 2500);
-  setInterval(syncBinanceP2PUsdtInrRate, 60 * 60 * 1000);
+  // Periodic intervals
+  setInterval(runPredictiveSentry, 2500);
+  setInterval(runDynamicScreener, 85000);
+  setInterval(syncLiveP2PRate, 600000);
 });
