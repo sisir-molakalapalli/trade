@@ -624,17 +624,27 @@ app.get('/api/drive/verify-files', async (req, res) => {
     });
     clearTimeout(timeout);
 
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('text/html')) {
+      return res.json({
+        success: false,
+        isAuthRequired: true,
+        message: 'Google Apps Script requires one-time permission authorization in the Apps Script editor.'
+      });
+    }
+
     if (response.ok) {
       const data = await response.json().catch(() => null);
-      State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
-      return res.json({
-        success: true,
-        message: 'Google Drive file creation verified! Permissions are active.',
-        data
-      });
-    } else {
-      return res.status(response.status).json({ success: false, message: `HTTP ${response.status} from Google Apps Script` });
+      if (data && data.success) {
+        State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
+        return res.json({
+          success: true,
+          message: 'Google Drive file creation verified! Permissions are active.',
+          data
+        });
+      }
     }
+    return res.status(response.status).json({ success: false, message: `HTTP ${response.status} from Google Apps Script` });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -647,7 +657,6 @@ app.post('/api/drive/sync-files-now', async (req, res) => {
   }
 
   try {
-    // 1. Direct GET command to Apps Script to create both files in Drive immediately
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
     const getRes = await fetch(`${targetUrl}?action=CREATE_ALL_FILES`, {
@@ -657,12 +666,21 @@ app.post('/api/drive/sync-files-now', async (req, res) => {
     });
     clearTimeout(timeout);
 
+    const contentType = getRes.headers.get('content-type') || '';
+    if (contentType.includes('text/html')) {
+      return res.json({
+        success: false,
+        isAuthRequired: true,
+        message: 'Action needed: Open Apps Script, select MANUAL_RUN_CREATE_DRIVE_FILES and click Run to grant Drive access.'
+      });
+    }
+
     let driveData = null;
     if (getRes.ok) {
       driveData = await getRes.json().catch(() => null);
     }
 
-    // 2. Push active state updates
+    // Push active state updates
     await backupLearningStateToGoogleDrive({ learningState: learningEngine.state });
     await backupPortfolioStateToGoogleDrive();
 
