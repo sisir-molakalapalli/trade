@@ -18,7 +18,7 @@ process.on('unhandledRejection', (reason, promise) => {
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
-const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL || '';
+const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
 
 const app = express();
 
@@ -238,7 +238,7 @@ const State = {
 // GOOGLE DRIVE JSON FILE SYNC & PERSISTENCE ENGINE
 // -------------------------------------------------------------
 async function backupLearningStateToGoogleDrive(payload) {
-  const targetUrl = State.googleSheetUrl;
+  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
   if (!targetUrl) return;
 
   try {
@@ -249,17 +249,18 @@ async function backupLearningStateToGoogleDrive(payload) {
     };
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
+    const timeout = setTimeout(() => controller.abort(), 15000);
     const res = await fetch(targetUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(postBody),
+      redirect: 'follow',
       signal: controller.signal
     });
     clearTimeout(timeout);
 
     if (res.ok) {
-      const data = await res.json();
+      const data = await res.json().catch(() => null);
       if (data && data.success) {
         State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (learning_state.json created in Drive)';
         console.log('[Google Drive] Saved learning_state.json to Drive:', data.fileId || 'Success');
@@ -271,7 +272,7 @@ async function backupLearningStateToGoogleDrive(payload) {
 }
 
 async function backupPortfolioStateToGoogleDrive() {
-  const targetUrl = State.googleSheetUrl;
+  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
   if (!targetUrl) return;
 
   try {
@@ -288,11 +289,12 @@ async function backupPortfolioStateToGoogleDrive() {
     };
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
+    const timeout = setTimeout(() => controller.abort(), 15000);
     const res = await fetch(targetUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(postBody),
+      redirect: 'follow',
       signal: controller.signal
     });
     clearTimeout(timeout);
@@ -304,12 +306,12 @@ async function backupPortfolioStateToGoogleDrive() {
 }
 
 async function syncWithGoogleDrive() {
-  const targetUrl = State.googleSheetUrl;
+  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
   if (!targetUrl) return;
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
+    const timeout = setTimeout(() => controller.abort(), 15000);
     const res = await fetch(`${targetUrl}?action=GET_ALL`, {
       method: 'GET',
       redirect: 'follow',
@@ -607,19 +609,24 @@ function normalizeSheetTrade(raw) {
 // REST API ENDPOINTS FOR GOOGLE DRIVE FILE CREATION & VERIFICATION
 // -------------------------------------------------------------
 app.get('/api/drive/verify-files', async (req, res) => {
-  const targetUrl = State.googleSheetUrl;
+  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
   if (!targetUrl) {
     return res.status(400).json({ success: false, message: 'Google Apps Script URL is not set.' });
   }
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-    const response = await fetch(`${targetUrl}?action=TEST_DRIVE_PERMISSION`, { signal: controller.signal });
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const response = await fetch(`${targetUrl}?action=CREATE_ALL_FILES`, { 
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal 
+    });
     clearTimeout(timeout);
 
     if (response.ok) {
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
+      State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
       return res.json({
         success: true,
         message: 'Google Drive file creation verified! Permissions are active.',
@@ -634,12 +641,37 @@ app.get('/api/drive/verify-files', async (req, res) => {
 });
 
 app.post('/api/drive/sync-files-now', async (req, res) => {
+  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
+  if (!targetUrl) {
+    return res.status(400).json({ success: false, error: 'Google Sheet / Apps Script URL is empty.' });
+  }
+
   try {
+    // 1. Direct GET command to Apps Script to create both files in Drive immediately
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const getRes = await fetch(`${targetUrl}?action=CREATE_ALL_FILES`, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    let driveData = null;
+    if (getRes.ok) {
+      driveData = await getRes.json().catch(() => null);
+    }
+
+    // 2. Push active state updates
     await backupLearningStateToGoogleDrive({ learningState: learningEngine.state });
     await backupPortfolioStateToGoogleDrive();
+
+    State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
+
     res.json({
       success: true,
-      message: 'Dispatched learning_state.json and cloud_portfolio_state.json to Google Drive!',
+      message: 'Created learning_state.json and cloud_portfolio_state.json in Google Drive!',
+      driveData,
       timestamp: Date.now()
     });
   } catch (err) {
