@@ -15,6 +15,7 @@ class LearningEngine {
       },
       failureClusters: [],
       recentAttributions: [],
+      avgPeakEfficiencyPct: 90,
       lastUpdated: Date.now()
     };
 
@@ -103,6 +104,7 @@ class LearningEngine {
           if (parsed.dynamicHurdles) this.state.dynamicHurdles = { ...this.state.dynamicHurdles, ...parsed.dynamicHurdles };
           if (Array.isArray(parsed.failureClusters)) this.state.failureClusters = parsed.failureClusters;
           if (Array.isArray(parsed.recentAttributions)) this.state.recentAttributions = parsed.recentAttributions;
+          if (parsed.avgPeakEfficiencyPct !== undefined) this.state.avgPeakEfficiencyPct = parsed.avgPeakEfficiencyPct;
         }
       }
     } catch (e) {
@@ -167,25 +169,27 @@ class LearningEngine {
         wins: 0,
         bags: 0,
         disasters: 0,
+        avgPeakEfficiency: 90,
         lastUpdated: Date.now()
       };
     }
     return this.state.assetReputations[cleanSym];
   }
 
-  recordTradeOutcome(sym, outcomeType, pnlUSDT, holdHours, entrySnapshot) {
+  recordTradeOutcome(sym, outcomeType, pnlUSDT, holdHours, entrySnapshot, peakEfficiencyPct) {
     const cleanSym = String(sym).replace(/[^A-Z0-9]/g, '');
     const rep = this.getAssetReputation(cleanSym);
     const pnl = Number(pnlUSDT) || 0;
     const hours = Number(holdHours) || 0;
+    const eff = (typeof peakEfficiencyPct === 'number' && !isNaN(peakEfficiencyPct)) ? peakEfficiencyPct : null;
 
     let multiplier = 1.0;
     let attributionReason = '';
 
-    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER')) {
+    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('EXHAUSTION')) {
       multiplier = 1.12;
       rep.wins++;
-      attributionReason = `Clean breakout win (+${pnl.toFixed(2)}$). Credit score boosted.`;
+      attributionReason = `Clean breakout win (+${pnl.toFixed(2)}$${eff !== null ? `, ${eff}% peak capture` : ''}). Credit score boosted.`;
     } else if (outcomeType.includes('HARD DISASTER') || outcomeType.includes('-6.50%') || pnl < -2.0) {
       multiplier = 0.50;
       rep.disasters++;
@@ -201,8 +205,35 @@ class LearningEngine {
       }
     }
 
+    if (eff !== null) {
+      rep.avgPeakEfficiency = Math.round((Number(rep.avgPeakEfficiency || 90) * 0.7) + (eff * 0.3));
+    }
+
     rep.repScore = Number(Math.max(0.20, Math.min(1.50, rep.repScore * multiplier)).toFixed(3));
     rep.lastUpdated = Date.now();
+
+    this.state.recentAttributions.push({
+      id: Date.now(),
+      timestamp: Date.now(),
+      symbol: cleanSym,
+      pnlUSDT: pnl,
+      type: outcomeType,
+      peakEfficiencyPct: eff,
+      repScoreAfter: rep.repScore,
+      reason: attributionReason
+    });
+
+    if (this.state.recentAttributions.length > 100) {
+      this.state.recentAttributions = this.state.recentAttributions.slice(-100);
+    }
+
+    // Update rolling average peak efficiency across portfolio
+    const recentEffs = this.state.recentAttributions
+      .map(a => a.peakEfficiencyPct)
+      .filter(e => typeof e === 'number' && !isNaN(e) && e > 0);
+    if (recentEffs.length > 0) {
+      this.state.avgPeakEfficiencyPct = Math.round(recentEffs.reduce((a, b) => a + b, 0) / recentEffs.length);
+    }
 
     this.recalculateDynamicHurdles();
     this.saveState();
