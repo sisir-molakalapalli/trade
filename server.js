@@ -426,6 +426,40 @@ async function backupPortfolioStateToGoogleDrive() {
   } catch (e) {}
 }
 
+function parseCleanNumber(val) {
+  if (typeof val === 'number') return isNaN(val) ? 0 : val;
+  if (!val) return 0;
+  const s = String(val).replace(/[^0-9.-]/g, '');
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+async function fetchTradesFromLedgerWebApp() {
+  const url = TRADE_LEDGER_URL;
+  if (!url) return [];
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(`${url}?action=GET_ALL`, { redirect: 'follow', signal: controller.signal });
+    clearTimeout(timeout);
+    if (res && res.ok) {
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
+      if (list.length > 0) {
+        const valid = [];
+        list.forEach(item => {
+          const norm = normalizeSheetTrade(item);
+          if (norm && isValidTradeRecord(norm)) valid.push(norm);
+        });
+        if (valid.length > 0) return valid;
+      }
+    }
+  } catch (e) {
+    console.error('[Trade Ledger WebApp Fetch Error]', e.message);
+  }
+  return [];
+}
+
 async function fetchTradesFromDirectLedgerCsv() {
   try {
     const csvUrl = 'https://docs.google.com/spreadsheets/d/1nMLhNb3JitkhWhghCQQUygeRdOBd7yAxfD3RCxxxVbE/gviz/tq?tqx=out:csv';
@@ -492,15 +526,23 @@ async function syncWithGoogleDrive() {
         }
       }
 
-      // Fallback: If Apps Script returned 0 trades, fetch directly from Trade Ledger CSV
+      // Fallback 1: Dedicated Trade Ledger Web App
+      if (State.tradeLogs.length === 0) {
+        const ledgerTrades = await fetchTradesFromLedgerWebApp();
+        if (ledgerTrades.length > 0) {
+          State.tradeLogs = sanitizeAndAuditTradeHistory(ledgerTrades);
+          recalculateTrueRealizedPnL();
+          reconcileRollingTradeQuotaFromHistory();
+        }
+      }
+
+      // Fallback 2: Direct Google Sheet CSV
       if (State.tradeLogs.length === 0) {
         await fetchTradesFromDirectLedgerCsv();
       }
 
-      // Autonomous Learning Engine Training on Historical Ledger
-      if (State.tradeLogs.length > 0) {
-        learningEngine.trainOnHistoricalTrades(State.tradeLogs);
-      }
+      // Autonomous Learning Engine Training & Universe Baseline
+      learningEngine.trainOnHistoricalTrades(State.tradeLogs, Object.keys(State.universe || {}));
 
       State.subsystems.persistence.googleSheetSync = 'ACTIVE';
       State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
@@ -513,10 +555,13 @@ async function syncWithGoogleDrive() {
   } catch (err) {
     console.error('[Google Drive Sync Error]', err.message);
     if (State.tradeLogs.length === 0) {
-      await fetchTradesFromDirectLedgerCsv();
-      if (State.tradeLogs.length > 0) {
-        learningEngine.trainOnHistoricalTrades(State.tradeLogs);
+      const ledgerTrades = await fetchTradesFromLedgerWebApp();
+      if (ledgerTrades.length > 0) {
+        State.tradeLogs = sanitizeAndAuditTradeHistory(ledgerTrades);
+      } else {
+        await fetchTradesFromDirectLedgerCsv();
       }
+      learningEngine.trainOnHistoricalTrades(State.tradeLogs, Object.keys(State.universe || {}));
     }
   }
   return false;
@@ -555,7 +600,6 @@ function parseCsvTradeRows(csvText) {
     const rowObj = {};
     headers.forEach((h, idx) => { rowObj[h] = cols[idx] || ''; });
 
-    // Format: 0:ID, 1:Date, 2:Time, 3:Pair, 4:Type, 5:Entry, 6:Exit, 7:PnL(USDT), 8:PnL(INR), 9:Regime, 10:Volatility, 11:Reason
     const normalized = normalizeSheetTrade({
       id: cols[0] || Date.now() - i * 1000,
       date: cols[1] || 'Recent',
@@ -875,13 +919,13 @@ function normalizeSheetTrade(raw) {
   const rawPair = String(getField(['pair', 'Pair', 'symbol', 'Symbol', 'asset'])).trim().toUpperCase();
   if (!rawPair || rawPair === 'CRYPTO/USDT' || !rawPair.includes('USDT')) return null;
 
-  const entry = Number(getField(['entryPriceUSDT', 'Entry Price (USDT)', 'entryPrice', 'entry']));
-  const exit = Number(getField(['exitPriceUSDT', 'Exit Price (USDT)', 'exitPrice', 'exit']));
-  if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) return null;
+  const entry = parseCleanNumber(getField(['entryPriceUSDT', 'Entry Price (USDT)', 'entryPrice', 'entry']));
+  const exit = parseCleanNumber(getField(['exitPriceUSDT', 'Exit Price (USDT)', 'exitPrice', 'exit']));
+  if (entry <= 0 || exit <= 0) return null;
 
-  const pnlUSDT = Number(getField(['pnlUSDT', 'PnL (USDT)', 'pnl'])) || 0;
-  const pnlINR = Number(getField(['pnlINR', 'PnL (INR)'])) || (pnlUSDT * (State.usdtToInrRate || 94.94));
-  const notional = Number(getField(['notionalUSDT', 'Notional (USDT)'])) || 50.00;
+  const pnlUSDT = parseCleanNumber(getField(['pnlUSDT', 'PnL (USDT)', 'pnl']));
+  const pnlINR = parseCleanNumber(getField(['pnlINR', 'PnL (INR)'])) || (pnlUSDT * (State.usdtToInrRate || 94.94));
+  const notional = parseCleanNumber(getField(['notionalUSDT', 'Notional (USDT)'])) || 50.00;
   const pair = rawPair.includes('/') ? rawPair : `${rawPair.replace('USDT', '')}/USDT`;
 
   return {
@@ -897,7 +941,7 @@ function normalizeSheetTrade(raw) {
     pnlINR: Number(pnlINR.toFixed(2)),
     reason: String(getField(['reason', 'Reason'])) || 'Settled trade',
     regime: String(getField(['regime', 'Regime'])) || 'BALANCED',
-    volatilityPct: Number(getField(['volatilityPct', 'Volatility %'])) || 4.5
+    volatilityPct: parseCleanNumber(getField(['volatilityPct', 'Volatility %'])) || 4.5
   };
 }
 
@@ -1851,19 +1895,36 @@ app.get('/api/p2p/sync', async (req, res) => {
 
 app.post('/api/drive/sync-files-now', async (req, res) => {
   try {
-    if (State.tradeLogs.length > 0) {
-      learningEngine.trainOnHistoricalTrades(State.tradeLogs);
+    // 1. Ingest trades passed from client
+    if (Array.isArray(req.body?.trades) && req.body.trades.length > 0) {
+      State.tradeLogs = sanitizeAndAuditTradeHistory(req.body.trades);
+      recalculateTrueRealizedPnL();
+      reconcileRollingTradeQuotaFromHistory();
     }
+
+    // 2. Fallback: Query cloud sources if still empty
+    if (State.tradeLogs.length === 0) {
+      await syncWithGoogleDrive();
+    }
+
+    // 3. Train learning engine with all universe tokens
+    learningEngine.trainOnHistoricalTrades(State.tradeLogs, Object.keys(State.universe || {}));
+
+    // 4. Force synchronous save to Google Drive JSON files
     await backupLearningStateToGoogleDrive();
     await backupPortfolioStateToGoogleDrive();
     saveStateToDisk();
     broadcastState();
 
+    const profileCount = Object.keys(learningEngine.state.assetReputations).length;
+    const sampleTokens = Object.keys(learningEngine.state.assetReputations).slice(0, 6).join(', ');
+
     res.json({
       success: true,
-      profiledTokens: Object.keys(learningEngine.state.assetReputations).length,
+      profiledTokens: profileCount,
+      sampleTokens,
       realizedPnL: State.portfolio.realizedPnL,
-      message: 'Successfully pushed live learning & portfolio data into Google Drive JSON files!'
+      message: `Successfully pushed ${profileCount} profiled tokens (${sampleTokens}...) to Google Drive JSON!`
     });
   } catch (err) {
     res.json({ success: false, error: err.message });
