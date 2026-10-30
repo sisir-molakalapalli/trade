@@ -1953,6 +1953,11 @@ app.get('/api/p2p/sync', async (req, res) => {
 
 app.post('/api/drive/sync-files-now', async (req, res) => {
   try {
+    // 0. Update URL dynamically if sent from client
+    if (req.body?.googleSheetUrl && typeof req.body.googleSheetUrl === 'string' && req.body.googleSheetUrl.startsWith('http')) {
+      State.googleSheetUrl = req.body.googleSheetUrl.trim();
+    }
+
     // 1. Ingest trades passed from client
     if (Array.isArray(req.body?.trades) && req.body.trades.length > 0) {
       State.tradeLogs = sanitizeAndAuditTradeHistory(req.body.trades);
@@ -1978,9 +1983,13 @@ app.post('/api/drive/sync-files-now', async (req, res) => {
     const sampleTokens = Object.keys(learningEngine.state.assetReputations).slice(0, 6).join(', ');
 
     if (!saveL.success) {
+      let friendlyError = saveL.error || 'Apps Script returned non-success';
+      if (friendlyError.includes('getRootFolder')) {
+        friendlyError = 'Old version active on Web App URL. In Apps Script, go to Deploy -> Manage Deployments -> Edit -> select "New version" from dropdown -> Deploy.';
+      }
       return res.json({
         success: false,
-        error: `Drive Write Failed: ${saveL.error || 'Unknown error'}. Please run MANUAL_RUN_CREATE_DRIVE_FILES in Apps Script.`,
+        error: friendlyError,
         profiledTokens: profileCount
       });
     }
@@ -1991,6 +2000,7 @@ app.post('/api/drive/sync-files-now', async (req, res) => {
       sampleTokens,
       realizedPnL: State.portfolio.realizedPnL,
       bytesWritten: saveL.data?.bytesWritten || 0,
+      scriptVersion: saveL.data?.scriptVersion || 'v3.2.0',
       message: `Successfully verified and wrote ${profileCount} tokens (${saveL.data?.bytesWritten || 'verified'} bytes) to Google Drive JSON!`
     });
   } catch (err) {
