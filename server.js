@@ -355,7 +355,7 @@ const State = {
 // -------------------------------------------------------------
 async function backupLearningStateToGoogleDrive(payload) {
   const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
-  if (!targetUrl) return;
+  if (!targetUrl) return { success: false, error: 'No Google Apps Script URL configured' };
 
   try {
     const postBody = {
@@ -380,10 +380,68 @@ async function backupLearningStateToGoogleDrive(payload) {
       const data = await res.json().catch(() => null);
       if (data && data.success) {
         State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (Drive ID: 15eSFMAP... Bound)';
+        return { success: true, data };
+      } else {
+        const errMsg = data?.error || data?.message || 'Apps Script returned non-success';
+        console.error('[Google Drive Learning State Save Error]', errMsg);
+        return { success: false, error: errMsg };
       }
+    } else {
+      return { success: false, error: `HTTP ${res.status}: ${res.statusText}` };
     }
   } catch (e) {
     State.subsystems.persistence.googleDriveFileStatus = 'DRIVE_SYNC_RETRY';
+    return { success: false, error: e.message };
+  }
+}
+
+async function backupPortfolioStateToGoogleDrive() {
+  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
+  if (!targetUrl) return { success: false, error: 'No Google Apps Script URL configured' };
+
+  try {
+    const postBody = {
+      action: 'SAVE_PORTFOLIO_STATE',
+      fileId: DRIVE_FILE_IDS.portfolioState,
+      portfolioState: {
+        portfolio: State.portfolio,
+        activePositions: State.activePositions,
+        recoveryBags: State.recoveryBags,
+        cooldowns: State.cooldowns,
+        tradeFrequencyController: State.tradeFrequencyController,
+        totalTradesExecuted: State.tradeLogs.length,
+        realizedPnLUSDT: State.portfolio.realizedPnL,
+        realizedPnLINR: Number((State.portfolio.realizedPnL * State.usdtToInrRate).toFixed(2)),
+        timestamp: Date.now(),
+        lastSyncTime: new Date().toISOString()
+      }
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(postBody),
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (data && data.success) {
+        State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (Drive ID: 1DVK9OvL... Bound)';
+        return { success: true, data };
+      } else {
+        const errMsg = data?.error || data?.message || 'Apps Script returned non-success';
+        return { success: false, error: errMsg };
+      }
+    } else {
+      return { success: false, error: `HTTP ${res.status}: ${res.statusText}` };
+    }
+  } catch (e) {
+    return { success: false, error: e.message };
   }
 }
 
@@ -1911,20 +1969,29 @@ app.post('/api/drive/sync-files-now', async (req, res) => {
     learningEngine.trainOnHistoricalTrades(State.tradeLogs, Object.keys(State.universe || {}));
 
     // 4. Force synchronous save to Google Drive JSON files
-    await backupLearningStateToGoogleDrive();
-    await backupPortfolioStateToGoogleDrive();
+    const saveL = await backupLearningStateToGoogleDrive();
+    const saveP = await backupPortfolioStateToGoogleDrive();
     saveStateToDisk();
     broadcastState();
 
     const profileCount = Object.keys(learningEngine.state.assetReputations).length;
     const sampleTokens = Object.keys(learningEngine.state.assetReputations).slice(0, 6).join(', ');
 
+    if (!saveL.success) {
+      return res.json({
+        success: false,
+        error: `Drive Write Failed: ${saveL.error || 'Unknown error'}. Please run MANUAL_RUN_CREATE_DRIVE_FILES in Apps Script.`,
+        profiledTokens: profileCount
+      });
+    }
+
     res.json({
       success: true,
       profiledTokens: profileCount,
       sampleTokens,
       realizedPnL: State.portfolio.realizedPnL,
-      message: `Successfully pushed ${profileCount} profiled tokens (${sampleTokens}...) to Google Drive JSON!`
+      bytesWritten: saveL.data?.bytesWritten || 0,
+      message: `Successfully verified and wrote ${profileCount} tokens (${saveL.data?.bytesWritten || 'verified'} bytes) to Google Drive JSON!`
     });
   } catch (err) {
     res.json({ success: false, error: err.message });
