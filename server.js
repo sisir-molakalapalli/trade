@@ -480,6 +480,138 @@ function broadcastState() {
 }
 
 // -------------------------------------------------------------
+// HIGH-FREQUENCY SUB-SECOND PRICE STREAM BROADCASTER
+// -------------------------------------------------------------
+let lastBroadcastTime = 0;
+function broadcastLivePrices(priceMap) {
+  if (wss.clients.size === 0) return;
+  const now = Date.now();
+  // Throttle to 800ms for network efficiency while delivering real-time feel
+  if (now - lastBroadcastTime < 800) return;
+  lastBroadcastTime = now;
+
+  const payload = JSON.stringify({
+    type: 'PRICE_STREAM',
+    prices: priceMap,
+    activePositions: State.activePositions,
+    recoveryBags: State.recoveryBags,
+    timestamp: now
+  });
+
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  });
+}
+
+// -------------------------------------------------------------
+// PERSISTENT BINANCE WEBSOCKET MARKET DATA STREAM
+// -------------------------------------------------------------
+let binanceWs = null;
+let binanceWsReconnectTimer = null;
+
+function initBinanceWebSocketStream() {
+  if (binanceWs) {
+    try { binanceWs.terminate(); } catch (e) {}
+    binanceWs = null;
+  }
+
+  const wsUrls = [
+    'wss://data-stream.binance.vision/ws/!miniTicker@arr',
+    'wss://stream.binance.com:9443/ws/!miniTicker@arr'
+  ];
+  let urlIndex = 0;
+
+  function connect(url) {
+    console.log(`[Binance Stream] Connecting to real-time market stream: ${url}`);
+    try {
+      binanceWs = new WebSocket(url);
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+
+    binanceWs.on('open', () => {
+      console.log('[Binance Stream] Real-time market feed ONLINE (sub-second streaming).');
+      State.subsystems.microstructure.status = 'STREAMING_LIVE';
+    });
+
+    binanceWs.on('message', (data) => {
+      try {
+        const raw = JSON.parse(data.toString());
+        if (!Array.isArray(raw)) return;
+
+        let hasActiveUpdates = false;
+        const priceMap = {};
+
+        for (const item of raw) {
+          const sym = item.s;
+          if (!sym) continue;
+          const closePrice = parseFloat(item.c);
+          if (isNaN(closePrice) || closePrice <= 0) continue;
+
+          // Update Universe if tracked
+          if (State.universe[sym]) {
+            State.universe[sym].priceUSDT = closePrice;
+            State.universe[sym].priceINR = Number((closePrice * State.usdtToInrRate).toFixed(2));
+            State.universe[sym].verifiedAt = Date.now();
+            priceMap[sym] = closePrice;
+          }
+
+          // Update Active Positions in real-time
+          if (State.activePositions[sym]) {
+            const pos = State.activePositions[sym];
+            pos.livePriceUSDT = closePrice;
+            pos.gainPct = Number((((closePrice - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100).toFixed(2));
+            pos.unrealizedPnLUSDT = Number(((closePrice - pos.entryPriceUSDT) * pos.qty).toFixed(4));
+            if (closePrice > pos.peakPriceUSDT) pos.peakPriceUSDT = closePrice;
+            priceMap[sym] = closePrice;
+            hasActiveUpdates = true;
+          }
+
+          // Update Recovery Bags in real-time
+          if (State.recoveryBags[sym]) {
+            const bag = State.recoveryBags[sym];
+            bag.livePriceUSDT = closePrice;
+            bag.gainPct = Number((((closePrice - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100).toFixed(2));
+            bag.unrealizedPnLUSDT = Number(((closePrice - bag.entryPriceUSDT) * bag.qty).toFixed(4));
+            priceMap[sym] = closePrice;
+            hasActiveUpdates = true;
+          }
+        }
+
+        // Trigger predictive sentry immediately when open positions move
+        if (hasActiveUpdates) {
+          runPredictiveSentry();
+        }
+
+        // Broadcast live price updates to connected web terminals
+        broadcastLivePrices(priceMap);
+      } catch (e) {}
+    });
+
+    binanceWs.on('close', () => {
+      scheduleReconnect();
+    });
+
+    binanceWs.on('error', () => {
+      try { binanceWs.close(); } catch (e) {}
+    });
+  }
+
+  function scheduleReconnect() {
+    if (binanceWsReconnectTimer) clearTimeout(binanceWsReconnectTimer);
+    binanceWsReconnectTimer = setTimeout(() => {
+      urlIndex = (urlIndex + 1) % wsUrls.length;
+      connect(wsUrls[urlIndex]);
+    }, 3000);
+  }
+
+  connect(wsUrls[0]);
+}
+
+// -------------------------------------------------------------
 // STRICT RECORD VALIDATOR & SANITIZER
 // -------------------------------------------------------------
 function isValidTradeRecord(t) {
@@ -1474,6 +1606,7 @@ server.listen(PORT, '0.0.0.0', () => {
   syncWithGoogleDrive();
   syncLiveP2PRate();
   runDynamicScreener();
+  initBinanceWebSocketStream();
 
   // Periodic intervals
   setInterval(runPredictiveSentry, 2500);
