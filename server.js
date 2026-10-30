@@ -188,15 +188,15 @@ const State = {
       lastAdjustmentFactor: 1.0
     },
     recoveryManager: {
-      status: 'ONLINE',
-      activeRecoveryBagsCount: 0,
-      totalRecoveryCapitalUSDT: 0.00,
-      meanReversionTargetRate: 'Dynamic Stepped Target + Hard -6.50% Disaster Cap',
-      hardDisasterCutsCount: 0,
-      bagsResolvedWinCount: 0,
-      subsidyPoolUSDT: 0.00,
-      bagsSubsidizedCount: 0
-    },
+    status: 'ONLINE',
+    activeRecoveryBagsCount: 0,
+    totalRecoveryCapitalUSDT: 0.00,
+    meanReversionTargetRate: 'Dynamic Stepped Target + Hard -6.50% Disaster Cap',
+    hardDisasterCutsCount: 0,
+    bagsResolvedWinCount: 0,
+    subsidyPoolUSDT: 0.00,
+    bagsSubsidizedCount: 0
+  },
     quotaManager: {
       status: 'NORMAL',
       quotaBypassEnabled: false,
@@ -839,12 +839,47 @@ wss.on('connection', (ws) => {
 });
 
 // -------------------------------------------------------------
+// RESILIENT MULTI-MIRROR BINANCE MARKET DATA GATEWAY
+// -------------------------------------------------------------
+const BINANCE_BASE_URLS = [
+  'https://data-api.binance.vision', // Binance's public data mirror without cloud geo-blocking (HTTP 451 bypass)
+  'https://api.binance.com',
+  'https://api1.binance.com',
+  'https://api3.binance.com'
+];
+
+async function fetchBinance(apiPath, options = {}) {
+  for (const baseUrl of BINANCE_BASE_URLS) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 9000);
+      const res = await fetch(`${baseUrl}${apiPath}`, {
+        ...options,
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (res && res.ok) {
+        return res;
+      }
+      // If geo-blocked or server error, smoothly try the next mirror
+      if (res && (res.status === 451 || res.status === 403 || res.status >= 500)) {
+        continue;
+      }
+      return res;
+    } catch (e) {
+      continue;
+    }
+  }
+  return null;
+}
+
+// -------------------------------------------------------------
 // CORE QUANT SCREENER & ALGORITHMIC EXECUTION ENGINE
 // -------------------------------------------------------------
 async function fetchRealOrderBookDepth(symbol) {
   try {
-    const res = await fetch(`https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=20`);
-    if (!res.ok) return null;
+    const res = await fetchBinance(`/api/v3/depth?symbol=${symbol}&limit=20`);
+    if (!res || !res.ok) return null;
     const depth = await res.json();
     const bids = depth.bids || [];
     const asks = depth.asks || [];
@@ -868,8 +903,8 @@ async function fetchRealOrderBookDepth(symbol) {
 
 async function checkConfirmedClosedBar(symbol) {
   try {
-    const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=15m&limit=2`);
-    if (!res.ok) return { passed: true, upperWickRatio: 0.20 };
+    const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=2`);
+    if (!res || !res.ok) return { passed: true, upperWickRatio: 0.20 };
     const klines = await res.json();
     if (!klines || klines.length < 2) return { passed: true, upperWickRatio: 0.20 };
 
@@ -906,8 +941,8 @@ async function checkConfirmedClosedBar(symbol) {
 
 async function evaluateTimeMachineBreakoutOdds(symbol) {
   try {
-    const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
-    if (!res.ok) return { oddsPct: 55, simulatedCount: 0 };
+    const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
+    if (!res || !res.ok) return { oddsPct: 55, simulatedCount: 0 };
     const klines = await res.json();
     if (!klines || klines.length < 20) return { oddsPct: 55, simulatedCount: 0 };
 
@@ -961,9 +996,13 @@ async function evaluateTimeMachineBreakoutOdds(symbol) {
 
 async function runDynamicScreener() {
   try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/24hr');
-    if (!res.ok) return;
+    const res = await fetchBinance('/api/v3/ticker/24hr');
+    if (!res || !res.ok) {
+      console.warn('[Screener] Warning: Binance 24hr ticker feed unavailable across mirrors.');
+      return;
+    }
     const tickers = await res.json();
+    if (!Array.isArray(tickers) || tickers.length === 0) return;
 
     const candidates = [];
     for (const t of tickers) {
@@ -1011,34 +1050,44 @@ async function runDynamicScreener() {
     // Expand Autopilot evaluation pool to top 35 candidates (eliminates 10-pair deadlock)
     State.candidatePool = candidates.slice(0, 35);
 
-    // Maintain top 10 for clean UI Radar rendering
-    const top10 = candidates.slice(0, 10);
-    top10.forEach(c => {
-      State.universe[c.pair] = {
+    // Completely replace State.universe with live dynamically discovered candidates
+    const newUniverse = {};
+    const topLive = candidates.slice(0, 15);
+    topLive.forEach(c => {
+      newUniverse[c.pair] = {
         name: c.symbol,
         symbol: c.symbol,
         priceUSDT: c.priceUSDT,
         priceINR: c.priceINR,
         score: c.score,
-        direction: c.score >= 80 ? 'STRONG BUY' : 'BUY',
+        direction: c.score >= 80 ? 'STRONG BUY' : (c.score >= 70 ? 'BUY' : 'NEUTRAL'),
         obi: 0.56,
+        change24h: c.change24h,
         intradayRangePct: c.intradayRangePct,
         volumeM: c.volumeM,
         pricePositionInRange: c.pricePositionInRange,
-        source: 'QUANT_ALGO',
+        source: 'BINANCE_LIVE_SCAN',
+        reasoning: `Live market rank: #${candidates.indexOf(c) + 1} (${c.change24h >= 0 ? '+' : ''}${c.change24h.toFixed(1)}% 24h, $${c.volumeM}M vol)`,
         verifiedAt: Date.now()
       };
     });
 
+    if (Object.keys(newUniverse).length > 0) {
+      State.universe = newUniverse;
+    }
+
     State.subsystems.screener.status = 'ACTIVE';
     State.subsystems.screener.scannedPairsCount = candidates.length;
+    State.subsystems.screener.qualifiedCandidatesCount = candidates.length;
     State.subsystems.screener.lastRunTime = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 
     if (State.autopilotEnabled) {
       await evaluateAutopilotEntries();
     }
     broadcastState();
-  } catch (err) {}
+  } catch (err) {
+    console.error('[Screener Error]', err.message);
+  }
 }
 
 async function evaluateAutopilotEntries() {
@@ -1386,8 +1435,8 @@ function closeRecoveryBagManual(pairKey) {
 
 async function syncLiveP2PRate() {
   try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=USDTINR');
-    if (res.ok) {
+    const res = await fetchBinance('/api/v3/ticker/price?symbol=USDTINR');
+    if (res && res.ok) {
       const data = await res.json();
       const p = parseFloat(data.price);
       if (p > 70 && p < 130) {
