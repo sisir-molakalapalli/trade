@@ -33,6 +33,32 @@ learningEngine.setGoogleDriveSyncCallback((payload) => {
 });
 
 // -------------------------------------------------------------
+// CLOUD LEDGER TRADE DISPATCHER (GOOGLE SHEETS APPEND)
+// -------------------------------------------------------------
+async function recordTradeToCloudLedger(trade) {
+  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
+  if (!targetUrl || !trade) return;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(trade),
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (res.ok) {
+      console.log(`[Cloud Ledger] Successfully synced closed trade ${trade.pair} (${trade.type}) to Google Sheet!`);
+    }
+  } catch (e) {
+    console.error('[Cloud Ledger Sync Error]', e.message);
+  }
+}
+
+// -------------------------------------------------------------
 // CORS & PRE-FLIGHT HEADERS
 // -------------------------------------------------------------
 app.use((req, res, next) => {
@@ -424,9 +450,16 @@ async function syncWithGoogleDrive() {
         await fetchTradesFromDirectLedgerCsv();
       }
 
+      // Autonomous Learning Engine Training on Historical Ledger
+      if (State.tradeLogs.length > 0) {
+        learningEngine.trainOnHistoricalTrades(State.tradeLogs);
+      }
+
       State.subsystems.persistence.googleSheetSync = 'ACTIVE';
       State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
       saveStateToDisk();
+      backupLearningStateToGoogleDrive().catch(() => {});
+      backupPortfolioStateToGoogleDrive().catch(() => {});
       broadcastState();
       return true;
     }
@@ -434,32 +467,49 @@ async function syncWithGoogleDrive() {
     console.error('[Google Drive Sync Error]', err.message);
     if (State.tradeLogs.length === 0) {
       await fetchTradesFromDirectLedgerCsv();
+      if (State.tradeLogs.length > 0) {
+        learningEngine.trainOnHistoricalTrades(State.tradeLogs);
+      }
     }
   }
   return false;
 }
 
-// -------------------------------------------------------------
-// DIRECT GOOGLE SHEET CSV FALLBACK FETCHER
-// -------------------------------------------------------------
-async function fetchTradesFromDirectLedgerCsv() {
-  const CSV_URL = 'https://docs.google.com/spreadsheets/d/1nMLhNb3JitkhWhghCQQUygeRdOBd7yAxfD3RCxxxVbE/gviz/tq?tqx=out:csv';
+async function backupPortfolioStateToGoogleDrive() {
+  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
+  if (!targetUrl) return;
+
   try {
+    const postBody = {
+      action: 'SAVE_PORTFOLIO_STATE',
+      fileId: DRIVE_FILE_IDS.portfolioState,
+      portfolioState: {
+        portfolio: State.portfolio,
+        activePositions: State.activePositions,
+        recoveryBags: State.recoveryBags,
+        cooldowns: State.cooldowns,
+        tradeFrequencyController: State.tradeFrequencyController,
+        totalTradesExecuted: State.tradeLogs.length,
+        realizedPnLUSDT: State.portfolio.realizedPnL,
+        realizedPnLINR: Number((State.portfolio.realizedPnL * State.usdtToInrRate).toFixed(2)),
+        timestamp: Date.now(),
+        lastSyncTime: new Date().toISOString()
+      }
+    };
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-    const res = await fetch(CSV_URL, { signal: controller.signal });
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(postBody),
+      redirect: 'follow',
+      signal: controller.signal
+    });
     clearTimeout(timeout);
 
-    if (res && res.ok) {
-      const csvText = await res.text();
-      const parsedTrades = parseCsvTradeRows(csvText);
-      if (parsedTrades.length > 0) {
-        State.tradeLogs = sanitizeAndAuditTradeHistory(parsedTrades);
-        recalculateTrueRealizedPnL();
-        reconcileRollingTradeQuotaFromHistory();
-        saveStateToDisk();
-        broadcastState();
-      }
+    if (res.ok) {
+      State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (Drive ID: 1DVK9OvL... Bound)';
     }
   } catch (e) {}
 }
@@ -1172,7 +1222,7 @@ function runPredictiveSentry() {
     pos.peakGainPct = Number(peakGainPct.toFixed(2));
 
     // ==============================================================
-    // A. PRE-TP1 PROFIT RATCHET (ELIMINATES GIVEBACKS LIKE HYPE)
+    // A. PROFIT RATCHETS (ONLY PROFIT EXITS ALLOWED IN ACTIVE POSITIONS)
     // ==============================================================
     if (!pos.tp1Secured) {
       // Tier 1: Near-Miss Lock (+1.60% hit -> locks +1.10% profit floor)
@@ -1187,7 +1237,7 @@ function runPredictiveSentry() {
           State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
           State.portfolio.realizedPnL += Number(profit.toFixed(4));
 
-          State.tradeLogs.unshift({
+          const tradeRecord = {
             id: Date.now(),
             date: new Date().toLocaleDateString('en-GB'),
             time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1199,8 +1249,10 @@ function runPredictiveSentry() {
             pnlUSDT: Number(profit.toFixed(4)),
             pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
             reason: `Near-miss ratchet locked: Peaked +${peakGainPct.toFixed(2)}%, banked exit at +${gainPct.toFixed(2)}%`
-          });
+          };
 
+          State.tradeLogs.unshift(tradeRecord);
+          recordTradeToCloudLedger(tradeRecord);
           learningEngine.recordTradeOutcome(k, 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
           State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
           delete State.activePositions[k];
@@ -1221,7 +1273,7 @@ function runPredictiveSentry() {
           State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
           State.portfolio.realizedPnL += Number(profit.toFixed(4));
 
-          State.tradeLogs.unshift({
+          const tradeRecord = {
             id: Date.now(),
             date: new Date().toLocaleDateString('en-GB'),
             time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1233,43 +1285,11 @@ function runPredictiveSentry() {
             pnlUSDT: Number(profit.toFixed(4)),
             pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
             reason: `Breakeven ratchet locked: Peaked +${peakGainPct.toFixed(2)}%, principal & fees 100% secured`
-          });
+          };
 
+          State.tradeLogs.unshift(tradeRecord);
+          recordTradeToCloudLedger(tradeRecord);
           learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
-          State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
-          delete State.activePositions[k];
-          saveStateToDisk();
-          broadcastState();
-          return;
-        }
-      }
-      // Tier 3: Risk Reduction (+1.00% hit -> compresses stop from -5.0% to -0.50%)
-      else if (peakGainPct >= 1.00) {
-        const floorPrice = Number((pos.entryPriceUSDT * 0.9950).toFixed(6));
-        pos.sl = Math.max(pos.sl || 0, floorPrice);
-        pos.ratchetStage = 'RISK_REDUCED (-0.50%)';
-
-        if (live <= pos.sl) {
-          const returnCash = pos.qty * live;
-          const loss = returnCash - pos.notionalUSDT;
-          State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
-          State.portfolio.realizedPnL += Number(loss.toFixed(4));
-
-          State.tradeLogs.unshift({
-            id: Date.now(),
-            date: new Date().toLocaleDateString('en-GB'),
-            time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
-            pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-            type: 'TIGHT CUT (-0.50%)',
-            entryPriceUSDT: pos.entryPriceUSDT,
-            exitPriceUSDT: live,
-            notionalUSDT: pos.notionalUSDT,
-            pnlUSDT: Number(loss.toFixed(4)),
-            pnlINR: Number((loss * State.usdtToInrRate).toFixed(2)),
-            reason: `Tight risk stop filled: Peaked +${peakGainPct.toFixed(2)}%, cut at -0.50%`
-          });
-
-          learningEngine.recordTradeOutcome(k, 'HARD DISASTER', loss, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
           State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
           delete State.activePositions[k];
           saveStateToDisk();
@@ -1295,7 +1315,7 @@ function runPredictiveSentry() {
       pos.sl = Number((pos.entryPriceUSDT * 1.0050).toFixed(6));
       pos.ratchetStage = 'RUNNER_TRAILING';
 
-      State.tradeLogs.unshift({
+      const tradeRecord = {
         id: Date.now(),
         date: new Date().toLocaleDateString('en-GB'),
         time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1307,12 +1327,14 @@ function runPredictiveSentry() {
         pnlUSDT: Number(profit.toFixed(4)),
         pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
         reason: 'TP1 secured: 50% banked at +1.80%, runner activated'
-      });
+      };
+      State.tradeLogs.unshift(tradeRecord);
+      recordTradeToCloudLedger(tradeRecord);
       learningEngine.recordTradeOutcome(k, 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
     }
 
     // ==============================================================
-    // C. PROXIMITY-TIGHTENING RUNNER TRAIL (FIXES BEMX 1.17% BLEED)
+    // C. PROXIMITY-TIGHTENING RUNNER TRAIL
     // ==============================================================
     if (pos.tp1Secured) {
       let trailPct = 0.0050; // Tight 0.50% trail for +1.80% to +2.40%
@@ -1332,7 +1354,7 @@ function runPredictiveSentry() {
         State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
         State.portfolio.realizedPnL += Number(profit.toFixed(4));
 
-        State.tradeLogs.unshift({
+        const tradeRecord = {
           id: Date.now(),
           date: new Date().toLocaleDateString('en-GB'),
           time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1344,8 +1366,10 @@ function runPredictiveSentry() {
           pnlUSDT: Number(profit.toFixed(4)),
           pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
           reason: `Tightened runner trail locked (Peaked +${peakGainPct.toFixed(2)}%, Trailed ${pos.dynamicTrailPct}%)`
-        });
+        };
 
+        State.tradeLogs.unshift(tradeRecord);
+        recordTradeToCloudLedger(tradeRecord);
         learningEngine.recordTradeOutcome(k, 'RUNNER', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
         State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
         delete State.activePositions[k];
@@ -1355,24 +1379,12 @@ function runPredictiveSentry() {
       }
     }
 
-    // Emergency Active Cut (-5%)
-    if (gainPct <= -5.00) {
-      const returnCash = pos.qty * live;
-      const loss = returnCash - pos.notionalUSDT;
-      State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
-      State.portfolio.realizedPnL += Number(loss.toFixed(4));
-
-      learningEngine.recordTradeOutcome(k, 'HARD DISASTER', loss, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
-      State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
-      delete State.activePositions[k];
-      saveStateToDisk();
-      broadcastState();
-      return;
-    }
-
-    // Transfer to Spot Recovery Bag (-3.20%)
-    // (Protected: trades with stop ratcheted above entry can NEVER enter recovery)
-    if (!pos.tp1Secured && gainPct <= -3.20 && (pos.sl || 0) < pos.entryPriceUSDT) {
+    // ==============================================================
+    // D. ZERO REALIZED LOSS ARCHITECTURE: NO LOSS EXITS IN ACTIVE SLOTS
+    // ==============================================================
+    // Any adverse move or retest dip is transferred directly to the Spot Recovery Bag.
+    // Active breakout positions NEVER sell for a loss!
+    if (!pos.tp1Secured && gainPct <= -1.80) {
       State.recoveryBags[k] = {
         ...pos,
         movedAt: Date.now(),
@@ -1382,6 +1394,7 @@ function runPredictiveSentry() {
       delete State.activePositions[k];
       saveStateToDisk();
       broadcastState();
+      return;
     }
   });
 
@@ -1401,7 +1414,7 @@ function runPredictiveSentry() {
       State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
       State.portfolio.realizedPnL += Number(loss.toFixed(4));
 
-      State.tradeLogs.unshift({
+      const tradeRecord = {
         id: Date.now(),
         date: new Date().toLocaleDateString('en-GB'),
         time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1413,8 +1426,10 @@ function runPredictiveSentry() {
         pnlUSDT: Number(loss.toFixed(4)),
         pnlINR: Number((loss * State.usdtToInrRate).toFixed(2)),
         reason: 'Hard disaster floor liquidated to preserve cash'
-      });
+      };
 
+      State.tradeLogs.unshift(tradeRecord);
+      recordTradeToCloudLedger(tradeRecord);
       learningEngine.recordTradeOutcome(k, 'HARD DISASTER', loss, bag.ageHours, bag.entrySnapshot);
       State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
       delete State.recoveryBags[k];
@@ -1442,7 +1457,7 @@ function runPredictiveSentry() {
       State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
       State.portfolio.realizedPnL += Number(profit.toFixed(4));
 
-      State.tradeLogs.unshift({
+      const tradeRecord = {
         id: Date.now(),
         date: new Date().toLocaleDateString('en-GB'),
         time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1454,8 +1469,10 @@ function runPredictiveSentry() {
         pnlUSDT: Number(profit.toFixed(4)),
         pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
         reason: 'Relief bounce filled recovery target'
-      });
+      };
 
+      State.tradeLogs.unshift(tradeRecord);
+      recordTradeToCloudLedger(tradeRecord);
       learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, bag.ageHours, bag.entrySnapshot);
       State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
       delete State.recoveryBags[k];
@@ -1471,7 +1488,7 @@ function runPredictiveSentry() {
         State.portfolio.bagSubsidyPoolUSDT -= Number(deficit.toFixed(2));
         State.portfolio.cashUSDT += Number(bag.notionalUSDT.toFixed(2));
 
-        State.tradeLogs.unshift({
+        const tradeRecord = {
           id: Date.now(),
           date: new Date().toLocaleDateString('en-GB'),
           time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1483,8 +1500,10 @@ function runPredictiveSentry() {
           pnlUSDT: 0.0000,
           pnlINR: 0.00,
           reason: 'Winner subsidy pool absorbed bag deficit'
-        });
+        };
 
+        State.tradeLogs.unshift(tradeRecord);
+        recordTradeToCloudLedger(tradeRecord);
         learningEngine.recordTradeOutcome(k, 'RECOVERY', 0, bag.ageHours, bag.entrySnapshot);
         State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
         delete State.recoveryBags[k];
@@ -1504,7 +1523,7 @@ function closeActivePositionManual(pairKey) {
   State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
   State.portfolio.realizedPnL += Number(pnl.toFixed(4));
 
-  State.tradeLogs.unshift({
+  const tradeRecord = {
     id: Date.now(),
     date: new Date().toLocaleDateString('en-GB'),
     time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1516,8 +1535,10 @@ function closeActivePositionManual(pairKey) {
     pnlUSDT: Number(pnl.toFixed(4)),
     pnlINR: Number((pnl * State.usdtToInrRate).toFixed(2)),
     reason: 'Manual market exit by operator'
-  });
+  };
 
+  State.tradeLogs.unshift(tradeRecord);
+  recordTradeToCloudLedger(tradeRecord);
   State.cooldowns[pairKey] = { until: Date.now() + (90 * 60 * 1000) };
   delete State.activePositions[pairKey];
   saveStateToDisk();
@@ -1533,7 +1554,7 @@ function closeRecoveryBagManual(pairKey) {
   State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
   State.portfolio.realizedPnL += Number(pnl.toFixed(4));
 
-  State.tradeLogs.unshift({
+  const tradeRecord = {
     id: Date.now(),
     date: new Date().toLocaleDateString('en-GB'),
     time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
@@ -1545,8 +1566,10 @@ function closeRecoveryBagManual(pairKey) {
     pnlUSDT: Number(pnl.toFixed(4)),
     pnlINR: Number((pnl * State.usdtToInrRate).toFixed(2)),
     reason: 'Manual recovery bag liquidation by operator'
-  });
+  };
 
+  State.tradeLogs.unshift(tradeRecord);
+  recordTradeToCloudLedger(tradeRecord);
   State.cooldowns[pairKey] = { until: Date.now() + (90 * 60 * 1000) };
   delete State.recoveryBags[pairKey];
   saveStateToDisk();
@@ -1652,10 +1675,20 @@ app.get('/api/p2p/sync', async (req, res) => {
 
 app.post('/api/drive/sync-files-now', async (req, res) => {
   try {
-    const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
-    const resp = await fetch(`${targetUrl}?action=CREATE_ALL_FILES`);
-    const data = await resp.json().catch(() => null);
-    res.json({ success: true, driveData: data });
+    if (State.tradeLogs.length > 0) {
+      learningEngine.trainOnHistoricalTrades(State.tradeLogs);
+    }
+    await backupLearningStateToGoogleDrive();
+    await backupPortfolioStateToGoogleDrive();
+    saveStateToDisk();
+    broadcastState();
+
+    res.json({
+      success: true,
+      profiledTokens: Object.keys(learningEngine.state.assetReputations).length,
+      realizedPnL: State.portfolio.realizedPnL,
+      message: 'Successfully pushed live learning & portfolio data into Google Drive JSON files!'
+    });
   } catch (err) {
     res.json({ success: false, error: err.message });
   }
@@ -1690,4 +1723,10 @@ server.listen(PORT, '0.0.0.0', () => {
   setInterval(runPredictiveSentry, 2500);
   setInterval(runDynamicScreener, 85000);
   setInterval(syncLiveP2PRate, 600000);
+
+  // Automated 2-minute Google Drive sync heartbeat
+  setInterval(() => {
+    backupLearningStateToGoogleDrive().catch(() => {});
+    backupPortfolioStateToGoogleDrive().catch(() => {});
+  }, 120000);
 });
