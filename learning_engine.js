@@ -26,6 +26,72 @@ class LearningEngine {
     this.googleDriveSyncFn = fn;
   }
 
+  trainOnHistoricalTrades(tradeLogs) {
+    if (!Array.isArray(tradeLogs) || tradeLogs.length === 0) return;
+
+    // Reset base counts to train cleanly from the verified ledger
+    this.state.assetReputations = {};
+    this.state.recentAttributions = [];
+
+    // Sort chronologically (oldest to newest)
+    const chronological = [...tradeLogs].sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
+
+    chronological.forEach(trade => {
+      const rawPair = String(trade.pair || trade.symbol || '').trim().toUpperCase();
+      const cleanSym = rawPair.replace(/[^A-Z0-9]/g, '');
+      if (!cleanSym || cleanSym === 'CRYPTOUSDT' || !cleanSym.endsWith('USDT')) return;
+
+      const pnl = Number(trade.pnlUSDT) || 0;
+      const type = String(trade.type || 'EXIT').toUpperCase();
+      const reason = String(trade.reason || '');
+
+      let outcomeType = 'OTHER';
+      if (type.includes('TP1') || type.includes('RUNNER') || type.includes('PROFIT')) {
+        outcomeType = type.includes('TP1') ? 'TP1' : 'RUNNER';
+      } else if (type.includes('DISASTER') || type.includes('-6.50%') || pnl < -1.5) {
+        outcomeType = 'HARD DISASTER';
+      } else if (type.includes('RECOVERY') || type.includes('STEP') || reason.toLowerCase().includes('relief') || reason.toLowerCase().includes('bounce')) {
+        outcomeType = 'RECOVERY';
+      } else if (pnl >= 0) {
+        outcomeType = 'TP1';
+      } else {
+        outcomeType = 'RECOVERY';
+      }
+
+      const rep = this.getAssetReputation(cleanSym);
+      let multiplier = 1.0;
+      if (outcomeType === 'TP1' || outcomeType === 'RUNNER') {
+        multiplier = 1.10;
+        rep.wins = (rep.wins || 0) + 1;
+      } else if (outcomeType === 'HARD DISASTER' || pnl < -2.0) {
+        multiplier = 0.40; // Severe penalty for catastrophic drawdowns like HAEDAL
+        rep.disasters = (rep.disasters || 0) + 1;
+      } else {
+        multiplier = 0.95;
+        rep.bags = (rep.bags || 0) + 1;
+      }
+
+      rep.repScore = Number(Math.max(0.20, Math.min(1.50, rep.repScore * multiplier)).toFixed(3));
+      rep.lastUpdated = Number(trade.id) || Date.now();
+
+      this.state.recentAttributions.push({
+        id: trade.id,
+        timestamp: Number(trade.id) || Date.now(),
+        symbol: cleanSym,
+        pnlUSDT: pnl,
+        type: outcomeType,
+        repScoreAfter: rep.repScore
+      });
+    });
+
+    if (this.state.recentAttributions.length > 100) {
+      this.state.recentAttributions = this.state.recentAttributions.slice(-100);
+    }
+
+    this.recalculateDynamicHurdles();
+    this.saveState();
+  }
+
   loadState() {
     try {
       if (fs.existsSync(STATE_FILE)) {
