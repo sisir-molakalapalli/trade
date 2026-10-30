@@ -1001,6 +1001,40 @@ async function checkConfirmedClosedBar(symbol) {
   }
 }
 
+// -------------------------------------------------------------
+// DPEE: 1-MINUTE MICRO-CANDLE EXHAUSTION WICK CHECK
+// -------------------------------------------------------------
+async function check1mExhaustionWick(symbol) {
+  try {
+    const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=1m&limit=2`);
+    if (!res || !res.ok) return { exhausted: false, wickRatio: 0 };
+    const klines = await res.json();
+    if (!klines || klines.length === 0) return { exhausted: false, wickRatio: 0 };
+
+    const currentBar = klines[klines.length - 1];
+    const open = parseFloat(currentBar[1]);
+    const high = parseFloat(currentBar[2]);
+    const low = parseFloat(currentBar[3]);
+    const close = parseFloat(currentBar[4]);
+    const range = high - low;
+
+    if (range <= 0 || low <= 0) return { exhausted: false, wickRatio: 0 };
+
+    const rangePct = (range / low) * 100;
+    if (rangePct < 0.35) return { exhausted: false, wickRatio: 0 }; // Ignore micro-noise below 0.35%
+
+    const upperWick = high - Math.max(open, close);
+    const wickRatio = upperWick / range;
+
+    return {
+      exhausted: wickRatio >= 0.40,
+      wickRatio: Number(wickRatio.toFixed(2))
+    };
+  } catch (e) {
+    return { exhausted: false, wickRatio: 0 };
+  }
+}
+
 async function evaluateTimeMachineBreakoutOdds(symbol) {
   try {
     const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
@@ -1213,9 +1247,10 @@ function executeSpotBuy(pair, candidate, book, volFactor, entrySnapshot) {
     sl: Number((entryPrice * 0.95).toFixed(6)),
     peakPriceUSDT: entryPrice,
     peakGainPct: 0.0,
+    peakEfficiencyPct: 100,
     ratchetStage: 'INITIAL_RISK (-5.0%)',
     dynamicTrailPriceUSDT: 0,
-    dynamicTrailPct: '0.50',
+    dynamicTrailPct: '0.40',
     openedAt: Date.now(),
     entrySnapshot
   };
@@ -1225,37 +1260,46 @@ function executeSpotBuy(pair, candidate, book, volFactor, entrySnapshot) {
 }
 
 // -------------------------------------------------------------
-// DYNAMIC PROFIT RATCHET & TIGHTENING TRAILING SENTRY
+// DYNAMIC PEAK EXHAUSTION ENGINE (DPEE) & ADAPTIVE SENTRY
 // -------------------------------------------------------------
-function runPredictiveSentry() {
-  const activeKeys = Object.keys(State.activePositions);
-  const bagKeys = Object.keys(State.recoveryBags);
+let isSentryRunning = false;
 
-  // 1. MONITOR ACTIVE POSITIONS
-  activeKeys.forEach(k => {
-    const pos = State.activePositions[k];
-    const live = State.universe[k]?.priceUSDT || pos.livePriceUSDT;
-    pos.livePriceUSDT = live;
-    const gainPct = ((live - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
-    pos.gainPct = Number(gainPct.toFixed(2));
+async function runPredictiveSentry() {
+  if (isSentryRunning) return;
+  isSentryRunning = true;
 
-    if (live > (pos.peakPriceUSDT || pos.entryPriceUSDT)) {
-      pos.peakPriceUSDT = live;
-    }
-    const peakGainPct = ((pos.peakPriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
-    pos.peakGainPct = Number(peakGainPct.toFixed(2));
+  try {
+    const activeKeys = Object.keys(State.activePositions);
+    const bagKeys = Object.keys(State.recoveryBags);
 
-    // ==============================================================
-    // A. PROFIT RATCHETS (ONLY PROFIT EXITS ALLOWED IN ACTIVE POSITIONS)
-    // ==============================================================
-    if (!pos.tp1Secured) {
-      // Tier 1: Near-Miss Lock (+1.60% hit -> locks +1.10% profit floor)
-      if (peakGainPct >= 1.60) {
-        const floorPrice = Number((pos.entryPriceUSDT * 1.0110).toFixed(6));
-        pos.sl = Math.max(pos.sl || 0, floorPrice);
-        pos.ratchetStage = 'NEAR_MISS_LOCK (+1.10%)';
+    // 1. MONITOR ACTIVE POSITIONS
+    for (const k of activeKeys) {
+      const pos = State.activePositions[k];
+      if (!pos) continue;
 
-        if (live <= pos.sl) {
+      const live = State.universe[k]?.priceUSDT || pos.livePriceUSDT;
+      pos.livePriceUSDT = live;
+      const gainPct = ((live - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
+      pos.gainPct = Number(gainPct.toFixed(2));
+
+      if (live > (pos.peakPriceUSDT || pos.entryPriceUSDT)) {
+        pos.peakPriceUSDT = live;
+      }
+      const peakGainPct = ((pos.peakPriceUSDT - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
+      pos.peakGainPct = Number(peakGainPct.toFixed(2));
+
+      const peakEff = peakGainPct > 0
+        ? Math.min(100, Math.max(0, Math.round((gainPct / peakGainPct) * 100)))
+        : 100;
+      pos.peakEfficiencyPct = peakEff;
+
+      // ==============================================================
+      // DPEE PHASE 1: MICROSTRUCTURE ORDER BOOK FLIP DETECTION
+      // (When up >= 1.40% or peaked >= 1.50%, exit immediately if buyers flee)
+      // ==============================================================
+      if (gainPct >= 1.40 || peakGainPct >= 1.50) {
+        const book = await fetchRealOrderBookDepth(k);
+        if (book && book.obi < 0.38) {
           const exitCash = pos.qty * live;
           const profit = exitCash - pos.notionalUSDT;
           State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
@@ -1266,7 +1310,7 @@ function runPredictiveSentry() {
             date: new Date().toLocaleDateString('en-GB'),
             time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
             pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-            type: 'PROFIT RATCHET (+1.10%)',
+            type: 'EXHAUSTION (OBI FLIP)',
             entryPriceUSDT: pos.entryPriceUSDT,
             exitPriceUSDT: live,
             notionalUSDT: pos.notionalUSDT,
@@ -1274,262 +1318,252 @@ function runPredictiveSentry() {
             pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
             regime: State.marketRegime || 'BALANCED',
             volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
-            reason: `Near-miss ratchet locked: Peaked +${peakGainPct.toFixed(2)}%, banked exit at +${gainPct.toFixed(2)}%`
+            peakEfficiencyPct: peakEff,
+            reason: `Top-tick DPEE exit: 20-Depth OBI collapsed to ${(book.obi * 100).toFixed(0)}% bids (Peaked +${peakGainPct.toFixed(2)}%, captured ${peakEff}% efficiency)`
           };
 
           State.tradeLogs.unshift(tradeRecord);
           recordTradeToCloudLedger(tradeRecord);
-          learningEngine.recordTradeOutcome(k, 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
+          learningEngine.recordTradeOutcome(k, pos.tp1Secured ? 'RUNNER' : 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
           State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
           delete State.activePositions[k];
           saveStateToDisk();
           broadcastState();
-          return;
+          continue;
+        }
+
+        // ==============================================================
+        // DPEE PHASE 2: 1-MINUTE CANDLE REJECTION WICK TRIGGER
+        // (If price rejected >= 40% from the 1m intra-bar high, top is in)
+        // ==============================================================
+        if (gainPct >= 1.50) {
+          const wickCheck = await check1mExhaustionWick(k);
+          if (wickCheck.exhausted) {
+            const exitCash = pos.qty * live;
+            const profit = exitCash - pos.notionalUSDT;
+            State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+            State.portfolio.realizedPnL += Number(profit.toFixed(4));
+
+            const tradeRecord = {
+              id: Date.now(),
+              date: new Date().toLocaleDateString('en-GB'),
+              time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+              pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+              type: 'EXHAUSTION (1M WICK)',
+              entryPriceUSDT: pos.entryPriceUSDT,
+              exitPriceUSDT: live,
+              notionalUSDT: pos.notionalUSDT,
+              pnlUSDT: Number(profit.toFixed(4)),
+              pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+              regime: State.marketRegime || 'BALANCED',
+              volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+              peakEfficiencyPct: peakEff,
+              reason: `Top-tick DPEE exit: 1m upper rejection wick ${(wickCheck.wickRatio * 100).toFixed(0)}% (Peaked +${peakGainPct.toFixed(2)}%, captured ${peakEff}% efficiency)`
+            };
+
+            State.tradeLogs.unshift(tradeRecord);
+            recordTradeToCloudLedger(tradeRecord);
+            learningEngine.recordTradeOutcome(k, pos.tp1Secured ? 'RUNNER' : 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+            State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+            delete State.activePositions[k];
+            saveStateToDisk();
+            broadcastState();
+            continue;
+          }
         }
       }
-      // Tier 2: Breakeven & Fee Lock (+1.35% hit -> locks +0.30% profit floor)
-      else if (peakGainPct >= 1.35) {
-        const floorPrice = Number((pos.entryPriceUSDT * 1.0030).toFixed(6));
-        pos.sl = Math.max(pos.sl || 0, floorPrice);
-        pos.ratchetStage = 'BREAKEVEN_LOCK (+0.30%)';
 
-        if (live <= pos.sl) {
-          const exitCash = pos.qty * live;
-          const profit = exitCash - pos.notionalUSDT;
-          State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
-          State.portfolio.realizedPnL += Number(profit.toFixed(4));
+      // ==============================================================
+      // A. PRE-TP1 PROFIT RATCHETS (LOCKING PROFIT FLOORS)
+      // ==============================================================
+      if (!pos.tp1Secured) {
+        // Tier 1: Near-Miss Lock (+1.60% hit -> locks +1.10% profit floor)
+        if (peakGainPct >= 1.60) {
+          const floorPrice = Number((pos.entryPriceUSDT * 1.0110).toFixed(6));
+          pos.sl = Math.max(pos.sl || 0, floorPrice);
+          pos.ratchetStage = 'NEAR_MISS_LOCK (+1.10%)';
 
-          const tradeRecord = {
-            id: Date.now(),
-            date: new Date().toLocaleDateString('en-GB'),
-            time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
-            pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-            type: 'PROFIT RATCHET (+0.30%)',
-            entryPriceUSDT: pos.entryPriceUSDT,
-            exitPriceUSDT: live,
-            notionalUSDT: pos.notionalUSDT,
-            pnlUSDT: Number(profit.toFixed(4)),
-            pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
-            regime: State.marketRegime || 'BALANCED',
-            volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
-            reason: `Breakeven ratchet locked: Peaked +${peakGainPct.toFixed(2)}%, principal & fees 100% secured`
-          };
+          if (live <= pos.sl) {
+            const exitCash = pos.qty * live;
+            const profit = exitCash - pos.notionalUSDT;
+            State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+            State.portfolio.realizedPnL += Number(profit.toFixed(4));
 
-          State.tradeLogs.unshift(tradeRecord);
-          recordTradeToCloudLedger(tradeRecord);
-          learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
-          State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
-          delete State.activePositions[k];
-          saveStateToDisk();
-          broadcastState();
-          return;
+            const tradeRecord = {
+              id: Date.now(),
+              date: new Date().toLocaleDateString('en-GB'),
+              time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+              pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+              type: 'PROFIT RATCHET (+1.10%)',
+              entryPriceUSDT: pos.entryPriceUSDT,
+              exitPriceUSDT: live,
+              notionalUSDT: pos.notionalUSDT,
+              pnlUSDT: Number(profit.toFixed(4)),
+              pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+              regime: State.marketRegime || 'BALANCED',
+              volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+              peakEfficiencyPct: peakEff,
+              reason: `Near-miss ratchet locked: Peaked +${peakGainPct.toFixed(2)}%, banked exit at +${gainPct.toFixed(2)}% (Captured ${peakEff}% efficiency)`
+            };
+
+            State.tradeLogs.unshift(tradeRecord);
+            recordTradeToCloudLedger(tradeRecord);
+            learningEngine.recordTradeOutcome(k, 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+            State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+            delete State.activePositions[k];
+            saveStateToDisk();
+            broadcastState();
+            continue;
+          }
+        }
+        // Tier 2: Breakeven & Fee Lock (+1.35% hit -> locks +0.30% profit floor)
+        else if (peakGainPct >= 1.35) {
+          const floorPrice = Number((pos.entryPriceUSDT * 1.0030).toFixed(6));
+          pos.sl = Math.max(pos.sl || 0, floorPrice);
+          pos.ratchetStage = 'BREAKEVEN_LOCK (+0.30%)';
+
+          if (live <= pos.sl) {
+            const exitCash = pos.qty * live;
+            const profit = exitCash - pos.notionalUSDT;
+            State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+            State.portfolio.realizedPnL += Number(profit.toFixed(4));
+
+            const tradeRecord = {
+              id: Date.now(),
+              date: new Date().toLocaleDateString('en-GB'),
+              time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+              pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+              type: 'PROFIT RATCHET (+0.30%)',
+              entryPriceUSDT: pos.entryPriceUSDT,
+              exitPriceUSDT: live,
+              notionalUSDT: pos.notionalUSDT,
+              pnlUSDT: Number(profit.toFixed(4)),
+              pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+              regime: State.marketRegime || 'BALANCED',
+              volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+              peakEfficiencyPct: peakEff,
+              reason: `Breakeven ratchet locked: Peaked +${peakGainPct.toFixed(2)}%, principal & fees 100% secured`
+            };
+
+            State.tradeLogs.unshift(tradeRecord);
+            recordTradeToCloudLedger(tradeRecord);
+            learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+            State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+            delete State.activePositions[k];
+            saveStateToDisk();
+            broadcastState();
+            continue;
+          }
         }
       }
-    }
 
-    // ==============================================================
-    // B. TP1 HIT (+1.80%): BANK 50% POSITION & ACTIVATE RUNNER
-    // ==============================================================
-    if (!pos.tp1Secured && gainPct >= 1.80) {
-      pos.tp1Secured = true;
-      const bankedCash = (pos.notionalUSDT * 0.5) * (1 + (gainPct / 100));
-      const profit = bankedCash - (pos.notionalUSDT * 0.5);
-      const subsidy = profit * 0.35;
+      // ==============================================================
+      // B. TP1 HIT (+1.80%): BANK 50% POSITION & ACTIVATE RUNNER
+      // ==============================================================
+      if (!pos.tp1Secured && gainPct >= 1.80) {
+        pos.tp1Secured = true;
+        const bankedCash = (pos.notionalUSDT * 0.5) * (1 + (gainPct / 100));
+        const profit = bankedCash - (pos.notionalUSDT * 0.5);
+        const subsidy = profit * 0.35;
 
-      State.portfolio.cashUSDT += Number((bankedCash - subsidy).toFixed(2));
-      State.portfolio.bagSubsidyPoolUSDT += Number(subsidy.toFixed(2));
-      pos.qty = Number((pos.qty * 0.5).toFixed(6));
-      pos.notionalUSDT = Number((pos.notionalUSDT * 0.5).toFixed(2));
-      pos.sl = Number((pos.entryPriceUSDT * 1.0050).toFixed(6));
-      pos.ratchetStage = 'RUNNER_TRAILING';
-
-      const tradeRecord = {
-        id: Date.now(),
-        date: new Date().toLocaleDateString('en-GB'),
-        time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
-        pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-        type: 'TP1 (50% BANKED)',
-        entryPriceUSDT: pos.entryPriceUSDT,
-        exitPriceUSDT: live,
-        notionalUSDT: Number(pos.notionalUSDT.toFixed(2)),
-        pnlUSDT: Number(profit.toFixed(4)),
-        pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
-        regime: State.marketRegime || 'BALANCED',
-        volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
-        reason: 'TP1 secured: 50% banked at +1.80%, runner activated'
-      };
-      State.tradeLogs.unshift(tradeRecord);
-      recordTradeToCloudLedger(tradeRecord);
-      learningEngine.recordTradeOutcome(k, 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
-    }
-
-    // ==============================================================
-    // C. PROXIMITY-TIGHTENING RUNNER TRAIL
-    // ==============================================================
-    if (pos.tp1Secured) {
-      let trailPct = 0.0050; // Tight 0.50% trail for +1.80% to +2.40%
-      if (peakGainPct >= 3.50) {
-        trailPct = 0.0120; // 1.20% wide trail for runaway parabolic pumps
-      } else if (peakGainPct >= 2.40) {
-        trailPct = 0.0075; // 0.75% medium trail for +2.40% to +3.50%
-      }
-
-      const trailPrice = pos.peakPriceUSDT * (1 - trailPct);
-      pos.dynamicTrailPriceUSDT = trailPrice;
-      pos.dynamicTrailPct = (trailPct * 100).toFixed(2);
-
-      if (live <= trailPrice) {
-        const exitCash = pos.qty * live;
-        const profit = exitCash - pos.notionalUSDT;
-        State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
-        State.portfolio.realizedPnL += Number(profit.toFixed(4));
+        State.portfolio.cashUSDT += Number((bankedCash - subsidy).toFixed(2));
+        State.portfolio.bagSubsidyPoolUSDT += Number(subsidy.toFixed(2));
+        pos.qty = Number((pos.qty * 0.5).toFixed(6));
+        pos.notionalUSDT = Number((pos.notionalUSDT * 0.5).toFixed(2));
+        pos.sl = Number((pos.entryPriceUSDT * 1.0050).toFixed(6));
+        pos.ratchetStage = 'RUNNER_DPEE (0.40% TRAIL)';
 
         const tradeRecord = {
           id: Date.now(),
           date: new Date().toLocaleDateString('en-GB'),
           time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
           pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-          type: 'RUNNER EXIT',
+          type: 'TP1 (50% BANKED)',
           entryPriceUSDT: pos.entryPriceUSDT,
           exitPriceUSDT: live,
-          notionalUSDT: pos.notionalUSDT,
+          notionalUSDT: Number(pos.notionalUSDT.toFixed(2)),
           pnlUSDT: Number(profit.toFixed(4)),
           pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
           regime: State.marketRegime || 'BALANCED',
           volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
-          reason: `Tightened runner trail locked (Peaked +${peakGainPct.toFixed(2)}%, Trailed ${pos.dynamicTrailPct}%)`
+          peakEfficiencyPct: 100,
+          reason: 'TP1 secured: 50% banked at +1.80%, DPEE runner activated'
         };
-
         State.tradeLogs.unshift(tradeRecord);
         recordTradeToCloudLedger(tradeRecord);
-        learningEngine.recordTradeOutcome(k, 'RUNNER', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot);
-        State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+        learningEngine.recordTradeOutcome(k, 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, 100);
+      }
+
+      // ==============================================================
+      // C. DPEE PARABOLIC COMPRESSION RUNNER TRAIL (INVERSE RATCHET)
+      // (The higher and faster it pumps, the tighter the trail hugs peak!)
+      // ==============================================================
+      if (pos.tp1Secured) {
+        let trailPct = 0.0040; // 0.40% trail for +1.80% to +2.20%
+        if (peakGainPct >= 3.20) {
+          trailPct = 0.0022; // 0.22% ultra-tight trail on parabolic spikes!
+        } else if (peakGainPct >= 2.20) {
+          trailPct = 0.0030; // 0.30% tight compression trail (locks in +2.40% moves)
+        }
+
+        const trailPrice = pos.peakPriceUSDT * (1 - trailPct);
+        pos.dynamicTrailPriceUSDT = trailPrice;
+        pos.dynamicTrailPct = (trailPct * 100).toFixed(2);
+        pos.ratchetStage = `RUNNER_DPEE (${pos.dynamicTrailPct}% TRAIL)`;
+
+        if (live <= trailPrice) {
+          const exitCash = pos.qty * live;
+          const profit = exitCash - pos.notionalUSDT;
+          State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+          State.portfolio.realizedPnL += Number(profit.toFixed(4));
+
+          const tradeRecord = {
+            id: Date.now(),
+            date: new Date().toLocaleDateString('en-GB'),
+            time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+            pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+            type: 'RUNNER EXIT (DPEE)',
+            entryPriceUSDT: pos.entryPriceUSDT,
+            exitPriceUSDT: live,
+            notionalUSDT: pos.notionalUSDT,
+            pnlUSDT: Number(profit.toFixed(4)),
+            pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+            regime: State.marketRegime || 'BALANCED',
+            volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+            peakEfficiencyPct: peakEff,
+            reason: `DPEE compression trail locked: Peaked +${peakGainPct.toFixed(2)}%, trailed ${pos.dynamicTrailPct}%, efficiency ${peakEff}%`
+          };
+
+          State.tradeLogs.unshift(tradeRecord);
+          recordTradeToCloudLedger(tradeRecord);
+          learningEngine.recordTradeOutcome(k, 'RUNNER', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+          State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+          delete State.activePositions[k];
+          saveStateToDisk();
+          broadcastState();
+          continue;
+        }
+      }
+
+      // ==============================================================
+      // D. ZERO REALIZED LOSS ARCHITECTURE: NO LOSS EXITS IN ACTIVE SLOTS
+      // ==============================================================
+      if (!pos.tp1Secured && gainPct <= -1.80) {
+        State.recoveryBags[k] = {
+          ...pos,
+          movedAt: Date.now(),
+          targetStep: 'STEP 1 (+0.30%)',
+          targetExitPriceUSDT: Number((pos.entryPriceUSDT * 1.003).toFixed(6))
+        };
         delete State.activePositions[k];
         saveStateToDisk();
         broadcastState();
-        return;
+        continue;
       }
     }
 
-    // ==============================================================
-    // D. ZERO REALIZED LOSS ARCHITECTURE: NO LOSS EXITS IN ACTIVE SLOTS
-    // ==============================================================
-    // Any adverse move or retest dip is transferred directly to the Spot Recovery Bag.
-    // Active breakout positions NEVER sell for a loss!
-    if (!pos.tp1Secured && gainPct <= -1.80) {
-      State.recoveryBags[k] = {
-        ...pos,
-        movedAt: Date.now(),
-        targetStep: 'STEP 1 (+0.30%)',
-        targetExitPriceUSDT: Number((pos.entryPriceUSDT * 1.003).toFixed(6))
-      };
-      delete State.activePositions[k];
-      saveStateToDisk();
-      broadcastState();
-      return;
-    }
-  });
-
-  // 2. MONITOR RECOVERY BAGS
-  bagKeys.forEach(k => {
-    const bag = State.recoveryBags[k];
-    const live = State.universe[k]?.priceUSDT || bag.livePriceUSDT;
-    bag.livePriceUSDT = live;
-    const gainPct = ((live - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100;
-    bag.gainPct = Number(gainPct.toFixed(2));
-    bag.ageHours = Number(((Date.now() - (bag.movedAt || Date.now())) / 3600000).toFixed(1));
-
-    // Hard Disaster Floor (-6.50%)
-    if (gainPct <= -6.50) {
-      const returnCash = bag.qty * live;
-      const loss = returnCash - bag.notionalUSDT;
-      State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
-      State.portfolio.realizedPnL += Number(loss.toFixed(4));
-
-      const tradeRecord = {
-        id: Date.now(),
-        date: new Date().toLocaleDateString('en-GB'),
-        time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
-        pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-        type: 'HARD DISASTER (-6.50%)',
-        entryPriceUSDT: bag.entryPriceUSDT,
-        exitPriceUSDT: live,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: Number(loss.toFixed(4)),
-        pnlINR: Number((loss * State.usdtToInrRate).toFixed(2)),
-        regime: State.marketRegime || 'BALANCED',
-        volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
-        reason: 'Hard disaster floor liquidated to preserve cash'
-      };
-
-      State.tradeLogs.unshift(tradeRecord);
-      recordTradeToCloudLedger(tradeRecord);
-      learningEngine.recordTradeOutcome(k, 'HARD DISASTER', loss, bag.ageHours, bag.entrySnapshot);
-      State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
-      delete State.recoveryBags[k];
-      saveStateToDisk();
-      broadcastState();
-      return;
-    }
-
-    // Step Down Targets
-    if (bag.ageHours >= 24) {
-      bag.targetStep = 'STEP 4 (-1.50%)';
-      bag.targetExitPriceUSDT = Number((bag.entryPriceUSDT * 0.985).toFixed(6));
-    } else if (bag.ageHours >= 12) {
-      bag.targetStep = 'STEP 3 (-0.75%)';
-      bag.targetExitPriceUSDT = Number((bag.entryPriceUSDT * 0.9925).toFixed(6));
-    } else if (bag.ageHours >= 4) {
-      bag.targetStep = 'STEP 2 (0.00%)';
-      bag.targetExitPriceUSDT = Number(bag.entryPriceUSDT.toFixed(6));
-    }
-
-    // Target Filled on Relief Bounce
-    if (live >= bag.targetExitPriceUSDT) {
-      const returnCash = bag.qty * live;
-      const profit = returnCash - bag.notionalUSDT;
-      State.portfolio.cashUSDT += Number(returnCash.toFixed(2));
-      State.portfolio.realizedPnL += Number(profit.toFixed(4));
-
-      const tradeRecord = {
-        id: Date.now(),
-        date: new Date().toLocaleDateString('en-GB'),
-        time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
-        pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-        type: `RECOVERY (${bag.targetStep})`,
-        entryPriceUSDT: bag.entryPriceUSDT,
-        exitPriceUSDT: live,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: Number(profit.toFixed(4)),
-        pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
-        regime: State.marketRegime || 'BALANCED',
-        volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
-        reason: 'Relief bounce filled recovery target'
-      };
-
-      State.tradeLogs.unshift(tradeRecord);
-      recordTradeToCloudLedger(tradeRecord);
-      learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, bag.ageHours, bag.entrySnapshot);
-      State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
-      delete State.recoveryBags[k];
-      saveStateToDisk();
-      broadcastState();
-      return;
-    }
-
-    // Self-Healing Subsidy Pool Liquidation (>6h)
-    if (bag.ageHours >= 6.0 && gainPct < 0) {
-      const deficit = bag.notionalUSDT - (bag.qty * live);
-      if (deficit > 0 && State.portfolio.bagSubsidyPoolUSDT >= deficit) {
-        State.portfolio.bagSubsidyPoolUSDT -= Number(deficit.toFixed(2));
-        State.portfolio.cashUSDT += Number(bag.notionalUSDT.toFixed(2));
-
-        const tradeRecord = {
-          id: Date.now(),
-          date: new Date().toLocaleDateString('en-GB'),
-          time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
-          pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-          type: 'SUBSIDY CLEAR',
+    // 2. MONITOR RECOVERY BAGS
+    bagKeys.forEach(k => {
           entryPriceUSDT: bag.entryPriceUSDT,
           exitPriceUSDT: live,
           notionalUSDT: bag.notionalUSDT,
