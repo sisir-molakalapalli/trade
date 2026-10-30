@@ -19,6 +19,7 @@ const PORT = process.env.PORT || 8080;
 const STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || 'jtG8g4dNoJpXQ6vu03f8l4quEir2HHCVOrXXfpgmSCxV1ubg4p4eaOmN9oH3eG53';
 const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
+const TRADE_LEDGER_URL = process.env.TRADE_LEDGER_URL || 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2SYnfOfz_2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
 
 const DRIVE_FILE_IDS = {
   learningState: '15eSFMAP8gFT8hMZLO8xplq3woSCbQmeL',
@@ -36,25 +37,46 @@ learningEngine.setGoogleDriveSyncCallback((payload) => {
 // CLOUD LEDGER TRADE DISPATCHER (GOOGLE SHEETS APPEND)
 // -------------------------------------------------------------
 async function recordTradeToCloudLedger(trade) {
-  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
-  if (!targetUrl || !trade) return;
+  if (!trade) return;
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-    const res = await fetch(targetUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(trade),
-      redirect: 'follow',
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-    if (res.ok) {
-      console.log(`[Cloud Ledger] Successfully synced closed trade ${trade.pair} (${trade.type}) to Google Sheet!`);
+  const targetUrls = new Set();
+  if (TRADE_LEDGER_URL) targetUrls.add(TRADE_LEDGER_URL);
+  if (State.googleSheetUrl) targetUrls.add(State.googleSheetUrl);
+  if (GOOGLE_SHEET_URL) targetUrls.add(GOOGLE_SHEET_URL);
+
+  const payload = {
+    id: trade.id || Date.now(),
+    date: trade.date || new Date().toLocaleDateString('en-GB'),
+    time: trade.time || new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+    pair: trade.pair || '',
+    type: trade.type || 'EXIT',
+    entryPriceUSDT: Number(trade.entryPriceUSDT || 0),
+    exitPriceUSDT: Number(trade.exitPriceUSDT || 0),
+    pnlUSDT: Number(trade.pnlUSDT || 0),
+    pnlINR: Number(trade.pnlINR || 0),
+    regime: trade.regime || State.marketRegime || 'BALANCED',
+    volatilityPct: Number(trade.volatilityPct || State.activeThresholds?.marketAvgRange || 4.5),
+    reason: trade.reason || 'Settled trade'
+  };
+
+  for (const url of targetUrls) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 12000);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload),
+        redirect: 'follow',
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (res.ok) {
+        console.log(`[Cloud Ledger] Synced closed trade ${payload.pair} (${payload.type}) to ${url.slice(0, 48)}...`);
+      }
+    } catch (e) {
+      console.error('[Cloud Ledger Sync Error]', e.message);
     }
-  } catch (e) {
-    console.error('[Cloud Ledger Sync Error]', e.message);
   }
 }
 
@@ -547,6 +569,7 @@ function parseCsvTradeRows(csvText) {
     const rowObj = {};
     headers.forEach((h, idx) => { rowObj[h] = cols[idx] || ''; });
 
+    // Format: 0:ID, 1:Date, 2:Time, 3:Pair, 4:Type, 5:Entry, 6:Exit, 7:PnL(USDT), 8:PnL(INR), 9:Regime, 10:Volatility, 11:Reason
     const normalized = normalizeSheetTrade({
       id: cols[0] || Date.now() - i * 1000,
       date: cols[1] || 'Recent',
@@ -555,10 +578,11 @@ function parseCsvTradeRows(csvText) {
       type: cols[4] || 'EXIT',
       entryPriceUSDT: cols[5],
       exitPriceUSDT: cols[6],
-      notionalUSDT: cols[7],
-      pnlUSDT: cols[8],
-      pnlINR: cols[9],
-      reason: cols[10] || '',
+      pnlUSDT: cols[7],
+      pnlINR: cols[8],
+      regime: cols[9] || 'BALANCED',
+      volatilityPct: cols[10] || 4.5,
+      reason: cols[11] || '',
       ...rowObj
     });
 
@@ -1248,6 +1272,8 @@ function runPredictiveSentry() {
             notionalUSDT: pos.notionalUSDT,
             pnlUSDT: Number(profit.toFixed(4)),
             pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+            regime: State.marketRegime || 'BALANCED',
+            volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
             reason: `Near-miss ratchet locked: Peaked +${peakGainPct.toFixed(2)}%, banked exit at +${gainPct.toFixed(2)}%`
           };
 
@@ -1284,6 +1310,8 @@ function runPredictiveSentry() {
             notionalUSDT: pos.notionalUSDT,
             pnlUSDT: Number(profit.toFixed(4)),
             pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+            regime: State.marketRegime || 'BALANCED',
+            volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
             reason: `Breakeven ratchet locked: Peaked +${peakGainPct.toFixed(2)}%, principal & fees 100% secured`
           };
 
@@ -1326,6 +1354,8 @@ function runPredictiveSentry() {
         notionalUSDT: Number(pos.notionalUSDT.toFixed(2)),
         pnlUSDT: Number(profit.toFixed(4)),
         pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+        regime: State.marketRegime || 'BALANCED',
+        volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
         reason: 'TP1 secured: 50% banked at +1.80%, runner activated'
       };
       State.tradeLogs.unshift(tradeRecord);
@@ -1365,6 +1395,8 @@ function runPredictiveSentry() {
           notionalUSDT: pos.notionalUSDT,
           pnlUSDT: Number(profit.toFixed(4)),
           pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+          regime: State.marketRegime || 'BALANCED',
+          volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
           reason: `Tightened runner trail locked (Peaked +${peakGainPct.toFixed(2)}%, Trailed ${pos.dynamicTrailPct}%)`
         };
 
@@ -1425,6 +1457,8 @@ function runPredictiveSentry() {
         notionalUSDT: bag.notionalUSDT,
         pnlUSDT: Number(loss.toFixed(4)),
         pnlINR: Number((loss * State.usdtToInrRate).toFixed(2)),
+        regime: State.marketRegime || 'BALANCED',
+        volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
         reason: 'Hard disaster floor liquidated to preserve cash'
       };
 
@@ -1468,6 +1502,8 @@ function runPredictiveSentry() {
         notionalUSDT: bag.notionalUSDT,
         pnlUSDT: Number(profit.toFixed(4)),
         pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+        regime: State.marketRegime || 'BALANCED',
+        volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
         reason: 'Relief bounce filled recovery target'
       };
 
@@ -1499,6 +1535,8 @@ function runPredictiveSentry() {
           notionalUSDT: bag.notionalUSDT,
           pnlUSDT: 0.0000,
           pnlINR: 0.00,
+          regime: State.marketRegime || 'BALANCED',
+          volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
           reason: 'Winner subsidy pool absorbed bag deficit'
         };
 
@@ -1534,6 +1572,8 @@ function closeActivePositionManual(pairKey) {
     notionalUSDT: pos.notionalUSDT,
     pnlUSDT: Number(pnl.toFixed(4)),
     pnlINR: Number((pnl * State.usdtToInrRate).toFixed(2)),
+    regime: State.marketRegime || 'BALANCED',
+    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
     reason: 'Manual market exit by operator'
   };
 
@@ -1565,6 +1605,8 @@ function closeRecoveryBagManual(pairKey) {
     notionalUSDT: bag.notionalUSDT,
     pnlUSDT: Number(pnl.toFixed(4)),
     pnlINR: Number((pnl * State.usdtToInrRate).toFixed(2)),
+    regime: State.marketRegime || 'BALANCED',
+    volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
     reason: 'Manual recovery bag liquidation by operator'
   };
 
