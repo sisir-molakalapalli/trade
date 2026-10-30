@@ -529,100 +529,93 @@ async function fetchTradesFromDirectLedgerCsv() {
       const text = await res.text();
       const trades = parseCsvTradeRows(text);
       if (trades && trades.length > 0) {
-        State.tradeLogs = sanitizeAndAuditTradeHistory(trades);
-        recalculateTrueRealizedPnL();
-        reconcileRollingTradeQuotaFromHistory();
+        return trades;
       }
     }
   } catch (e) {
     console.error('[CSV Fetch Error]', e.message);
   }
+  return [];
 }
 
 async function syncWithGoogleDrive() {
   const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
-  if (!targetUrl) return;
+  let collectedTrades = [];
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-    const res = await fetch(`${targetUrl}?action=GET_ALL`, {
-      method: 'GET',
-      redirect: 'follow',
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
+  // 1. Fetch from Apps Script Web App
+  if (targetUrl) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 12000);
+      const res = await fetch(`${targetUrl}?action=GET_ALL`, {
+        method: 'GET',
+        redirect: 'follow',
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
 
-    if (res.ok) {
-      const data = await res.json();
-      
-      if (data && data.learningState) {
-        learningEngine.restoreFromDrivePayload(data);
-      }
+      if (res.ok) {
+        const data = await res.json();
+        
+        if (data && data.learningState) {
+          learningEngine.restoreFromDrivePayload(data);
+        }
 
-      if (data && data.portfolioState && typeof data.portfolioState === 'object') {
-        const ps = data.portfolioState;
-        if (ps.portfolio) State.portfolio = { ...State.portfolio, ...ps.portfolio };
-        if (ps.activePositions && Object.keys(ps.activePositions).length > 0) State.activePositions = ps.activePositions;
-        if (ps.recoveryBags && Object.keys(ps.recoveryBags).length > 0) State.recoveryBags = ps.recoveryBags;
-        if (ps.cooldowns) State.cooldowns = { ...State.cooldowns, ...ps.cooldowns };
-      }
+        if (data && data.portfolioState && typeof data.portfolioState === 'object') {
+          const ps = data.portfolioState;
+          if (ps.portfolio) State.portfolio = { ...State.portfolio, ...ps.portfolio };
+          if (ps.activePositions && Object.keys(ps.activePositions).length > 0) State.activePositions = ps.activePositions;
+          if (ps.recoveryBags && Object.keys(ps.recoveryBags).length > 0) State.recoveryBags = ps.recoveryBags;
+          if (ps.cooldowns) State.cooldowns = { ...State.cooldowns, ...ps.cooldowns };
+        }
 
-      const rawList = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
-      if (rawList.length > 0) {
-        const validSheetTrades = [];
+        const rawList = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
         rawList.forEach(item => {
           const normalized = normalizeSheetTrade(item);
           if (normalized && isValidTradeRecord(normalized)) {
-            validSheetTrades.push(normalized);
+            collectedTrades.push(normalized);
           }
         });
-        if (validSheetTrades.length > 0) {
-          State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
-          recalculateTrueRealizedPnL();
-          reconcileRollingTradeQuotaFromHistory();
-        }
       }
-
-      // Fallback 1: Dedicated Trade Ledger Web App
-      if (State.tradeLogs.length === 0) {
-        const ledgerTrades = await fetchTradesFromLedgerWebApp();
-        if (ledgerTrades.length > 0) {
-          State.tradeLogs = sanitizeAndAuditTradeHistory(ledgerTrades);
-          recalculateTrueRealizedPnL();
-          reconcileRollingTradeQuotaFromHistory();
-        }
-      }
-
-      // Fallback 2: Direct Google Sheet CSV
-      if (State.tradeLogs.length === 0) {
-        await fetchTradesFromDirectLedgerCsv();
-      }
-
-      // Autonomous Learning Engine Training & Universe Baseline
-      learningEngine.trainOnHistoricalTrades(State.tradeLogs, Object.keys(State.universe || {}));
-
-      State.subsystems.persistence.googleSheetSync = 'ACTIVE';
-      State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
-      saveStateToDisk();
-      backupLearningStateToGoogleDrive().catch(() => {});
-      backupPortfolioStateToGoogleDrive().catch(() => {});
-      broadcastState();
-      return true;
-    }
-  } catch (err) {
-    console.error('[Google Drive Sync Error]', err.message);
-    if (State.tradeLogs.length === 0) {
-      const ledgerTrades = await fetchTradesFromLedgerWebApp();
-      if (ledgerTrades.length > 0) {
-        State.tradeLogs = sanitizeAndAuditTradeHistory(ledgerTrades);
-      } else {
-        await fetchTradesFromDirectLedgerCsv();
-      }
-      learningEngine.trainOnHistoricalTrades(State.tradeLogs, Object.keys(State.universe || {}));
+    } catch (err) {
+      console.error('[Google Drive Sync Error]', err.message);
     }
   }
-  return false;
+
+  // 2. Fetch from Dedicated Trade Ledger Web App
+  try {
+    const ledgerTrades = await fetchTradesFromLedgerWebApp();
+    if (ledgerTrades && ledgerTrades.length > 0) {
+      collectedTrades.push(...ledgerTrades);
+    }
+  } catch (e) {}
+
+  // 3. Fetch from Direct Google Sheet CSV (Master 70-Trade Ledger)
+  try {
+    const csvTrades = await fetchTradesFromDirectLedgerCsv();
+    if (csvTrades && csvTrades.length > 0) {
+      collectedTrades.push(...csvTrades);
+    }
+  } catch (e) {}
+
+  // 4. Merge all sources with existing State.tradeLogs (never discard historical trades)
+  const allMerged = [...(State.tradeLogs || []), ...collectedTrades];
+  if (allMerged.length > 0) {
+    State.tradeLogs = sanitizeAndAuditTradeHistory(allMerged);
+    recalculateTrueRealizedPnL();
+    reconcileRollingTradeQuotaFromHistory();
+  }
+
+  // 5. Train Learning Engine with full verified trade history
+  learningEngine.trainOnHistoricalTrades(State.tradeLogs, Object.keys(State.universe || {}));
+
+  State.subsystems.persistence.googleSheetSync = 'ACTIVE';
+  State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
+  saveStateToDisk();
+  backupLearningStateToGoogleDrive().catch(() => {});
+  backupPortfolioStateToGoogleDrive().catch(() => {});
+  broadcastState();
+  return true;
 }
 
 function parseCsvTradeRows(csvText) {
@@ -974,16 +967,16 @@ function normalizeSheetTrade(raw) {
     return '';
   };
 
-  const rawPair = String(getField(['pair', 'Pair', 'symbol', 'Symbol', 'asset'])).trim().toUpperCase();
+  const rawPair = String(getField(['pair', 'Pair', 'symbol', 'Symbol', 'asset', 'pairusdt'])).trim().toUpperCase();
   if (!rawPair || rawPair === 'CRYPTO/USDT' || !rawPair.includes('USDT')) return null;
 
-  const entry = parseCleanNumber(getField(['entryPriceUSDT', 'Entry Price (USDT)', 'entryPrice', 'entry']));
-  const exit = parseCleanNumber(getField(['exitPriceUSDT', 'Exit Price (USDT)', 'exitPrice', 'exit']));
+  const entry = parseCleanNumber(getField(['entryPriceUSDT', 'Entry Price (USDT)', 'entryPrice', 'entry', 'entryusdt']));
+  const exit = parseCleanNumber(getField(['exitPriceUSDT', 'Exit Price (USDT)', 'exitPrice', 'exit', 'exitusdt']));
   if (entry <= 0 || exit <= 0) return null;
 
-  const pnlUSDT = parseCleanNumber(getField(['pnlUSDT', 'PnL (USDT)', 'pnl']));
-  const pnlINR = parseCleanNumber(getField(['pnlINR', 'PnL (INR)'])) || (pnlUSDT * (State.usdtToInrRate || 94.94));
-  const notional = parseCleanNumber(getField(['notionalUSDT', 'Notional (USDT)'])) || 50.00;
+  const pnlUSDT = parseCleanNumber(getField(['pnlUSDT', 'PnL (USDT)', 'pnl', 'pnlusdt']));
+  const pnlINR = parseCleanNumber(getField(['pnlINR', 'PnL (INR)', 'pnlinr'])) || (pnlUSDT * (State.usdtToInrRate || 94.94));
+  const notional = parseCleanNumber(getField(['notionalUSDT', 'Notional (USDT)', 'notional'])) || 50.00;
   const pair = rawPair.includes('/') ? rawPair : `${rawPair.replace('USDT', '')}/USDT`;
 
   return {
@@ -991,15 +984,15 @@ function normalizeSheetTrade(raw) {
     date: String(getField(['date', 'Date'])) || 'Recent',
     time: String(getField(['time', 'Time'])) || '',
     pair,
-    type: String(getField(['type', 'Type'])) || 'EXIT',
+    type: String(getField(['type', 'Type', 'action'])) || 'EXIT',
     entryPriceUSDT: formatBinanceUSDTPrice(entry),
     exitPriceUSDT: formatBinanceUSDTPrice(exit),
     notionalUSDT: notional,
     pnlUSDT: Number(pnlUSDT.toFixed(4)),
     pnlINR: Number(pnlINR.toFixed(2)),
-    reason: String(getField(['reason', 'Reason'])) || 'Settled trade',
+    reason: String(getField(['reason', 'Reason', 'notes'])) || 'Settled trade',
     regime: String(getField(['regime', 'Regime'])) || 'BALANCED',
-    volatilityPct: parseCleanNumber(getField(['volatilityPct', 'Volatility %'])) || 4.5
+    volatilityPct: parseCleanNumber(getField(['volatilityPct', 'Volatility %', 'volatility'])) || 4.5
   };
 }
 
