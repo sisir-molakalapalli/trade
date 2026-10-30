@@ -52,6 +52,68 @@ app.use(express.static(__dirname));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// -------------------------------------------------------------
+// WEBSOCKET CLIENT MESSAGE DISPATCHER
+// -------------------------------------------------------------
+wss.on('connection', (ws) => {
+  ws.send(JSON.stringify({
+    type: 'INIT_STATE',
+    portfolio: State.portfolio,
+    activePositions: State.activePositions,
+    recoveryBags: State.recoveryBags,
+    universe: State.universe,
+    tradeLogs: sanitizeAndAuditTradeHistory(State.tradeLogs).slice(0, 100),
+    quantTelemetry: State.quantTelemetry,
+    marketRegime: State.marketRegime,
+    activeThresholds: State.activeThresholds,
+    tradeFrequencyController: State.tradeFrequencyController,
+    subsystems: State.subsystems,
+    usdtToInrRate: State.usdtToInrRate,
+    p2pLastUpdated: State.p2pLastUpdated,
+    googleSheetUrl: State.googleSheetUrl,
+    learningEngineState: learningEngine.state
+  }));
+
+  ws.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      if (data.type === 'SYNC_STATE') {
+        broadcastState();
+      } else if (data.type === 'SET_CASH') {
+        State.portfolio.cashUSDT = Number(data.cashUSDT) || State.portfolio.cashUSDT;
+        saveStateToDisk();
+        broadcastState();
+      } else if (data.type === 'SET_SIZING_CONFIG') {
+        State.portfolio.sizingMode = data.sizingMode || State.portfolio.sizingMode;
+        State.portfolio.allocationPct = Number(data.allocationPct) || State.portfolio.allocationPct;
+        saveStateToDisk();
+        broadcastState();
+      } else if (data.type === 'TOGGLE_AUTOPILOT') {
+        State.autopilotEnabled = Boolean(data.enabled);
+        saveStateToDisk();
+        broadcastState();
+      } else if (data.type === 'SET_DYNAMIC_GOVERNOR') {
+        State.tradeFrequencyController.dynamicGovernorEnabled = Boolean(data.enabled);
+        saveStateToDisk();
+        broadcastState();
+      } else if (data.type === 'CLOSE_POSITION') {
+        closeActivePositionManual(data.pairKey);
+      } else if (data.type === 'CLOSE_RECOVERY_BAG') {
+        closeRecoveryBagManual(data.pairKey);
+      } else if (data.type === 'SET_GOOGLE_SHEET_URL') {
+        State.googleSheetUrl = data.url;
+        saveStateToDisk();
+        syncWithGoogleDrive();
+      } else if (data.type === 'SYNC_P2P_RATE') {
+        syncLiveP2PRate();
+      } else if (data.type === 'RECONCILE_QUOTA') {
+        reconcileRollingTradeQuotaFromHistory();
+        broadcastState();
+      }
+    } catch (e) {}
+  });
+});
+
 // Baseline Universe
 const DEFAULT_UNIVERSE = {
   SOLUSDT:  { name: 'Solana', symbol: 'SOL', priceUSDT: 105.20, priceINR: 9987.69, score: 82, direction: 'STRONG BUY', cvd: 14.2, obi: 0.56, intradayRangePct: 4.2, volumeM: 320, source: 'QUANT_ALGO', reasoning: 'Institutional spot bid depth absorption', verifiedAt: Date.now() },
@@ -336,9 +398,9 @@ async function syncWithGoogleDrive() {
       if (data && data.portfolioState && typeof data.portfolioState === 'object') {
         const ps = data.portfolioState;
         if (ps.portfolio) State.portfolio = { ...State.portfolio, ...ps.portfolio };
-        if (ps.activePositions) State.activePositions = ps.activePositions;
-        if (ps.recoveryBags) State.recoveryBags = ps.recoveryBags;
-        if (ps.cooldowns) State.cooldowns = ps.cooldowns;
+        if (ps.activePositions && Object.keys(ps.activePositions).length > 0) State.activePositions = ps.activePositions;
+        if (ps.recoveryBags && Object.keys(ps.recoveryBags).length > 0) State.recoveryBags = ps.recoveryBags;
+        if (ps.cooldowns) State.cooldowns = { ...State.cooldowns, ...ps.cooldowns };
       }
 
       const rawList = Array.isArray(data) ? data : (Array.isArray(data?.trades) ? data.trades : []);
@@ -350,19 +412,111 @@ async function syncWithGoogleDrive() {
             validSheetTrades.push(normalized);
           }
         });
-        State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
-        recalculateTrueRealizedPnL();
-        reconcileRollingTradeQuotaFromHistory();
+        if (validSheetTrades.length > 0) {
+          State.tradeLogs = sanitizeAndAuditTradeHistory(validSheetTrades);
+          recalculateTrueRealizedPnL();
+          reconcileRollingTradeQuotaFromHistory();
+        }
+      }
+
+      // Fallback: If Apps Script returned 0 trades, fetch directly from Trade Ledger CSV
+      if (State.tradeLogs.length === 0) {
+        await fetchTradesFromDirectLedgerCsv();
       }
 
       State.subsystems.persistence.googleSheetSync = 'ACTIVE';
       State.subsystems.persistence.googleDriveFileStatus = 'FILES_ONLINE (Drive JSON Active)';
       saveStateToDisk();
       broadcastState();
+      return true;
     }
   } catch (err) {
     console.error('[Google Drive Sync Error]', err.message);
+    if (State.tradeLogs.length === 0) {
+      await fetchTradesFromDirectLedgerCsv();
+    }
   }
+  return false;
+}
+
+// -------------------------------------------------------------
+// DIRECT GOOGLE SHEET CSV FALLBACK FETCHER
+// -------------------------------------------------------------
+async function fetchTradesFromDirectLedgerCsv() {
+  const CSV_URL = 'https://docs.google.com/spreadsheets/d/1nMLhNb3JitkhWhghCQQUygeRdOBd7yAxfD3RCxxxVbE/gviz/tq?tqx=out:csv';
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(CSV_URL, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (res && res.ok) {
+      const csvText = await res.text();
+      const parsedTrades = parseCsvTradeRows(csvText);
+      if (parsedTrades.length > 0) {
+        State.tradeLogs = sanitizeAndAuditTradeHistory(parsedTrades);
+        recalculateTrueRealizedPnL();
+        reconcileRollingTradeQuotaFromHistory();
+        saveStateToDisk();
+        broadcastState();
+      }
+    }
+  } catch (e) {}
+}
+
+function parseCsvTradeRows(csvText) {
+  if (!csvText || typeof csvText !== 'string') return [];
+  const lines = csvText.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length <= 1) return [];
+
+  const parseLine = (line) => {
+    const values = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (char === '"') {
+        if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+        else { inQuotes = !inQuotes; }
+      } else if (char === ',' && !inQuotes) {
+        values.push(current.trim());
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    values.push(current.trim());
+    return values;
+  };
+
+  const headers = parseLine(lines[0]).map(h => h.toLowerCase().replace(/[^a-z0-9]/g, ''));
+  const trades = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = parseLine(lines[i]);
+    const rowObj = {};
+    headers.forEach((h, idx) => { rowObj[h] = cols[idx] || ''; });
+
+    const normalized = normalizeSheetTrade({
+      id: cols[0] || Date.now() - i * 1000,
+      date: cols[1] || 'Recent',
+      time: cols[2] || '',
+      pair: cols[3] || '',
+      type: cols[4] || 'EXIT',
+      entryPriceUSDT: cols[5],
+      exitPriceUSDT: cols[6],
+      notionalUSDT: cols[7],
+      pnlUSDT: cols[8],
+      pnlINR: cols[9],
+      reason: cols[10] || '',
+      ...rowObj
+    });
+
+    if (normalized && isValidTradeRecord(normalized)) {
+      trades.push(normalized);
+    }
+  }
+  return trades;
 }
 
 function saveStateToDisk() {
@@ -1430,6 +1584,97 @@ app.get('/api/state', (req, res) => {
     googleSheetUrl: State.googleSheetUrl,
     learningEngineState: learningEngine.state
   });
+});
+
+// -------------------------------------------------------------
+// REST CONTROL & SYNC ENDPOINTS
+// -------------------------------------------------------------
+app.post('/api/trades/sync-strict-sheet', async (req, res) => {
+  try {
+    await syncWithGoogleDrive();
+    res.json({
+      success: true,
+      count: State.tradeLogs.length,
+      trades: State.tradeLogs
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, trades: State.tradeLogs });
+  }
+});
+
+app.post('/api/trades/purge-empty', (req, res) => {
+  State.tradeLogs = sanitizeAndAuditTradeHistory(State.tradeLogs);
+  recalculateTrueRealizedPnL();
+  saveStateToDisk();
+  broadcastState();
+  res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs });
+});
+
+app.get('/api/screener/run', async (req, res) => {
+  await runDynamicScreener();
+  res.json({ success: true, universe: State.universe, candidatePool: State.candidatePool });
+});
+
+app.post('/api/portfolio/cash', (req, res) => {
+  if (req.body.cashUSDT !== undefined) {
+    State.portfolio.cashUSDT = Number(req.body.cashUSDT);
+  } else if (req.body.addUSDT !== undefined) {
+    State.portfolio.cashUSDT += Number(req.body.addUSDT);
+  }
+  saveStateToDisk();
+  broadcastState();
+  res.json({ success: true, cashUSDT: State.portfolio.cashUSDT });
+});
+
+app.post('/api/portfolio/sizing', (req, res) => {
+  if (req.body.allocationPct !== undefined) State.portfolio.allocationPct = Number(req.body.allocationPct);
+  if (req.body.sizingMode !== undefined) State.portfolio.sizingMode = req.body.sizingMode;
+  saveStateToDisk();
+  broadcastState();
+  res.json({ success: true, portfolio: State.portfolio });
+});
+
+app.get('/api/quota/reconcile', (req, res) => {
+  reconcileRollingTradeQuotaFromHistory();
+  res.json({
+    success: true,
+    rollingTrades24h: State.tradeFrequencyController.rollingTrades24h,
+    executed24hCount: State.tradeFrequencyController.rollingTrades24h.length,
+    quotaRemaining: Math.max(0, State.tradeFrequencyController.maxTradesPer24h - State.tradeFrequencyController.rollingTrades24h.length),
+    formattedReset: 'Reconciled'
+  });
+});
+
+app.get('/api/p2p/sync', async (req, res) => {
+  await syncLiveP2PRate();
+  res.json({ success: true, rate: State.usdtToInrRate });
+});
+
+app.post('/api/drive/sync-files-now', async (req, res) => {
+  try {
+    const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
+    const resp = await fetch(`${targetUrl}?action=CREATE_ALL_FILES`);
+    const data = await resp.json().catch(() => null);
+    res.json({ success: true, driveData: data });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/drive/verify-files', async (req, res) => {
+  try {
+    const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
+    const resp = await fetch(`${targetUrl}?action=GET_ALL`);
+    const data = await resp.json().catch(() => null);
+    res.json({ success: true, data });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/settings/googlesheet/sync', async (req, res) => {
+  await syncWithGoogleDrive();
+  res.json({ success: true, count: State.tradeLogs.length });
 });
 
 app.get('/healthz', (req, res) => res.status(200).send('OK'));
