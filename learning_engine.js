@@ -21,18 +21,37 @@ class LearningEngine {
 
     this.googleDriveSyncFn = null;
     this.loadState();
+    this.initializeUniverseTokens();
   }
 
   setGoogleDriveSyncCallback(fn) {
     this.googleDriveSyncFn = fn;
   }
 
-  trainOnHistoricalTrades(tradeLogs) {
-    if (!Array.isArray(tradeLogs) || tradeLogs.length === 0) return;
+  initializeUniverseTokens(universeKeys = []) {
+    const defaultTokens = [
+      'SOLUSDT', 'BTCUSDT', 'ETHUSDT', 'AVAXUSDT', 'NEARUSDT',
+      'LINKUSDT', 'BNBUSDT', 'DASHUSDT', 'SUIUSDT', 'PEPEUSDT',
+      'HYPEUSDT', 'BEMXUSDT', 'ZROUSDT', 'HAEDALUSDT'
+    ];
+    const allKeys = new Set([...universeKeys, ...defaultTokens]);
+    allKeys.forEach(k => {
+      const clean = String(k).replace(/[^A-Z0-9]/g, '');
+      if (clean && clean.endsWith('USDT') && clean !== 'CRYPTOUSDT') {
+        this.getAssetReputation(clean);
+      }
+    });
+  }
 
-    // Reset base counts to train cleanly from the verified ledger
-    this.state.assetReputations = {};
-    this.state.recentAttributions = [];
+  trainOnHistoricalTrades(tradeLogs, universeKeys = []) {
+    // 1. Ensure all universe tokens have a profile baseline
+    this.initializeUniverseTokens(universeKeys);
+
+    if (!Array.isArray(tradeLogs) || tradeLogs.length === 0) {
+      this.recalculateDynamicHurdles();
+      this.saveState();
+      return;
+    }
 
     // Sort chronologically (oldest to newest)
     const chronological = [...tradeLogs].sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
