@@ -401,7 +401,11 @@ async function backupPortfolioStateToGoogleDrive() {
         recoveryBags: State.recoveryBags,
         cooldowns: State.cooldowns,
         tradeFrequencyController: State.tradeFrequencyController,
-        timestamp: Date.now()
+        totalTradesExecuted: State.tradeLogs.length,
+        realizedPnLUSDT: State.portfolio.realizedPnL,
+        realizedPnLINR: Number((State.portfolio.realizedPnL * State.usdtToInrRate).toFixed(2)),
+        timestamp: Date.now(),
+        lastSyncTime: new Date().toISOString()
       }
     };
 
@@ -420,6 +424,27 @@ async function backupPortfolioStateToGoogleDrive() {
       State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (Drive ID: 1DVK9OvL... Bound)';
     }
   } catch (e) {}
+}
+
+async function fetchTradesFromDirectLedgerCsv() {
+  try {
+    const csvUrl = 'https://docs.google.com/spreadsheets/d/1nMLhNb3JitkhWhghCQQUygeRdOBd7yAxfD3RCxxxVbE/gviz/tq?tqx=out:csv';
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(csvUrl, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (res && res.ok) {
+      const text = await res.text();
+      const trades = parseCsvTradeRows(text);
+      if (trades && trades.length > 0) {
+        State.tradeLogs = sanitizeAndAuditTradeHistory(trades);
+        recalculateTrueRealizedPnL();
+        reconcileRollingTradeQuotaFromHistory();
+      }
+    }
+  } catch (e) {
+    console.error('[CSV Fetch Error]', e.message);
+  }
 }
 
 async function syncWithGoogleDrive() {
@@ -495,45 +520,6 @@ async function syncWithGoogleDrive() {
     }
   }
   return false;
-}
-
-async function backupPortfolioStateToGoogleDrive() {
-  const targetUrl = State.googleSheetUrl || GOOGLE_SHEET_URL;
-  if (!targetUrl) return;
-
-  try {
-    const postBody = {
-      action: 'SAVE_PORTFOLIO_STATE',
-      fileId: DRIVE_FILE_IDS.portfolioState,
-      portfolioState: {
-        portfolio: State.portfolio,
-        activePositions: State.activePositions,
-        recoveryBags: State.recoveryBags,
-        cooldowns: State.cooldowns,
-        tradeFrequencyController: State.tradeFrequencyController,
-        totalTradesExecuted: State.tradeLogs.length,
-        realizedPnLUSDT: State.portfolio.realizedPnL,
-        realizedPnLINR: Number((State.portfolio.realizedPnL * State.usdtToInrRate).toFixed(2)),
-        timestamp: Date.now(),
-        lastSyncTime: new Date().toISOString()
-      }
-    };
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-    const res = await fetch(targetUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(postBody),
-      redirect: 'follow',
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-
-    if (res.ok) {
-      State.subsystems.persistence.googleDriveFileStatus = 'SYNCED (Drive ID: 1DVK9OvL... Bound)';
-    }
-  } catch (e) {}
 }
 
 function parseCsvTradeRows(csvText) {
@@ -1563,7 +1549,116 @@ async function runPredictiveSentry() {
     }
 
     // 2. MONITOR RECOVERY BAGS
-    bagKeys.forEach(k => {
+    for (const k of bagKeys) {
+      const bag = State.recoveryBags[k];
+      if (!bag) continue;
+
+      const live = State.universe[k]?.priceUSDT || bag.livePriceUSDT;
+      bag.livePriceUSDT = live;
+      const gainPct = ((live - bag.entryPriceUSDT) / bag.entryPriceUSDT) * 100;
+      bag.gainPct = Number(gainPct.toFixed(2));
+      bag.unrealizedPnLUSDT = Number(((live - bag.entryPriceUSDT) * bag.qty).toFixed(4));
+
+      const ageHours = Number(((Date.now() - (bag.movedAt || bag.openedAt || Date.now())) / 3600000).toFixed(1));
+      bag.ageHours = ageHours;
+
+      // Dynamic Stepped Targets (Time-Decay Recovery Ladder)
+      if (ageHours >= 24) {
+        bag.targetStep = 'STEP 4 (-1.50%)';
+        bag.targetExitPriceUSDT = Number((bag.entryPriceUSDT * 0.985).toFixed(6));
+      } else if (ageHours >= 12) {
+        bag.targetStep = 'STEP 3 (-0.75%)';
+        bag.targetExitPriceUSDT = Number((bag.entryPriceUSDT * 0.9925).toFixed(6));
+      } else if (ageHours >= 4) {
+        bag.targetStep = 'STEP 2 (0.00%)';
+        bag.targetExitPriceUSDT = Number((bag.entryPriceUSDT * 1.000).toFixed(6));
+      } else {
+        bag.targetStep = 'STEP 1 (+0.30%)';
+        bag.targetExitPriceUSDT = Number((bag.entryPriceUSDT * 1.003).toFixed(6));
+      }
+
+      // A. HARD DISASTER FLOOR (-6.50% Hard Cap)
+      if (gainPct <= (State.subsystems?.predictiveSentry?.hardDisasterFloorPct || -6.50)) {
+        const exitCash = bag.qty * live;
+        const loss = exitCash - bag.notionalUSDT;
+        State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+        State.portfolio.realizedPnL += Number(loss.toFixed(4));
+        State.subsystems.recoveryManager.hardDisasterCutsCount++;
+
+        const tradeRecord = {
+          id: Date.now(),
+          date: new Date().toLocaleDateString('en-GB'),
+          time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+          pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+          type: 'HARD DISASTER CUT (-6.5%)',
+          entryPriceUSDT: bag.entryPriceUSDT,
+          exitPriceUSDT: live,
+          notionalUSDT: bag.notionalUSDT,
+          pnlUSDT: Number(loss.toFixed(4)),
+          pnlINR: Number((loss * State.usdtToInrRate).toFixed(2)),
+          regime: State.marketRegime || 'BALANCED',
+          volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+          reason: `Disaster floor triggered at ${gainPct.toFixed(2)}%: Capital protected from deep drawdown`
+        };
+
+        State.tradeLogs.unshift(tradeRecord);
+        recordTradeToCloudLedger(tradeRecord);
+        learningEngine.recordTradeOutcome(k, 'HARD DISASTER', loss, ageHours, bag.entrySnapshot, 0);
+        State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+        delete State.recoveryBags[k];
+        saveStateToDisk();
+        broadcastState();
+        continue;
+      }
+
+      // B. STEPPED TARGET FILLED ON RELIEF BOUNCE
+      if (live >= bag.targetExitPriceUSDT) {
+        const exitCash = bag.qty * live;
+        const profit = exitCash - bag.notionalUSDT;
+        State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+        State.portfolio.realizedPnL += Number(profit.toFixed(4));
+        State.subsystems.recoveryManager.bagsResolvedWinCount++;
+
+        const tradeRecord = {
+          id: Date.now(),
+          date: new Date().toLocaleDateString('en-GB'),
+          time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+          pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+          type: 'RECOVERY RESOLVED',
+          entryPriceUSDT: bag.entryPriceUSDT,
+          exitPriceUSDT: live,
+          notionalUSDT: bag.notionalUSDT,
+          pnlUSDT: Number(profit.toFixed(4)),
+          pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+          regime: State.marketRegime || 'BALANCED',
+          volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+          reason: `Relief bounce filled ${bag.targetStep} at $${live} (Held ${ageHours}h, Zero Loss)`
+        };
+
+        State.tradeLogs.unshift(tradeRecord);
+        recordTradeToCloudLedger(tradeRecord);
+        learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, ageHours, bag.entrySnapshot, 100);
+        State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+        delete State.recoveryBags[k];
+        saveStateToDisk();
+        broadcastState();
+        continue;
+      }
+
+      // C. SELF-HEALING SUBSIDY LIQUIDATION (IF HELD > 6h)
+      const deficit = bag.notionalUSDT - (bag.qty * live);
+      if (ageHours >= 6 && deficit > 0 && State.portfolio.bagSubsidyPoolUSDT >= deficit) {
+        State.portfolio.bagSubsidyPoolUSDT -= Number(deficit.toFixed(2));
+        const exitCash = bag.qty * live;
+        State.portfolio.cashUSDT += Number((exitCash + deficit).toFixed(2));
+        State.subsystems.recoveryManager.bagsSubsidizedCount++;
+
+        const tradeRecord = {
+          id: Date.now(),
+          date: new Date().toLocaleDateString('en-GB'),
+          time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+          pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+          type: 'SUBSIDIZED EXIT',
           entryPriceUSDT: bag.entryPriceUSDT,
           exitPriceUSDT: live,
           notionalUSDT: bag.notionalUSDT,
@@ -1571,19 +1666,24 @@ async function runPredictiveSentry() {
           pnlINR: 0.00,
           regime: State.marketRegime || 'BALANCED',
           volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
-          reason: 'Winner subsidy pool absorbed bag deficit'
+          reason: `Winner subsidy pool ($${deficit.toFixed(2)}) absorbed bag deficit after ${ageHours}h`
         };
 
         State.tradeLogs.unshift(tradeRecord);
         recordTradeToCloudLedger(tradeRecord);
-        learningEngine.recordTradeOutcome(k, 'RECOVERY', 0, bag.ageHours, bag.entrySnapshot);
+        learningEngine.recordTradeOutcome(k, 'RECOVERY', 0, ageHours, bag.entrySnapshot, 100);
         State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
         delete State.recoveryBags[k];
         saveStateToDisk();
         broadcastState();
+        continue;
       }
     }
-  });
+  } catch (err) {
+    console.error('[Sentry Error]', err.message);
+  } finally {
+    isSentryRunning = false;
+  }
 }
 
 function closeActivePositionManual(pairKey) {
