@@ -297,6 +297,13 @@ const State = {
       baselineVolPct: 4.5,
       lastAdjustmentFactor: 1.0
     },
+    trendGuard: {
+      status: 'ONLINE',
+      emaPeriod: 20,
+      timeframe: '1h',
+      minRangePosition: 0.50,
+      rule: 'Price >= 1h 20-EMA & 24h Range >= 50%'
+    },
     recoveryManager: {
       status: 'ONLINE',
       activeRecoveryBagsCount: 0,
@@ -1116,6 +1123,47 @@ async function check1mExhaustionWick(symbol) {
   }
 }
 
+// -------------------------------------------------------------
+// FILTER 1: 1-HOUR TREND & 20-EMA ALIGNMENT GATE
+// Blocks bear-market dead-cat bounces (e.g., WLD/USDT failure mode)
+// -------------------------------------------------------------
+async function check1hTrendAlignment(symbol) {
+  try {
+    const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=1h&limit=24`);
+    if (!res || !res.ok) return { passed: true, ema20: 0, delta1h: 0, reason: 'Fallback pass' };
+    const klines = await res.json();
+    if (!klines || klines.length < 20) return { passed: true, ema20: 0, delta1h: 0, reason: 'Insufficient bars' };
+
+    const closes = klines.map(k => parseFloat(k[4]));
+    const currentPrice = closes[closes.length - 1];
+
+    // Calculate 20-period Exponential Moving Average (EMA)
+    const k = 2 / (20 + 1);
+    let ema20 = closes[0];
+    for (let i = 1; i < closes.length; i++) {
+      ema20 = (closes[i] * k) + (ema20 * (1 - k));
+    }
+
+    const prevClose = closes[closes.length - 2];
+    const delta1h = prevClose > 0 ? ((currentPrice - prevClose) / prevClose) * 100 : 0;
+
+    // Must trade above or within 0.25% of 1h 20-EMA and not dumping on 1h
+    const isAboveEma = currentPrice >= (ema20 * 0.9975);
+    const isNotDumping1h = delta1h >= -0.75;
+    const passed = isAboveEma && isNotDumping1h;
+
+    return {
+      passed,
+      isAboveEma,
+      ema20: Number(ema20.toFixed(4)),
+      delta1h: Number(delta1h.toFixed(2)),
+      reason: passed ? '1h Trend Supportive' : `Below 1h 20-EMA ($${ema20.toFixed(4)}) or dumping 1h (${delta1h.toFixed(1)}%)`
+    };
+  } catch (e) {
+    return { passed: true, ema20: 0, delta1h: 0, reason: 'Error fallback' };
+  }
+}
+
 async function evaluateTimeMachineBreakoutOdds(symbol) {
   try {
     const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
@@ -1151,7 +1199,35 @@ async function evaluateTimeMachineBreakoutOdds(symbol) {
       }
     }
 
-    const oddsPct = setupsDetected >= 2 ? Math.round((continuationWins / setupsDetected) * 100) : 55;
+    // -------------------------------------------------------------
+    // FILTER 2: ELIMINATE DEFAULT FREE PASS + IGNITION EXCEPTION
+    // -------------------------------------------------------------
+    let oddsPct = 0;
+    if (setupsDetected >= 2) {
+      oddsPct = Math.round((continuationWins / setupsDetected) * 100);
+    } else {
+      // Evaluate previous 15m bar for high-volume breakout ignition
+      const prevBar = klines[klines.length - 2];
+      const lOpen = parseFloat(prevBar[1]);
+      const lClose = parseFloat(prevBar[4]);
+      const lVol = parseFloat(prevBar[5]);
+      const barGain15m = lOpen > 0 ? ((lClose - lOpen) / lOpen) * 100 : 0;
+
+      let volSum = 0;
+      const count = Math.min(10, klines.length - 2);
+      for (let v = klines.length - 2 - count; v < klines.length - 2; v++) {
+        volSum += parseFloat(klines[v][5]);
+      }
+      const avgVol = count > 0 ? (volSum / count) : 1;
+      const rvol15m = avgVol > 0 ? (lVol / avgVol) : 1;
+
+      if (barGain15m >= 1.60 && rvol15m >= 1.80) {
+        oddsPct = 58; // Approved under fresh breakout ignition exception
+      } else {
+        oddsPct = 0; // Strictly blocked (Dead-cat / dormant bounce trap)
+      }
+    }
+
     State.subsystems.timeMachine.replaysCompleted++;
     State.subsystems.timeMachine.lastEvaluatedSymbol = symbol.replace('USDT', '');
     State.subsystems.timeMachine.lastWinOddsPct = oddsPct;
@@ -1188,11 +1264,21 @@ async function runDynamicScreener() {
       const posInRange = range > 0 ? (price - low) / range : 0.5;
       const intradayRangePct = low > 0 ? ((high - low) / low) * 100 : 4.5;
 
+      // FILTER 4: 24-HOUR RANGE MIDPOINT FLOOR
+      // Disqualify coins trading in the lower half of daily range (closer to 24h lows)
+      if (posInRange < 0.50) {
+        continue;
+      }
+
+      // Parabolic Climax & Range Ceiling Filter
       if (change24h >= 20.0 || (change24h >= 14.0 && posInRange >= 0.96 && intradayRangePct >= 16.0)) {
         continue;
       }
 
-      const volBonus = Math.min(6, Math.log10(Math.max(1, volQuote / 1000000)) * 2.5);
+      // FILTER 3: DIRECTIONAL VOLUME CONDITIONING
+      // Do not award volume bonuses to red or dumping coins
+      const isPositiveMomentum = change24h >= 0.0 && posInRange >= 0.50;
+      const volBonus = isPositiveMomentum ? Math.min(6, Math.log10(Math.max(1, volQuote / 1000000)) * 2.5) : 0;
       const score = Math.min(96, Math.max(50, Math.round(58 + (Math.max(0, change24h) * 1.3) + (posInRange * 20) + volBonus)));
       candidates.push({
         pair: sym,
@@ -1283,6 +1369,10 @@ async function evaluateAutopilotEntries() {
     const effectiveScoreHurdle = baseHurdle + (eligibility.netScoreHurdleOffset || 0);
     if ((candidate.score || 0) < effectiveScoreHurdle) continue;
 
+    // FILTER 1 ENFORCEMENT: 1-HOUR TREND & 20-EMA ALIGNMENT GATE
+    const trendCheck = await check1hTrendAlignment(pair);
+    if (!trendCheck.passed) continue;
+
     const closedBarCheck = await checkConfirmedClosedBar(pair);
     if (!closedBarCheck.passed) continue;
 
@@ -1298,7 +1388,14 @@ async function evaluateAutopilotEntries() {
     const tokenVol = Math.max(2.5, candidate.intradayRangePct || baselineVol);
     const volFactor = Math.min(1.25, Math.max(0.40, baselineVol / tokenVol));
 
-    const entrySnapshot = learningEngine.createEntrySnapshot(pair, candidate, book, null, tmResult.oddsPct, State.subsystems.btcMacroGate);
+    const entrySnapshot = learningEngine.createEntrySnapshot(
+      pair, 
+      candidate, 
+      book, 
+      { change1hPct: trendCheck.delta1h, isAbove1hEma: trendCheck.isAboveEma }, 
+      tmResult.oddsPct, 
+      State.subsystems.btcMacroGate
+    );
     executeSpotBuy(pair, candidate, book, volFactor, entrySnapshot);
     break;
   }
