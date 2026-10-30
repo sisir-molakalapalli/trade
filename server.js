@@ -881,9 +881,16 @@ async function checkConfirmedClosedBar(symbol) {
     const range = high - low;
 
     if (range <= 0) return { passed: true, upperWickRatio: 0.10 };
+
+    // TIGHT CONSOLIDATION SHIELD: If the 15m candle range is under 1.2%, it is a tight base/consolidation bar,
+    // NOT an exhaustion wick rejection. Do not falsely penalize quiet base-building bars.
+    const candleVolPct = low > 0 ? (range / low) * 100 : 0;
+    if (candleVolPct < 1.20) {
+      return { passed: true, upperWickRatio: 0.15 };
+    }
+
     const upperWick = high - Math.max(open, close);
     const upperWickRatio = upperWick / range;
-
     const dynamicCeiling = learningEngine.state.dynamicHurdles?.wickCeiling || 0.40;
     
     // Clean expansion bars closing strong near their highs pass cleanly
@@ -907,30 +914,38 @@ async function evaluateTimeMachineBreakoutOdds(symbol) {
     let setupsDetected = 0;
     let continuationWins = 0;
 
-    for (let i = 0; i < klines.length - 4; i++) {
+    // Evaluate historical expansion setups across prior bars
+    for (let i = 0; i < klines.length - 8; i++) {
       const open = parseFloat(klines[i][1]);
       const close = parseFloat(klines[i][4]);
-      const high = parseFloat(klines[i][2]);
-      const low = parseFloat(klines[i][3]);
       const barGain = open > 0 ? ((close - open) / open) * 100 : 0;
 
-      if (barGain >= 1.00) {
+      if (barGain >= 0.80) {
         setupsDetected++;
         const target = close * 1.018; // TP1 (+1.80%)
-        const stop = close * 0.968;   // Realistic spot recovery invalidation (-3.20%)
+        const stop = close * 0.968;   // Spot recovery bag threshold (-3.20%)
         let won = false;
 
-        for (let j = i + 1; j < Math.min(i + 5, klines.length); j++) {
+        // Realistic 12-bar (3-hour) horizon for spot continuation
+        const maxBar = Math.min(i + 13, klines.length);
+        for (let j = i + 1; j < maxBar; j++) {
           const fHigh = parseFloat(klines[j][2]);
           const fLow = parseFloat(klines[j][3]);
+          const fClose = parseFloat(klines[j][4]);
+
           if (fHigh >= target) { won = true; break; }
           if (fLow <= stop) { won = false; break; }
+          // Sustained positive drift without stop hit
+          if (j === maxBar - 1 && fClose >= (close * 1.008)) { won = true; }
         }
         if (won) continuationWins++;
       }
     }
 
-    const oddsPct = setupsDetected > 0 ? Math.round((continuationWins / setupsDetected) * 100) : 56;
+    // If fewer than 2 recent spikes occurred, assign neutral baseline odds (55%)
+    const oddsPct = setupsDetected >= 2 
+      ? Math.round((continuationWins / setupsDetected) * 100) 
+      : 55;
     
     // Update live subsystem telemetry
     State.subsystems.timeMachine.replaysCompleted++;
@@ -968,13 +983,16 @@ async function runDynamicScreener() {
       const posInRange = range > 0 ? (price - low) / range : 0.5;
       const intradayRangePct = low > 0 ? ((high - low) / low) * 100 : 4.5;
 
-      // Parabolic top filter: blocks extreme blow-off tops like HAEDAL (+35%) without penalizing standard daily breakouts
+      // Parabolic top filter: blocks extreme blow-off tops like HAEDAL (+35%)
       if (change24h >= 20.0 || (change24h >= 14.0 && posInRange >= 0.96 && intradayRangePct >= 16.0)) {
         continue;
       }
 
-      // Multi-Factor Composite Scoring: rewards volume density, range position, and momentum
-      const score = Math.min(96, Math.max(50, Math.round(58 + (Math.max(0, change24h) * 1.3) + (posInRange * 22))));
+      // Volume liquidity density bonus (rewards institutional participation)
+      const volBonus = Math.min(6, Math.log10(Math.max(1, volQuote / 1000000)) * 2.5);
+
+      // Multi-Factor Composite Scoring
+      const score = Math.min(96, Math.max(50, Math.round(58 + (Math.max(0, change24h) * 1.3) + (posInRange * 20) + volBonus)));
       candidates.push({
         pair: sym,
         symbol: sym.replace('USDT', ''),
@@ -989,6 +1007,11 @@ async function runDynamicScreener() {
     }
 
     candidates.sort((a, b) => b.score - a.score);
+
+    // Expand Autopilot evaluation pool to top 35 candidates (eliminates 10-pair deadlock)
+    State.candidatePool = candidates.slice(0, 35);
+
+    // Maintain top 10 for clean UI Radar rendering
     const top10 = candidates.slice(0, 10);
     top10.forEach(c => {
       State.universe[c.pair] = {
@@ -1028,21 +1051,27 @@ async function evaluateAutopilotEntries() {
   const activeBagsCount = Object.keys(State.recoveryBags).length;
   if (activeBagsCount >= State.tradeFrequencyController.maxRecoveryBagsLimit) return;
 
-  // AQPE Starvation Check: if idle with 0 active positions for > 2 hours, enable balanced base hurdle (78 pts)
+  // AQPE Starvation Check: if idle with 0 active positions, enable balanced base hurdle
   const isStarved = currentCount === 0 && activeBagsCount === 0;
   const baseHurdle = isStarved ? 78 : (State.activeThresholds.scoreThreshold || 80);
-  const maxAllowedSpread = isStarved ? 0.10 : (State.activeThresholds.maxSpread || 0.08);
+  const maxAllowedSpread = isStarved ? 0.12 : (State.activeThresholds.maxSpread || 0.08);
+  const minRequiredObi = isStarved ? 0.52 : (State.activeThresholds.obiThreshold || 0.54);
 
-  const sortedPairs = Object.keys(State.universe).sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
+  // Evaluate candidate pool (top 35 liquid pairs sorted by score)
+  const evalList = (State.candidatePool && State.candidatePool.length > 0)
+    ? State.candidatePool
+    : Object.keys(State.universe).map(k => ({ pair: k, ...State.universe[k] }));
 
-  for (const pair of sortedPairs) {
+  for (const item of evalList) {
+    const pair = item.pair;
     if (Object.keys(State.activePositions).length >= State.tradeFrequencyController.maxConcurrentPositions) break;
     if (State.activePositions[pair] || State.recoveryBags[pair]) continue;
 
+    // Check 90m Anti-Churn Lockout
     const cd = State.cooldowns[pair];
     if (cd && cd.until > Date.now()) continue;
 
-    const candidate = State.universe[pair];
+    const candidate = item;
     const eligibility = learningEngine.evaluateCandidateEligibility(pair, candidate, null, State.subsystems.btcMacroGate);
     if (!eligibility.allowed) continue;
 
@@ -1057,7 +1086,7 @@ async function evaluateAutopilotEntries() {
 
     const book = await fetchRealOrderBookDepth(pair);
     if (!book) continue;
-    if (book.obi < (State.activeThresholds.obiThreshold || 0.55) && book.obi < 0.53) continue;
+    if (book.obi < minRequiredObi) continue;
     if (book.spreadPct > maxAllowedSpread) continue;
 
     const baselineVol = 4.5;
@@ -1066,6 +1095,7 @@ async function evaluateAutopilotEntries() {
 
     const entrySnapshot = learningEngine.createEntrySnapshot(pair, candidate, book, null, tmResult.oddsPct, State.subsystems.btcMacroGate);
     executeSpotBuy(pair, candidate, book, volFactor, entrySnapshot);
+    break; // Open highest-ranked passing candidate and allow sentry to take over
   }
 }
 
