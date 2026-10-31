@@ -171,6 +171,9 @@ class LearningEngine {
         change15mPct: shortTerm?.change15mPct || 0,
         change1hPct: shortTerm?.change1hPct || 0,
         isAbove1hEma: shortTerm?.isAbove1hEma !== undefined ? shortTerm.isAbove1hEma : true,
+        distFrom4hHighPct: shortTerm?.distFrom4hHighPct || 0,
+        isAboveVwap: shortTerm?.isAboveVwap !== undefined ? shortTerm.isAboveVwap : true,
+        selectionTrack: shortTerm?.selectionTrack || 'STANDARD',
         change24hPct: coinData?.priceChangePct || coinData?.change24h || 0,
         pricePositionInRange: coinData?.pricePositionInRange || 0.7,
         rvol: shortTerm?.rvol || 1.0,
@@ -278,7 +281,12 @@ class LearningEngine {
     let wickCeiling = 0.40;
     let minOdds = 45;
 
-    if (error > 0) {
+    // Real-time active bag coupling: throttle new entries dynamically when bags are holding capital
+    if (activeBagsCount > 0) {
+      scoreOffset = Math.min(8, activeBagsCount * 2);
+      wickCeiling = Math.max(0.20, Number((0.40 - (activeBagsCount * 0.05)).toFixed(2)));
+      minOdds = Math.min(65, 45 + (activeBagsCount * 5));
+    } else if (error > 0) {
       scoreOffset = Math.min(6, Math.round(error * 8));
       wickCeiling = Math.max(0.20, Number((0.40 - (error * 0.30)).toFixed(2)));
       minOdds = Math.min(60, Math.round(45 + (error * 25)));
