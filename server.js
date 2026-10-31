@@ -1164,6 +1164,74 @@ async function check1hTrendAlignment(symbol) {
   }
 }
 
+// -------------------------------------------------------------
+// DUAL-TRACK UPSTREAM SELECTION GATE: VWAP & 4H PEAK PROXIMITY
+// Permanently blocks distribution bleeders (EIGEN, LINK, PYTH, PENDLE, WLD)
+// -------------------------------------------------------------
+async function checkMicrostructureMomentumAndVwap(symbol) {
+  try {
+    const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=16`);
+    if (!res || !res.ok) return { passed: true, distFrom4hHighPct: 0, isAboveVwap: true, track: 'FALLBACK', reason: 'Fallback pass' };
+    const klines = await res.json();
+    if (!klines || klines.length < 8) return { passed: true, distFrom4hHighPct: 0, isAboveVwap: true, track: 'FALLBACK', reason: 'Insufficient bars' };
+
+    const currentBar = klines[klines.length - 1];
+    const prevBar = klines[klines.length - 2];
+    const currentPrice = parseFloat(currentBar[4]);
+
+    // 1. Calculate 4-hour Session High (16 15m bars = 4h) & 15m VWAP
+    let maxHigh4h = -Infinity;
+    let sumTypicalVol = 0;
+    let sumVol = 0;
+
+    for (const b of klines) {
+      const h = parseFloat(b[2]);
+      const l = parseFloat(b[3]);
+      const c = parseFloat(b[4]);
+      const v = parseFloat(b[5]);
+      if (h > maxHigh4h) maxHigh4h = h;
+
+      const typicalPrice = (h + l + c) / 3;
+      sumTypicalVol += (typicalPrice * v);
+      sumVol += v;
+    }
+
+    const distFrom4hHighPct = maxHigh4h > 0 ? ((maxHigh4h - currentPrice) / maxHigh4h) * 100 : 0;
+    const vwap15m = sumVol > 0 ? (sumTypicalVol / sumVol) : currentPrice;
+    const isAboveVwap = currentPrice >= (vwap15m * 0.998); // On or above 15m VWAP
+
+    // 2. 15m Bar Momentum and Candle State
+    const curOpen = parseFloat(currentBar[1]);
+    const curClose = parseFloat(currentBar[4]);
+    const prevOpen = parseFloat(prevBar[1]);
+    const prevClose = parseFloat(prevBar[4]);
+    const delta15m = prevOpen > 0 ? ((prevClose - prevOpen) / prevOpen) * 100 : 0;
+    const isNotRedDump = (curClose >= curOpen * 0.998) || (prevClose >= prevOpen);
+
+    // Track A: Ignition Surge (Fast movers like BEMX, HYPE)
+    const isTrackA = (delta15m >= 0.90) && (distFrom4hHighPct <= 2.50) && isAboveVwap;
+
+    // Track B: Base Expansion (Steady leaders like SOL, NEAR, AVAX)
+    const isTrackB = isAboveVwap && (distFrom4hHighPct <= 3.80) && isNotRedDump;
+
+    const passed = isTrackA || isTrackB;
+    const reason = passed 
+      ? (isTrackA ? 'Track A: Ignition Surge Approved' : 'Track B: Base Expansion Approved')
+      : `Failed Dual-Track: ${distFrom4hHighPct.toFixed(1)}% off 4h High (Max 3.8%), Above VWAP: ${isAboveVwap}`;
+
+    return {
+      passed,
+      distFrom4hHighPct: Number(distFrom4hHighPct.toFixed(2)),
+      vwap15m: Number(vwap15m.toFixed(4)),
+      isAboveVwap,
+      track: isTrackA ? 'TRACK_A' : (isTrackB ? 'TRACK_B' : 'NONE'),
+      reason
+    };
+  } catch (e) {
+    return { passed: true, distFrom4hHighPct: 0, isAboveVwap: true, track: 'FALLBACK', reason: 'Error fallback pass' };
+  }
+}
+
 async function evaluateTimeMachineBreakoutOdds(symbol) {
   try {
     const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
@@ -1264,9 +1332,9 @@ async function runDynamicScreener() {
       const posInRange = range > 0 ? (price - low) / range : 0.5;
       const intradayRangePct = low > 0 ? ((high - low) / low) * 100 : 4.5;
 
-      // FILTER 4: 24-HOUR RANGE MIDPOINT FLOOR
-      // Disqualify coins trading in the lower half of daily range (closer to 24h lows)
-      if (posInRange < 0.50) {
+      // CALIBRATED 24-HOUR RANGE FLOOR (0.65)
+      // Disqualifies assets that have surrendered over 35% of their daily range (blocks EIGEN/PENDLE bleeder midpoints)
+      if (posInRange < 0.65) {
         continue;
       }
 
@@ -1345,6 +1413,9 @@ async function evaluateAutopilotEntries() {
   const activeBagsCount = Object.keys(State.recoveryBags).length;
   if (activeBagsCount >= State.tradeFrequencyController.maxRecoveryBagsLimit) return;
 
+  // Real-time coupling of active bags to dynamic hurdle
+  learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
+
   const isStarved = currentCount === 0 && activeBagsCount === 0;
   const baseHurdle = isStarved ? 78 : (State.activeThresholds.scoreThreshold || 80);
   const maxAllowedSpread = isStarved ? 0.12 : (State.activeThresholds.maxSpread || 0.08);
@@ -1369,9 +1440,14 @@ async function evaluateAutopilotEntries() {
     const effectiveScoreHurdle = baseHurdle + (eligibility.netScoreHurdleOffset || 0);
     if ((candidate.score || 0) < effectiveScoreHurdle) continue;
 
-    // FILTER 1 ENFORCEMENT: 1-HOUR TREND & 20-EMA ALIGNMENT GATE
+    // 1-HOUR TREND & 20-EMA ALIGNMENT GATE
     const trendCheck = await check1hTrendAlignment(pair);
     if (!trendCheck.passed) continue;
+
+    // DUAL-TRACK UPSTREAM SELECTION GATE: VWAP & 4H HIGH PROXIMITY
+    // Permanently blocks distribution bleeders (EIGEN, LINK, PYTH, PENDLE, WLD)
+    const vwapCheck = await checkMicrostructureMomentumAndVwap(pair);
+    if (!vwapCheck.passed) continue;
 
     const closedBarCheck = await checkConfirmedClosedBar(pair);
     if (!closedBarCheck.passed) continue;
@@ -1392,7 +1468,13 @@ async function evaluateAutopilotEntries() {
       pair, 
       candidate, 
       book, 
-      { change1hPct: trendCheck.delta1h, isAbove1hEma: trendCheck.isAboveEma }, 
+      { 
+        change1hPct: trendCheck.delta1h, 
+        isAbove1hEma: trendCheck.isAboveEma,
+        distFrom4hHighPct: vwapCheck.distFrom4hHighPct,
+        isAboveVwap: vwapCheck.isAboveVwap,
+        selectionTrack: vwapCheck.track
+      }, 
       tmResult.oddsPct, 
       State.subsystems.btcMacroGate
     );
@@ -1725,8 +1807,9 @@ async function runPredictiveSentry() {
 
       // ==============================================================
       // D. ZERO REALIZED LOSS ARCHITECTURE: NO LOSS EXITS IN ACTIVE SLOTS
+      // Calibrated to -2.80% to allow normal retest wicks to breathe & reach TP1
       // ==============================================================
-      if (!pos.tp1Secured && gainPct <= -1.80) {
+      if (!pos.tp1Secured && gainPct <= -2.80) {
         State.recoveryBags[k] = {
           ...pos,
           movedAt: Date.now(),
