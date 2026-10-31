@@ -1232,6 +1232,92 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
   }
 }
 
+// -------------------------------------------------------------
+// VETERAN ORDER-FLOW, CVD & WYCKOFF VSA ANALYSIS GATE
+// Uses native Binance kline fields 9 & 10 (Executed Taker Buy Volume)
+// to detect hidden distribution, order-book spoofing, and bull traps
+// -------------------------------------------------------------
+async function checkVeteranOrderFlowAndVSA(symbol) {
+  try {
+    const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=5m&limit=12`);
+    if (!res || !res.ok) return { passed: true, takerBuyRatio: 55, recent3Delta: 0, clv: 0.5, vsaPattern: 'FALLBACK_PASS', reason: 'Fallback pass' };
+    const klines = await res.json();
+    if (!klines || klines.length < 6) return { passed: true, takerBuyRatio: 55, recent3Delta: 0, clv: 0.5, vsaPattern: 'FALLBACK_PASS', reason: 'Insufficient bars' };
+
+    // 1. Calculate Aggressive Taker Buy vs Taker Sell Volume over last 3 5m bars (past 15m)
+    const recent3 = klines.slice(-3);
+    let recent3TotalVol = 0;
+    let recent3TakerBuy = 0;
+
+    for (const b of recent3) {
+      const v = parseFloat(b[5]);   // Field 5: Total Base Asset Volume
+      const tb = parseFloat(b[9]);  // Field 9: Taker Buy Base Asset Volume (Executed Market Buys)
+      recent3TotalVol += v;
+      recent3TakerBuy += tb;
+    }
+
+    const recent3TakerSell = recent3TotalVol - recent3TakerBuy;
+    const recent3Delta = recent3TakerBuy - recent3TakerSell;
+    const takerBuyRatio = recent3TotalVol > 0 ? (recent3TakerBuy / recent3TotalVol) * 100 : 50;
+
+    // 2. Wyckoff VSA Close Location Value (CLV) on the latest and previous completed candle
+    const lastBar = klines[klines.length - 1];
+    const prevBar = klines[klines.length - 2];
+    const lbHigh = parseFloat(lastBar[2]);
+    const lbLow = parseFloat(lastBar[3]);
+    const lbClose = parseFloat(lastBar[4]);
+    const lbRange = lbHigh - lbLow;
+    const lbCLV = lbRange > 0 ? (lbClose - lbLow) / lbRange : 0.5;
+
+    const pbHigh = parseFloat(prevBar[2]);
+    const pbLow = parseFloat(prevBar[3]);
+    const pbClose = parseFloat(prevBar[4]);
+    const pbVol = parseFloat(prevBar[5]);
+    const pbTakerBuy = parseFloat(prevBar[9]);
+    const pbDelta = pbTakerBuy - (pbVol - pbTakerBuy);
+    const pbRange = pbHigh - pbLow;
+    const pbCLV = pbRange > 0 ? (pbClose - pbLow) / pbRange : 0.5;
+
+    // Check A: Aggressor Flow / Taker Buy Ratio Floor
+    // Whales spoofing fake passive limit bids while dumping market sells will have takerBuyRatio < 48.0%
+    const isTakerDominant = takerBuyRatio >= 48.5 || (recent3Delta >= 0);
+
+    // Check B: Wyckoff "High Effort, Low Result" (Absorption / Upthrust Trap)
+    // If high volume produced a weak close (CLV < 0.40) with negative taker delta
+    const isAbsorptionTrap = (pbCLV < 0.40 && pbDelta < 0) || (lbCLV < 0.35 && recent3Delta < 0);
+
+    // Check C: 5-Minute Microstructure Cascade (No consecutive Lower Lows + Lower Highs into bids)
+    const c1 = klines[klines.length - 3];
+    const c2 = klines[klines.length - 2];
+    const c3 = klines[klines.length - 1];
+    const isLowerLowCascade = (parseFloat(c3[3]) < parseFloat(c2[3])) && 
+                              (parseFloat(c2[3]) < parseFloat(c1[3])) && 
+                              (parseFloat(c3[4]) < parseFloat(c3[1])); // 3 lower lows in a row with red close
+
+    const passed = isTakerDominant && !isAbsorptionTrap && !isLowerLowCascade;
+
+    let vsaPattern = 'ACCUMULATION / EXPANSION';
+    if (isAbsorptionTrap) vsaPattern = 'ABSORPTION_TRAP (High Effort, Low Result)';
+    else if (!isTakerDominant) vsaPattern = 'SELLER_DOMINANCE (Negative Taker CVD)';
+    else if (isLowerLowCascade) vsaPattern = '5M_LOWER_LOW_CASCADE';
+
+    const reason = passed
+      ? `Order-Flow Supportive: Taker Buy ${takerBuyRatio.toFixed(1)}%, CVD: ${recent3Delta >= 0 ? '+' : ''}${recent3Delta.toFixed(1)}, CLV: ${(lbCLV * 100).toFixed(0)}%`
+      : `Failed Order-Flow: ${vsaPattern} (Taker: ${takerBuyRatio.toFixed(1)}%, Delta: ${recent3Delta.toFixed(1)})`;
+
+    return {
+      passed,
+      takerBuyRatio: Number(takerBuyRatio.toFixed(1)),
+      recent3Delta: Number(recent3Delta.toFixed(2)),
+      clv: Number(lbCLV.toFixed(2)),
+      vsaPattern,
+      reason
+    };
+  } catch (e) {
+    return { passed: true, takerBuyRatio: 55, recent3Delta: 0, clv: 0.5, vsaPattern: 'FALLBACK_PASS', reason: 'Error fallback pass' };
+  }
+}
+
 async function evaluateTimeMachineBreakoutOdds(symbol) {
   try {
     const res = await fetchBinance(`/api/v3/klines?symbol=${symbol}&interval=15m&limit=48`);
@@ -1449,6 +1535,11 @@ async function evaluateAutopilotEntries() {
     const vwapCheck = await checkMicrostructureMomentumAndVwap(pair);
     if (!vwapCheck.passed) continue;
 
+    // VETERAN ORDER-FLOW, CVD & WYCKOFF VSA GATE
+    // Evaluates real executed taker volume delta (Binance kline[9]), Effort vs. Result (CLV), and 5m market structure
+    const orderFlowCheck = await checkVeteranOrderFlowAndVSA(pair);
+    if (!orderFlowCheck.passed) continue;
+
     const closedBarCheck = await checkConfirmedClosedBar(pair);
     if (!closedBarCheck.passed) continue;
 
@@ -1473,7 +1564,10 @@ async function evaluateAutopilotEntries() {
         isAbove1hEma: trendCheck.isAboveEma,
         distFrom4hHighPct: vwapCheck.distFrom4hHighPct,
         isAboveVwap: vwapCheck.isAboveVwap,
-        selectionTrack: vwapCheck.track
+        selectionTrack: vwapCheck.track,
+        takerBuyRatio: orderFlowCheck.takerBuyRatio,
+        recent3Delta: orderFlowCheck.recent3Delta,
+        vsaPattern: orderFlowCheck.vsaPattern
       }, 
       tmResult.oddsPct, 
       State.subsystems.btcMacroGate
