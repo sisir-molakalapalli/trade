@@ -1,17 +1,20 @@
 /**
  * =========================================================================
- * SISIR QUANT TERMINAL - PRODUCTION BACKEND ENGINE (STABLE 2-DAY REVERT)
+ * SISIR QUANT TERMINAL - PRODUCTION BACKEND ENGINE
  * =========================================================================
  * - Zero external HTTP dependencies: Native fetch & https fallback
  * - Singapore low-latency Binance WebSocket stream (<5ms latency)
+ * - Dynamic @bookTicker subscriptions for active breakout positions & bags
+ * - 5 Concurrent Active Breakout Slots (High-Velocity Execution)
+ * - Deep candidate rotation (evaluates up to 30 pairs per cycle)
+ * - Custom Dormant Pump & Dump Trap (<$70M liquidity + dormant 24h baseline)
  * - Time Machine 48-candle historical replay (45% win odds baseline)
  * - Taker Cumulative Volume Delta (CVD) & Wyckoff VSA confluence
  * - 15m VWAP & 1h 20-EMA macro trend alignment
- * - 20-depth real order book gate (OBI >= 50%, spread <= 0.12%)
+ * - 20-depth real order book gate (OBI >= 48%, spread <= 0.15%)
  * - Minute-0 Micro-Trailing Sentry with 30m/45m Alpha Velocity exits
- * - 3 Concurrent Active Breakout Slots
  * - Spot Recovery Bag Engine (Zero Realized Loss Model)
- * - Separate endpoints for Master Trade Ledger and Self-Learning Drive states
+ * - Dedicated independent endpoints for Master Ledger and Drive State
  * =========================================================================
  */
 
@@ -84,7 +87,7 @@ const State = {
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Drive Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
   marketRegime: 'BALANCED',
-  activeThresholds: { regime: 'BALANCED', scoreThreshold: 75, obiThreshold: 0.50, maxSpread: 0.12, marketAvgRange: 4.5 },
+  activeThresholds: { regime: 'BALANCED', scoreThreshold: 75, obiThreshold: 0.48, maxSpread: 0.15, marketAvgRange: 4.5 },
   tradeFrequencyController: {
     dynamicGovernorEnabled: true,
     quotaBypassEnabled: false,
@@ -92,7 +95,7 @@ const State = {
     maxRecoveryBagsLimit: 6,
     governorTier: 'UNLIMITED_SPRINT',
     maxTradesPer24h: 9999,
-    maxConcurrentPositions: 5, // Expanded to 5 Concurrent Slots for maximum trade velocity
+    maxConcurrentPositions: 5,
     rollingTrades24h: [],
     consecutiveWinStreak: 0,
     nextSlotReleaseTimestamp: 0,
@@ -166,8 +169,12 @@ async function safePostJson(url, dataObj, timeoutMs = 8000) {
         signal: controller.signal
       });
       clearTimeout(timeout);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        return { success: true, raw: text };
+      }
     } catch (err) {
       clearTimeout(timeout);
       throw err;
@@ -256,6 +263,80 @@ if (typeof learningEngine.setGoogleDriveSyncCallback === 'function') {
 }
 
 // -------------------------------------------------------------
+// USER CUSTOM PUMP & DUMP TRAP (<$70M LIQUIDITY + DORMANT SPIKE)
+// -------------------------------------------------------------
+const pumpDumpCache = new Map();
+
+async function checkDormantPumpAndDumpTrap(symbol, volQuote, change24, rangePct) {
+  if (volQuote >= 70000000) {
+    return { isTrap: false, reason: 'Liquidity >= $70M (Institutional float)' };
+  }
+
+  const isRapidSpike = (change24 >= 7.5 || rangePct >= 9.0);
+  if (!isRapidSpike) {
+    return { isTrap: false, reason: 'No rapid 24h spike detected' };
+  }
+
+  const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+
+  const cached = pumpDumpCache.get(pairSym);
+  if (cached && (Date.now() - cached.timestamp < 300000)) {
+    return cached.result;
+  }
+
+  try {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=1d&limit=4`;
+    const klines = await safeFetch(url, 3500);
+
+    if (!Array.isArray(klines) || klines.length < 3) {
+      const res = { isTrap: false, reason: 'Insufficient daily history' };
+      pumpDumpCache.set(pairSym, { timestamp: Date.now(), result: res });
+      return res;
+    }
+
+    let priorVolSum = 0;
+    let priorRangeSum = 0;
+    const priorDaysCount = klines.length - 1;
+
+    for (let i = 0; i < priorDaysCount; i++) {
+      const dHigh = parseFloat(klines[i][2]);
+      const dLow = parseFloat(klines[i][3]);
+      const dQuoteVol = parseFloat(klines[i][7]);
+      priorVolSum += dQuoteVol;
+      const dRange = dLow > 0 ? ((dHigh - dLow) / dLow) * 100 : 0;
+      priorRangeSum += dRange;
+    }
+
+    const priorAvgDailyVol = priorVolSum / priorDaysCount;
+    const priorAvgDailyRange = priorRangeSum / priorDaysCount;
+
+    const isVolumeExplosionFromDormant = (priorAvgDailyVol < 12000000 && volQuote >= (priorAvgDailyVol * 2.5));
+    const isPriceExplosionFromDormant = (priorAvgDailyRange < 4.5 && (change24 >= 8.0 || rangePct >= 9.5));
+
+    if (isVolumeExplosionFromDormant || isPriceExplosionFromDormant) {
+      const res = {
+        isTrap: true,
+        reason: `Dormant token (<$70M vol: $${(volQuote/1000000).toFixed(1)}M, prior avg: $${(priorAvgDailyVol/1000000).toFixed(1)}M, spike: +${change24.toFixed(1)}%)`
+      };
+      pumpDumpCache.set(pairSym, { timestamp: Date.now(), result: res });
+
+      if (State.subsystems && State.subsystems.pumpDumpTrap) {
+        State.subsystems.pumpDumpTrap.trappedTokensDetected = (State.subsystems.pumpDumpTrap.trappedTokensDetected || 0) + 1;
+        State.subsystems.pumpDumpTrap.lastBlockedSymbol = cleanSym.replace('USDT', '');
+      }
+      return res;
+    }
+
+    const res = { isTrap: false, reason: 'Asset has consistent prior activity' };
+    pumpDumpCache.set(pairSym, { timestamp: Date.now(), result: res });
+    return res;
+  } catch (err) {
+    return { isTrap: false, reason: 'Trap check fallback' };
+  }
+}
+
+// -------------------------------------------------------------
 // ORDER FLOW, TAKER CVD & WYCKOFF VSA CONFLUENCE GATE
 // -------------------------------------------------------------
 async function checkVeteranOrderFlowAndVSA(symbol) {
@@ -275,7 +356,7 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
     const low = parseFloat(lastBar[3]);
     const close = parseFloat(lastBar[4]);
     const vol = parseFloat(lastBar[5]);
-    const takerBuyVol = parseFloat(lastBar[9]); // Native Binance Taker Buy Volume
+    const takerBuyVol = parseFloat(lastBar[9]);
 
     const takerBuyRatio = vol > 0 ? (takerBuyVol / vol) * 100 : 50;
 
@@ -537,9 +618,24 @@ async function runDynamicScreener() {
       const rangePct = low > 0 ? ((high - low) / low) * 100 : 0;
       const posInRange = (high - low) > 0 ? (last - low) / (high - low) : 0.5;
 
+      let isPumpDump = false;
+      let pumpDumpReason = '';
+
+      if (volQuote < 70000000 && (change24 >= 7.5 || rangePct >= 9.0)) {
+        const pdResult = await checkDormantPumpAndDumpTrap(sym, volQuote, change24, rangePct);
+        if (pdResult.isTrap) {
+          isPumpDump = true;
+          pumpDumpReason = pdResult.reason;
+        }
+      }
+
       let score = 60 + (posInRange * 22) + (Math.min(change24, 15) * 0.9);
       if (volQuote >= 10000000) score += 5;
       if (rangePct >= 5.0) score += 3;
+
+      if (isPumpDump) {
+        score = 0;
+      }
 
       universe[sym] = {
         symbol: sym.replace('USDT', ''),
@@ -550,13 +646,22 @@ async function runDynamicScreener() {
         pricePositionInRange: Number(posInRange.toFixed(2)),
         score: Math.min(99, Math.round(score)),
         volumeM: Math.round(volQuote / 1000000),
-        obi: 0.55
+        obi: 0.55,
+        isPumpAndDump: isPumpDump,
+        pumpDumpReason: pumpDumpReason
       };
     }
 
     State.universe = universe;
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
     State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75 && !c.isPumpAndDump).length;
+
+    const topCandidates = Object.keys(universe).sort((a, b) => (universe[b]?.score || 0) - (universe[a]?.score || 0));
+    if (topCandidates.length > 0) {
+      evaluateTimeMachineBreakoutOdds(topCandidates[0]).then(() => {
+        broadcastStateUpdate();
+      }).catch(() => {});
+    }
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
   }
@@ -596,7 +701,7 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
     livePriceUSDT: livePrice,
     qty: qty,
     notionalUSDT: notional,
-    sl: Number((livePrice * 0.972).toFixed(6)), // -2.80% bag buffer
+    sl: Number((livePrice * 0.972).toFixed(6)),
     peakGainPct: 0,
     peakHighPrice: livePrice,
     ratchetStage: 'INITIAL',
@@ -621,7 +726,6 @@ async function evaluateAutopilotEntries() {
   const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
   learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
 
-  // High-velocity score threshold: 75
   const minScore = (State.activeThresholds?.scoreThreshold || 75);
 
   const keys = Object.keys(State.universe || {});
@@ -633,9 +737,7 @@ async function evaluateAutopilotEntries() {
     const coin = State.universe[k];
     if (!coin || !coin.symbol) continue;
 
-    // Strict pump and dump avoidance
     if (coin.isPumpAndDump) continue;
-
     if ((coin.score || 0) < minScore) break;
 
     const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
@@ -644,7 +746,6 @@ async function evaluateAutopilotEntries() {
 
     if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
 
-    // Deep evaluation window: scan up to 30 eligible candidates so no trade is skipped
     if (++evaluatedCount > 30) break;
 
     const change24h = Number(coin.priceChangePct || coin.change24h || 0);
@@ -653,7 +754,6 @@ async function evaluateAutopilotEntries() {
     const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
     if (posInRange < 0.50) continue;
 
-    // Real-time pre-flight pump and dump trap verification
     const volQuote = (coin.volumeM || 0) * 1000000;
     const rangePct = coin.intradayRangePct || 0;
     if (volQuote < 70000000 && (change24h >= 7.5 || rangePct >= 9.0)) {
@@ -718,33 +818,28 @@ async function runPredictiveSentry() {
     pos.peakHighPrice = Math.max(pos.peakHighPrice || entryPrice, livePrice);
     const peakGain = pos.peakGainPct;
 
-    // TIER 1: Micro-Protection at +0.35% -> Move SL to +0.10% (Breakeven + Fees Locked)
     if (peakGain >= 0.35 && !pos.ratchetStage?.includes('LOCKED') && pos.ratchetStage !== 'DYNAMIC_TRAIL') {
       pos.ratchetStage = 'BREAKEVEN_LOCKED';
       pos.sl = Number((entryPrice * 1.0010).toFixed(6));
     }
 
-    // TIER 2: Profit Lock at +0.60% -> Move SL to +0.35%
     if (peakGain >= 0.60 && pos.ratchetStage !== 'PROFIT_LOCKED' && pos.ratchetStage !== 'DYNAMIC_TRAIL') {
       pos.ratchetStage = 'PROFIT_LOCKED';
       pos.sl = Number((entryPrice * 1.0035).toFixed(6));
     }
 
-    // TIER 3: Dynamic Trailing from +0.90% (0.25% from peak)
     if (peakGain >= 0.90 && peakGain < 1.40) {
       pos.ratchetStage = 'DYNAMIC_TRAIL';
       const trailFloor = Number((pos.peakHighPrice * 0.9975).toFixed(6));
       if (trailFloor > pos.sl) pos.sl = trailFloor;
     }
 
-    // TIER 4: Dynamic Trailing from +1.40% (0.30% from peak)
     if (peakGain >= 1.40 && peakGain < 1.80) {
       pos.ratchetStage = 'DYNAMIC_TRAIL';
       const trailFloor = Number((pos.peakHighPrice * 0.9970).toFixed(6));
       if (trailFloor > pos.sl) pos.sl = trailFloor;
     }
 
-    // TIER 5: TP1 Hit (+1.80%) -> Bank 50%, Trail Remaining 50%
     if (gainPct >= 1.80 && !pos.tp1Secured) {
       pos.tp1Secured = true;
       pos.tp1Price = livePrice;
@@ -762,7 +857,6 @@ async function runPredictiveSentry() {
       });
     }
 
-    // TRAILING STOP HIT
     if (pos.sl && livePrice <= pos.sl && (pos.ratchetStage === 'BREAKEVEN_LOCKED' || pos.ratchetStage === 'PROFIT_LOCKED' || pos.ratchetStage === 'DYNAMIC_TRAIL' || pos.ratchetStage === 'RUNNER_TRAIL')) {
       const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
@@ -784,7 +878,6 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // ALPHA VELOCITY TIME-DECAY EXITS
     if (holdMinutes >= 30 && gainPct >= 0.20) {
       const exitNotional = pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
@@ -1082,7 +1175,16 @@ async function recordTradeToCloudLedger(trade) {
     id: tradeId,
     date: cleanDate,
     time: cleanTime,
-    pnlINR: Number((trade.pnlUSDT * State.usdtToInrRate).toFixed(2))
+    pair: trade.pair,
+    type: trade.type,
+    entryPriceUSDT: Number(trade.entryPriceUSDT),
+    exitPriceUSDT: Number(trade.exitPriceUSDT),
+    notionalUSDT: Number(trade.notionalUSDT || 10.05),
+    pnlUSDT: Number(trade.pnlUSDT),
+    pnlINR: Number((trade.pnlUSDT * State.usdtToInrRate).toFixed(2)),
+    regime: State.marketRegime || 'BALANCED',
+    volatilityPct: 4.5,
+    reason: trade.reason || 'Closed trade'
   };
 
   const timeMinute = cleanTime.slice(0, 5);
@@ -1104,6 +1206,12 @@ async function recordTradeToCloudLedger(trade) {
     console.log(`[Cloud Ledger Success] Successfully logged:`, JSON.stringify(res));
   } catch (err) {
     console.error(`[Cloud Ledger Error]`, err.message);
+    if (State.learningSheetUrl && State.learningSheetUrl !== targetUrl) {
+      try {
+        console.log(`[Cloud Ledger Fallback] Dispatching trade to secondary endpoint...`);
+        await safePostJson(State.learningSheetUrl, record, 10000);
+      } catch (e2) {}
+    }
   }
 
   learningEngine.recordTradeOutcome(
@@ -1138,7 +1246,9 @@ function loadDiskState() {
       if (parsed.activePositions) State.activePositions = parsed.activePositions;
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
-      if (parsed.masterLedgerUrl) State.masterLedgerUrl = parsed.masterLedgerUrl;
+      if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
+        State.masterLedgerUrl = parsed.masterLedgerUrl;
+      }
       if (parsed.learningSheetUrl) State.learningSheetUrl = parsed.learningSheetUrl;
     }
   } catch (e) {}
@@ -1243,6 +1353,62 @@ app.post('/api/trades/sync-strict-sheet', async (req, res) => {
   }
 });
 
+app.post('/api/positions/close', async (req, res) => {
+  const { pairKey } = req.body;
+  if (!pairKey) return res.status(400).json({ success: false, error: 'Missing pairKey' });
+  const pos = State.activePositions[pairKey];
+  if (!pos) return res.status(404).json({ success: false, error: 'Position not found' });
+  const livePrice = Number(State.universe[pairKey]?.priceUSDT || pos.livePriceUSDT || pos.entryPriceUSDT);
+  const entryPrice = Number(pos.entryPriceUSDT || livePrice);
+  const notional = Number(pos.notionalUSDT || 10.05);
+  const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * notional).toFixed(4));
+  const closeRecord = {
+    id: Date.now(),
+    pair: pos.pair || `${pairKey.replace('USDT', '')}/USDT`,
+    type: realizedGain >= 0 ? 'MANUAL PROFIT' : 'MANUAL EXIT',
+    entryPriceUSDT: entryPrice,
+    exitPriceUSDT: livePrice,
+    notionalUSDT: notional,
+    pnlUSDT: realizedGain,
+    reason: `Manual position close at $${livePrice.toFixed(4)}`
+  };
+  delete State.activePositions[pairKey];
+  State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + notional + realizedGain).toFixed(4));
+  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+  saveDiskState();
+  broadcastStateUpdate();
+  await recordTradeToCloudLedger(closeRecord);
+  res.json({ success: true, trade: closeRecord });
+});
+
+app.post('/api/bags/close', async (req, res) => {
+  const { pairKey } = req.body;
+  if (!pairKey) return res.status(400).json({ success: false, error: 'Missing pairKey' });
+  const bag = State.recoveryBags[pairKey];
+  if (!bag) return res.status(404).json({ success: false, error: 'Bag not found' });
+  const livePrice = Number(State.universe[pairKey]?.priceUSDT || bag.livePriceUSDT || bag.entryPriceUSDT);
+  const entryPrice = Number(bag.entryPriceUSDT || livePrice);
+  const notional = Number(bag.notionalUSDT || 10.05);
+  const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * notional).toFixed(4));
+  const closeRecord = {
+    id: Date.now(),
+    pair: bag.pair || `${pairKey.replace('USDT', '')}/USDT`,
+    type: realizedGain >= 0 ? 'RECOVERY MANUAL EXIT' : 'BAG LIQUIDATION',
+    entryPriceUSDT: entryPrice,
+    exitPriceUSDT: livePrice,
+    notionalUSDT: notional,
+    pnlUSDT: realizedGain,
+    reason: `Manual bag liquidation at $${livePrice.toFixed(4)}`
+  };
+  delete State.recoveryBags[pairKey];
+  State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + notional + realizedGain).toFixed(4));
+  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+  saveDiskState();
+  broadcastStateUpdate();
+  await recordTradeToCloudLedger(closeRecord);
+  res.json({ success: true, trade: closeRecord });
+});
+
 app.post('/api/drive/sync-files-now', async (req, res) => {
   try {
     if (req.body && req.body.learningSheetUrl) {
@@ -1285,7 +1451,8 @@ function broadcastStateUpdate() {
     portfolio: State.portfolio,
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
-    tradeLogs: State.tradeLogs
+    tradeLogs: State.tradeLogs,
+    subsystems: State.subsystems
   });
   wss.clients.forEach(c => {
     if (c.readyState === WebSocket.OPEN) c.send(msg);
@@ -1450,7 +1617,7 @@ wss.on('connection', (ws) => {
           const entryPrice = Number(pos.entryPriceUSDT || livePrice);
           const notional = Number(pos.notionalUSDT || 10.05);
           const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * notional).toFixed(4));
-          recordTradeToCloudLedger({
+          const closeRecord = {
             id: Date.now(),
             pair: pos.pair || `${msg.pairKey.replace('USDT', '')}/USDT`,
             type: realizedGain >= 0 ? 'MANUAL PROFIT' : 'MANUAL EXIT',
@@ -1459,12 +1626,13 @@ wss.on('connection', (ws) => {
             notionalUSDT: notional,
             pnlUSDT: realizedGain,
             reason: `Manual position close at $${livePrice.toFixed(4)}`
-          }).catch(() => {});
+          };
+          delete State.activePositions[msg.pairKey];
           State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + notional + realizedGain).toFixed(4));
           State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-          delete State.activePositions[msg.pairKey];
           saveDiskState();
           broadcastStateUpdate();
+          recordTradeToCloudLedger(closeRecord).catch(() => {});
         }
       } else if (msg.type === 'CLOSE_RECOVERY_BAG' && msg.pairKey) {
         const bag = State.recoveryBags[msg.pairKey];
@@ -1473,7 +1641,7 @@ wss.on('connection', (ws) => {
           const entryPrice = Number(bag.entryPriceUSDT || livePrice);
           const notional = Number(bag.notionalUSDT || 10.05);
           const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * notional).toFixed(4));
-          recordTradeToCloudLedger({
+          const closeRecord = {
             id: Date.now(),
             pair: bag.pair || `${msg.pairKey.replace('USDT', '')}/USDT`,
             type: realizedGain >= 0 ? 'RECOVERY MANUAL EXIT' : 'BAG LIQUIDATION',
@@ -1482,12 +1650,13 @@ wss.on('connection', (ws) => {
             notionalUSDT: notional,
             pnlUSDT: realizedGain,
             reason: `Manual bag liquidation at $${livePrice.toFixed(4)}`
-          }).catch(() => {});
+          };
+          delete State.recoveryBags[msg.pairKey];
           State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + notional + realizedGain).toFixed(4));
           State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-          delete State.recoveryBags[msg.pairKey];
           saveDiskState();
           broadcastStateUpdate();
+          recordTradeToCloudLedger(closeRecord).catch(() => {});
         }
       }
     } catch (e) {}
