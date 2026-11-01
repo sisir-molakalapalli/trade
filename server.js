@@ -102,11 +102,16 @@ const State = {
 // ZERO-DEPENDENCY SAFE HTTP FETCHER
 // -------------------------------------------------------------
 async function safeFetch(url, timeoutMs = 4000) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
+  };
+
   if (typeof fetch === 'function') {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { signal: controller.signal });
+      const res = await fetch(url, { headers, signal: controller.signal });
       clearTimeout(timeout);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
@@ -118,12 +123,16 @@ async function safeFetch(url, timeoutMs = 4000) {
 
   // Fallback to native Node.js https module
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { timeout: timeoutMs }, (res) => {
+    const req = https.get(url, { timeout: timeoutMs, headers }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
-          resolve(JSON.parse(data));
+          if (res.statusCode >= 400) {
+            reject(new Error(`HTTP ${res.statusCode}`));
+          } else {
+            resolve(JSON.parse(data));
+          }
         } catch (e) {
           reject(new Error('Invalid JSON from ' + url));
         }
@@ -462,13 +471,22 @@ async function evaluateAutopilotEntries() {
   const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
   learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
 
+  const minScore = (State.activeThresholds?.scoreThreshold || 80) + (learningEngine.state?.dynamicHurdles?.scoreOffset || 0);
+
   const keys = Object.keys(State.universe || {});
   const sorted = [...keys].sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
 
+  let evaluatedCount = 0;
   for (const k of sorted) {
     if (Object.keys(State.activePositions).length >= maxSlots) break;
     const coin = State.universe[k];
     if (!coin || !coin.symbol) continue;
+
+    // Early exit: sorted descending, so no subsequent coin can meet the score threshold
+    if ((coin.score || 0) < minScore) break;
+
+    // Rate-limit guard: inspect max 4 high-conviction candidates per 2.5s cycle
+    if (++evaluatedCount > 4) break;
 
     const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
     const pairKey = `${baseSym}USDT`;
@@ -589,7 +607,52 @@ async function runPredictiveSentry() {
         reason: `Dynamic trailing stop executed at $${livePrice.toFixed(4)} (Peak: +${peakGain.toFixed(2)}%)`
       });
 
-      State.portfolio.cashUSDT += (exitNotional + realizedGain);
+      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
+      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+      delete State.activePositions[k];
+      continue;
+    }
+
+    // ALPHA VELOCITY TIME-DECAY EXITS
+    // At 30 mins: Bank if in profit >= +0.20%
+    if (holdMinutes >= 30 && gainPct >= 0.20) {
+      const exitNotional = pos.notionalUSDT;
+      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+
+      await recordTradeToCloudLedger({
+        id: Date.now(),
+        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
+        type: 'VELOCITY HARVEST 30M',
+        entryPriceUSDT: entryPrice,
+        exitPriceUSDT: livePrice,
+        notionalUSDT: exitNotional,
+        pnlUSDT: realizedGain,
+        reason: `30m Alpha Velocity: Banked +${gainPct.toFixed(2)}% to clear slot`
+      });
+
+      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
+      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+      delete State.activePositions[k];
+      continue;
+    }
+
+    // At 45 mins: Scratch if positive >= +0.10%
+    if (holdMinutes >= 45 && gainPct >= 0.10) {
+      const exitNotional = pos.notionalUSDT;
+      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+
+      await recordTradeToCloudLedger({
+        id: Date.now(),
+        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
+        type: 'VELOCITY SCRATCH 45M',
+        entryPriceUSDT: entryPrice,
+        exitPriceUSDT: livePrice,
+        notionalUSDT: exitNotional,
+        pnlUSDT: realizedGain,
+        reason: `45m Velocity Scratch: Cleared stalled breakout at +${gainPct.toFixed(2)}%`
+      });
+
+      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
       State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
       delete State.activePositions[k];
       continue;
@@ -871,7 +934,7 @@ function sanitizeAndAuditTradeHistory(logs) {
  * Actively syncs and parses trades from both Master Ledger and Learning Sheet.
  */
 async function syncTradesFromGoogleSheets() {
-  const masterUrl = State.masterLedgerUrl || 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
+  const masterUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
 
   try {
     const fullUrl = masterUrl.includes('?') ? `${masterUrl}&action=GET_ALL` : `${masterUrl}?action=GET_ALL`;
@@ -923,19 +986,17 @@ async function recordTradeToCloudLedger(trade) {
   State.tradeLogs.unshift(record);
   saveDiskState();
 
-  // Async dispatch to Google Apps Script
-  const targetUrl = State.masterLedgerUrl || State.googleSheetUrl;
-  if (targetUrl) {
-    try {
-      if (typeof fetch === 'function') {
-        fetch(targetUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(record)
-        }).catch(() => {});
-      }
-    } catch (e) {}
-  }
+  // Async dispatch strictly to Sisir_Quant_Trade_Ledger endpoint
+  const targetUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
+  try {
+    if (typeof fetch === 'function') {
+      fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(record)
+      }).catch(() => {});
+    }
+  } catch (e) {}
 
   learningEngine.recordTradeOutcome(
     record.pair.replace('/USDT', 'USDT'),
@@ -969,6 +1030,9 @@ function loadDiskState() {
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
     }
   } catch (e) {}
+  // Ensure URLs are strictly locked to Sisir_Quant_Trade_Ledger
+  State.googleSheetUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
+  State.masterLedgerUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
 }
 
 // -------------------------------------------------------------
@@ -989,12 +1053,22 @@ app.use((req, res, next) => {
 
 // Serve static frontend files
 app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
+
 app.get('/', (req, res) => {
   const indexHtml = path.join(__dirname, 'index.html');
   if (fs.existsSync(indexHtml)) {
     return res.sendFile(indexHtml);
   }
   res.json({ status: 'ONLINE', engine: 'Sisir Quant Production Engine' });
+});
+
+app.get(['/pnl_dashboard', '/pnl_dashboard.html', '/net_in_hand_p_l_audit_terminal.html'], (req, res) => {
+  const pnlHtml = path.join(__dirname, 'pnl_dashboard.html');
+  if (fs.existsSync(pnlHtml)) {
+    return res.sendFile(pnlHtml);
+  }
+  res.status(404).send('P&L Dashboard file not found');
 });
 
 // REST API Endpoints
@@ -1156,6 +1230,10 @@ wss.on('connection', (ws) => {
         if (State.tradeFrequencyController) {
           State.tradeFrequencyController.dynamicGovernorEnabled = Boolean(msg.enabled);
         }
+        broadcastStateUpdate();
+      } else if (msg.type === 'SET_GOOGLE_SHEET_URL') {
+        State.googleSheetUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
+        State.masterLedgerUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
         broadcastStateUpdate();
       } else if (msg.type === 'SYNC_P2P_RATE') {
         broadcastStateUpdate();
