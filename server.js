@@ -658,51 +658,6 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // ALPHA VELOCITY TIME-DECAY EXITS
-    // At 30 mins: Bank if in profit >= +0.20%
-    if (holdMinutes >= 30 && gainPct >= 0.20) {
-      const exitNotional = pos.notionalUSDT;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-
-      await recordTradeToCloudLedger({
-        id: Date.now(),
-        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'VELOCITY HARVEST 30M',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: exitNotional,
-        pnlUSDT: realizedGain,
-        reason: `30m Alpha Velocity: Banked +${gainPct.toFixed(2)}% to clear slot`
-      });
-
-      State.portfolio.cashUSDT += (exitNotional + realizedGain);
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.activePositions[k];
-      continue;
-    }
-
-    // At 45 mins: Scratch if positive >= +0.10%
-    if (holdMinutes >= 45 && gainPct >= 0.10) {
-      const exitNotional = pos.notionalUSDT;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-
-      await recordTradeToCloudLedger({
-        id: Date.now(),
-        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'VELOCITY SCRATCH 45M',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: exitNotional,
-        pnlUSDT: realizedGain,
-        reason: `45m Velocity Scratch: Cleared stalled breakout at +${gainPct.toFixed(2)}%`
-      });
-
-      State.portfolio.cashUSDT += (exitNotional + realizedGain);
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.activePositions[k];
-      continue;
-    }
-
     // At 45 mins: Move negative trades to Recovery Bag
     if (holdMinutes >= 45 && gainPct <= 0.00) {
       State.recoveryBags[k] = {
