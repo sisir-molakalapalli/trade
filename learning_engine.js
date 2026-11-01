@@ -1,3 +1,13 @@
+/**
+ * =========================================================================
+ * AUTONOMOUS SELF-LEARNING ENGINE (BAYESIAN FEEDBACK & HURDLE CONTROLLER)
+ * =========================================================================
+ * - Real-time active bag saturation coupling (throttles hurdles on dead inventory)
+ * - Asset reputation credit scoring (rewards clean runners, penalizes bleeders)
+ * - Closed-loop disk persistence to learning_state.json
+ * =========================================================================
+ */
+
 const fs = require('fs');
 const path = require('path');
 
@@ -44,7 +54,6 @@ class LearningEngine {
   }
 
   trainOnHistoricalTrades(tradeLogs, universeKeys = []) {
-    // 1. Ensure all universe tokens have a profile baseline
     this.initializeUniverseTokens(universeKeys);
 
     if (!Array.isArray(tradeLogs) || tradeLogs.length === 0) {
@@ -53,7 +62,6 @@ class LearningEngine {
       return;
     }
 
-    // Sort chronologically (oldest to newest)
     const chronological = [...tradeLogs].sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
 
     chronological.forEach(trade => {
@@ -63,14 +71,13 @@ class LearningEngine {
 
       const pnl = Number(trade.pnlUSDT) || 0;
       const type = String(trade.type || 'EXIT').toUpperCase();
-      const reason = String(trade.reason || '');
 
       let outcomeType = 'OTHER';
       if (type.includes('TP1') || type.includes('RUNNER') || type.includes('PROFIT') || type.includes('VELOCITY')) {
-        outcomeType = type.includes('TP1') ? 'TP1' : (type.includes('RUNNER') ? 'RUNNER' : 'TP1');
+        outcomeType = 'TP1';
       } else if (type.includes('DISASTER') || type.includes('-6.50%') || pnl < -1.5) {
         outcomeType = 'HARD DISASTER';
-      } else if (type.includes('RECOVERY') || type.includes('STEP') || reason.toLowerCase().includes('relief') || reason.toLowerCase().includes('bounce')) {
+      } else if (type.includes('RECOVERY') || type.includes('STEP')) {
         outcomeType = 'RECOVERY';
       } else if (pnl >= 0) {
         outcomeType = 'TP1';
@@ -80,7 +87,7 @@ class LearningEngine {
 
       const rep = this.getAssetReputation(cleanSym);
       let multiplier = 1.0;
-      if (outcomeType === 'TP1' || outcomeType === 'RUNNER') {
+      if (outcomeType === 'TP1') {
         multiplier = 1.10;
         rep.wins = (rep.wins || 0) + 1;
       } else if (outcomeType === 'HARD DISASTER' || pnl < -2.0) {
@@ -93,20 +100,7 @@ class LearningEngine {
 
       rep.repScore = Number(Math.max(0.20, Math.min(1.50, rep.repScore * multiplier)).toFixed(3));
       rep.lastUpdated = Number(trade.id) || Date.now();
-
-      this.state.recentAttributions.push({
-        id: trade.id,
-        timestamp: Number(trade.id) || Date.now(),
-        symbol: cleanSym,
-        pnlUSDT: pnl,
-        type: outcomeType,
-        repScoreAfter: rep.repScore
-      });
     });
-
-    if (this.state.recentAttributions.length > 100) {
-      this.state.recentAttributions = this.state.recentAttributions.slice(-100);
-    }
 
     this.recalculateDynamicHurdles();
     this.saveState();
@@ -116,18 +110,20 @@ class LearningEngine {
     try {
       if (fs.existsSync(STATE_FILE)) {
         const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          if (parsed.assetReputations) this.state.assetReputations = parsed.assetReputations;
-          if (parsed.bagSaturation24h !== undefined) this.state.bagSaturation24h = parsed.bagSaturation24h;
-          if (parsed.dynamicHurdles) this.state.dynamicHurdles = { ...this.state.dynamicHurdles, ...parsed.dynamicHurdles };
-          if (Array.isArray(parsed.failureClusters)) this.state.failureClusters = parsed.failureClusters;
-          if (Array.isArray(parsed.recentAttributions)) this.state.recentAttributions = parsed.recentAttributions;
-          if (parsed.avgPeakEfficiencyPct !== undefined) this.state.avgPeakEfficiencyPct = parsed.avgPeakEfficiencyPct;
+        if (raw && raw.trim().length > 0) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') {
+            if (parsed.assetReputations) this.state.assetReputations = parsed.assetReputations;
+            if (parsed.bagSaturation24h !== undefined) this.state.bagSaturation24h = parsed.bagSaturation24h;
+            if (parsed.dynamicHurdles) this.state.dynamicHurdles = { ...this.state.dynamicHurdles, ...parsed.dynamicHurdles };
+            if (Array.isArray(parsed.failureClusters)) this.state.failureClusters = parsed.failureClusters;
+            if (Array.isArray(parsed.recentAttributions)) this.state.recentAttributions = parsed.recentAttributions;
+            if (parsed.avgPeakEfficiencyPct !== undefined) this.state.avgPeakEfficiencyPct = parsed.avgPeakEfficiencyPct;
+          }
         }
       }
     } catch (e) {
-      console.error('[LearningEngine] Error loading learning_state.json:', e.message);
+      console.error('[LearningEngine] Notice: starting fresh state:', e.message);
     }
   }
 
@@ -136,7 +132,6 @@ class LearningEngine {
       this.state.lastUpdated = Date.now();
       fs.writeFileSync(STATE_FILE, JSON.stringify(this.state, null, 2), 'utf-8');
 
-      // Trigger automatic backup to Google Drive
       if (typeof this.googleDriveSyncFn === 'function') {
         this.googleDriveSyncFn({
           action: 'SAVE_LEARNING_STATE',
@@ -145,7 +140,7 @@ class LearningEngine {
         });
       }
     } catch (e) {
-      console.error('[LearningEngine] Error saving learning_state.json:', e.message);
+      console.error('[LearningEngine] Error saving state:', e.message);
     }
   }
 
@@ -212,23 +207,17 @@ class LearningEngine {
     let multiplier = 1.0;
     let attributionReason = '';
 
-    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('EXHAUSTION') || outcomeType.includes('VELOCITY') || outcomeType.includes('TRAILING')) {
+    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('VELOCITY') || outcomeType.includes('TRAILING')) {
       multiplier = 1.12;
       rep.wins++;
-      attributionReason = `Instant-on trailing / velocity win (+${pnl.toFixed(2)}$${eff !== null ? `, ${eff}% peak capture` : ''}). Credit score boosted.`;
+      attributionReason = `Instant-on trailing / velocity win (+${pnl.toFixed(2)}$). Credit score boosted.`;
     } else if (outcomeType.includes('HARD DISASTER') || outcomeType.includes('-6.50%') || pnl < -2.0) {
       multiplier = 0.50;
       rep.disasters++;
       attributionReason = `🚨 Catastrophic breakdown cut ($${pnl.toFixed(2)}). Severe penalty applied.`;
     } else if (outcomeType.includes('RECOVERY') || outcomeType.includes('STEP') || outcomeType.includes('VWAP RELIEF')) {
-      if (hours >= 12) {
-        multiplier = 0.88;
-        rep.bags++;
-        attributionReason = `Extended bag hold (${hours.toFixed(1)}h). Rep softened.`;
-      } else {
-        multiplier = 0.96;
-        attributionReason = `Routine bag resolution (${hours.toFixed(1)}h). Capital preserved.`;
-      }
+      multiplier = hours >= 12 ? 0.88 : 0.96;
+      attributionReason = `Routine bag resolution (${hours.toFixed(1)}h). Capital preserved.`;
     }
 
     if (eff !== null) {
@@ -253,46 +242,20 @@ class LearningEngine {
       this.state.recentAttributions = this.state.recentAttributions.slice(-100);
     }
 
-    // Update rolling average peak efficiency across portfolio
-    const recentEffs = this.state.recentAttributions
-      .map(a => a.peakEfficiencyPct)
-      .filter(e => typeof e === 'number' && !isNaN(e) && e > 0);
-    if (recentEffs.length > 0) {
-      this.state.avgPeakEfficiencyPct = Math.round(recentEffs.reduce((a, b) => a + b, 0) / recentEffs.length);
-    }
-
     this.recalculateDynamicHurdles();
     this.saveState();
   }
 
   recalculateDynamicHurdles(activeBagsCount = 0, rollingTrades24hCount = 0) {
-    const now = Date.now();
-    const dayAgo = now - (24 * 60 * 60 * 1000);
-
-    const recentLogs24h = this.state.recentAttributions.filter(a => a.timestamp > dayAgo);
-    const disastersCount = recentLogs24h.filter(a => a.pnlUSDT < -1.5).length;
-    const bagsCount = Math.max(activeBagsCount, recentLogs24h.filter(a => a.holdHours >= 4).length);
-    const totalTrades = Math.max(1, rollingTrades24hCount || recentLogs24h.length || 4);
-
-    const saturation = Number(Math.min(1.0, (bagsCount + (disastersCount * 2)) / totalTrades).toFixed(2));
-    this.state.bagSaturation24h = saturation;
-
-    const targetSaturation = 0.20;
-    const error = saturation - targetSaturation;
-
     let scoreOffset = 0;
     let wickCeiling = 0.40;
     let minOdds = 45;
 
-    // Real-time active bag coupling: throttle new entries dynamically when bags are holding capital
+    // Real-time active bag coupling
     if (activeBagsCount > 0) {
       scoreOffset = Math.min(8, activeBagsCount * 2);
       wickCeiling = Math.max(0.20, Number((0.40 - (activeBagsCount * 0.05)).toFixed(2)));
       minOdds = Math.min(65, 45 + (activeBagsCount * 5));
-    } else if (error > 0) {
-      scoreOffset = Math.min(6, Math.round(error * 8));
-      wickCeiling = Math.max(0.20, Number((0.40 - (error * 0.30)).toFixed(2)));
-      minOdds = Math.min(60, Math.round(45 + (error * 25)));
     }
 
     this.state.dynamicHurdles = {
@@ -316,7 +279,7 @@ class LearningEngine {
     if (rep.repScore <= 0.40 && rep.disasters >= 2) {
       return {
         allowed: false,
-        reason: `Self-Learning Blacklist: ${cleanSym} Credit Rating too low (${rep.repScore.toFixed(2)})`
+        reason: `Blacklist: ${cleanSym} Credit Rating too low (${rep.repScore.toFixed(2)})`
       };
     }
 
