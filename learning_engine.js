@@ -212,15 +212,15 @@ class LearningEngine {
     let multiplier = 1.0;
     let attributionReason = '';
 
-    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('EXHAUSTION') || outcomeType.includes('VELOCITY')) {
+    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('EXHAUSTION') || outcomeType.includes('VELOCITY') || outcomeType.includes('TRAILING')) {
       multiplier = 1.12;
       rep.wins++;
-      attributionReason = `Clean breakout / velocity win (+${pnl.toFixed(2)}$${eff !== null ? `, ${eff}% peak capture` : ''}). Credit score boosted.`;
+      attributionReason = `Instant-on trailing / velocity win (+${pnl.toFixed(2)}$${eff !== null ? `, ${eff}% peak capture` : ''}). Credit score boosted.`;
     } else if (outcomeType.includes('HARD DISASTER') || outcomeType.includes('-6.50%') || pnl < -2.0) {
       multiplier = 0.50;
       rep.disasters++;
       attributionReason = `🚨 Catastrophic breakdown cut ($${pnl.toFixed(2)}). Severe penalty applied.`;
-    } else if (outcomeType.includes('RECOVERY') || outcomeType.includes('STEP')) {
+    } else if (outcomeType.includes('RECOVERY') || outcomeType.includes('STEP') || outcomeType.includes('VWAP RELIEF')) {
       if (hours >= 12) {
         multiplier = 0.88;
         rep.bags++;
