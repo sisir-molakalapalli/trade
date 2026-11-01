@@ -73,17 +73,18 @@ const State = {
   cooldowns: {},
   subsystems: {
     timeMachine: { status: 'ONLINE', replaysCompleted: 0, lastEvaluatedSymbol: '--', lastWinOddsPct: 55, minOddsFloorPct: 45 },
+    pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 12, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
-    regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 80, liveObiGatePct: 55 },
+    regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 75, liveObiGatePct: 50 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Instant-On Minute-0 Trailing + Alpha Velocity' },
     recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Dynamic Stepped Target (+0.30% -> 0.00% -> -0.75%)', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Drive Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
   marketRegime: 'BALANCED',
-  activeThresholds: { regime: 'BALANCED', scoreThreshold: 80, obiThreshold: 0.55, maxSpread: 0.08, marketAvgRange: 4.5 },
+  activeThresholds: { regime: 'BALANCED', scoreThreshold: 75, obiThreshold: 0.50, maxSpread: 0.12, marketAvgRange: 4.5 },
   tradeFrequencyController: {
     dynamicGovernorEnabled: true,
     quotaBypassEnabled: false,
@@ -91,11 +92,11 @@ const State = {
     maxRecoveryBagsLimit: 6,
     governorTier: 'UNLIMITED_SPRINT',
     maxTradesPer24h: 9999,
-    maxConcurrentPositions: 3, // 3 Concurrent Slots
+    maxConcurrentPositions: 5, // Expanded to 5 Concurrent Slots for maximum trade velocity
     rollingTrades24h: [],
     consecutiveWinStreak: 0,
     nextSlotReleaseTimestamp: 0,
-    pacingMode: 'BALANCED'
+    pacingMode: 'HIGH_VELOCITY'
   },
   usdtToInrRate: 94.94,
   // Dedicated Separate Endpoints
@@ -555,7 +556,7 @@ async function runDynamicScreener() {
 
     State.universe = universe;
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
-    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 80).length;
+    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75 && !c.isPumpAndDump).length;
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
   }
@@ -614,13 +615,14 @@ async function evaluateAutopilotEntries() {
   if (!State.autopilotEnabled) return;
 
   const currentCount = Object.keys(State.activePositions).length;
-  const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 3;
+  const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 5;
   if (currentCount >= maxSlots) return;
 
   const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
   learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
 
-  const minScore = (State.activeThresholds?.scoreThreshold || 80) + (learningEngine.state?.dynamicHurdles?.scoreOffset || 0);
+  // High-velocity score threshold: 75
+  const minScore = (State.activeThresholds?.scoreThreshold || 75);
 
   const keys = Object.keys(State.universe || {});
   const sorted = [...keys].sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
@@ -631,21 +633,36 @@ async function evaluateAutopilotEntries() {
     const coin = State.universe[k];
     if (!coin || !coin.symbol) continue;
 
+    // Strict pump and dump avoidance
+    if (coin.isPumpAndDump) continue;
+
     if ((coin.score || 0) < minScore) break;
 
     const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
     const pairKey = `${baseSym}USDT`;
     if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
 
-    if (++evaluatedCount > 6) break;
+    if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
+
+    // Deep evaluation window: scan up to 30 eligible candidates so no trade is skipped
+    if (++evaluatedCount > 30) break;
 
     const change24h = Number(coin.priceChangePct || coin.change24h || 0);
-    if (change24h < 1.20) continue;
+    if (change24h < 0.50) continue;
 
     const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
-    if (posInRange < 0.60) continue;
+    if (posInRange < 0.50) continue;
 
-    if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
+    // Real-time pre-flight pump and dump trap verification
+    const volQuote = (coin.volumeM || 0) * 1000000;
+    const rangePct = coin.intradayRangePct || 0;
+    if (volQuote < 70000000 && (change24h >= 7.5 || rangePct >= 9.0)) {
+      const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
+      if (pdCheck.isTrap) {
+        console.log(`[PUMP & DUMP AVOIDED] Blocked entry on ${pairKey}: ${pdCheck.reason}`);
+        continue;
+      }
+    }
 
     const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
     if (!orderFlow.passed) continue;
@@ -672,7 +689,7 @@ async function evaluateAutopilotEntries() {
       };
     }
     
-    if (book.obi < 0.50 || book.spreadPct > 0.12) continue;
+    if (book.obi < 0.48 || book.spreadPct > 0.15) continue;
 
     console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, TM Odds ${timeMachine.oddsPct}%, 15m ${microMom.change15mPct}%`);
     await executeSpotBuy(pairKey, coin, book, microMom);
