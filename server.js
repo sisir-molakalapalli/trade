@@ -96,11 +96,12 @@ const State = {
   },
   usdtToInrRate: 94.94,
   googleSheetUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec',
-  masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec'
+  masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec',
+  learningSheetUrl: 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec'
 };
 
 // -------------------------------------------------------------
-// ZERO-DEPENDENCY SAFE HTTP FETCHER
+// ZERO-DEPENDENCY SAFE HTTP FETCHER & JSON POSTER
 // -------------------------------------------------------------
 async function safeFetch(url, timeoutMs = 4000) {
   const headers = {
@@ -141,6 +142,120 @@ async function safeFetch(url, timeoutMs = 4000) {
     });
     req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
     req.on('error', reject);
+  });
+}
+
+async function safePostJson(url, dataObj, timeoutMs = 8000) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+  };
+
+  if (typeof fetch === 'function') {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(dataObj),
+        redirect: 'follow',
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      clearTimeout(timeout);
+      throw err;
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    try {
+      const parsedUrl = new URL(url);
+      const postData = JSON.stringify(dataObj);
+      const options = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Length': Buffer.byteLength(postData)
+        },
+        timeout: timeoutMs
+      };
+      const req = https.request(options, (res) => {
+        let body = '';
+        res.on('data', chunk => body += chunk);
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(body));
+          } catch (e) {
+            resolve({ success: true, raw: body });
+          }
+        });
+      });
+      req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
+      req.on('error', reject);
+      req.write(postData);
+      req.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+// -------------------------------------------------------------
+// GOOGLE DRIVE LEARNING STATE & PORTFOLIO STATE BACKUPS
+// -------------------------------------------------------------
+async function backupLearningStateToGoogleDrive() {
+  const targetUrl = State.learningSheetUrl || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
+  try {
+    const payload = {
+      action: 'SAVE_LEARNING_STATE',
+      learningState: learningEngine.state,
+      timestamp: Date.now()
+    };
+    const res = await safePostJson(targetUrl, payload, 8000);
+    console.log(`[Drive Sync] learning_state.json backed up to Google Drive.`);
+    return res;
+  } catch (err) {
+    console.warn('[Drive Sync Notice - Learning]:', err.message);
+    return null;
+  }
+}
+
+async function backupPortfolioStateToGoogleDrive() {
+  const targetUrl = State.learningSheetUrl || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
+  try {
+    const payload = {
+      action: 'SAVE_PORTFOLIO_STATE',
+      portfolioState: {
+        portfolio: State.portfolio,
+        activePositions: State.activePositions,
+        recoveryBags: State.recoveryBags,
+        cooldowns: State.cooldowns,
+        lastUpdated: Date.now()
+      },
+      timestamp: Date.now()
+    };
+    const res = await safePostJson(targetUrl, payload, 8000);
+    console.log(`[Drive Sync] cloud_portfolio_state.json backed up to Google Drive.`);
+    return res;
+  } catch (err) {
+    console.warn('[Drive Sync Notice - Portfolio]:', err.message);
+    return null;
+  }
+}
+
+// Hook learningEngine to automatic Google Drive dispatch
+if (typeof learningEngine.setGoogleDriveSyncCallback === 'function') {
+  learningEngine.setGoogleDriveSyncCallback(async (payload) => {
+    const targetUrl = State.learningSheetUrl || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
+    try {
+      await safePostJson(targetUrl, payload, 8000);
+    } catch (e) {}
   });
 }
 
@@ -1045,7 +1160,8 @@ function saveDiskState() {
       portfolio: State.portfolio,
       activePositions: State.activePositions,
       recoveryBags: State.recoveryBags,
-      tradeLogs: State.tradeLogs.slice(0, 150)
+      tradeLogs: State.tradeLogs.slice(0, 150),
+      learningSheetUrl: State.learningSheetUrl
     };
     fs.writeFileSync(DISK_STATE_FILE, JSON.stringify(data, null, 2), 'utf-8');
   } catch (e) {}
@@ -1059,11 +1175,15 @@ function loadDiskState() {
       if (parsed.activePositions) State.activePositions = parsed.activePositions;
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
+      if (parsed.learningSheetUrl) State.learningSheetUrl = parsed.learningSheetUrl;
     }
   } catch (e) {}
-  // Ensure URLs are strictly locked to Sisir_Quant_Trade_Ledger
+  // Ensure URLs are strictly locked to respective production endpoints
   State.googleSheetUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
   State.masterLedgerUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
+  if (!State.learningSheetUrl) {
+    State.learningSheetUrl = 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
+  }
 }
 
 // -------------------------------------------------------------
@@ -1115,6 +1235,9 @@ app.get('/api/state', (req, res) => {
     activeThresholds: State.activeThresholds,
     marketRegime: State.marketRegime,
     usdtToInrRate: State.usdtToInrRate,
+    googleSheetUrl: State.googleSheetUrl,
+    masterLedgerUrl: State.masterLedgerUrl,
+    learningSheetUrl: State.learningSheetUrl,
     learningEngineState: learningEngine.state || {}
   });
 });
@@ -1185,8 +1308,35 @@ app.get('/api/quota/reconcile', (req, res) => {
   });
 });
 
-app.post('/api/drive/sync-files-now', (req, res) => {
-  res.json({ success: true, profiledTokens: Object.keys(learningEngine.state?.assetReputations || {}).length });
+app.post('/api/drive/sync-files-now', async (req, res) => {
+  try {
+    if (req.body && req.body.learningSheetUrl) {
+      State.learningSheetUrl = req.body.learningSheetUrl.trim();
+      saveDiskState();
+    }
+
+    if (Array.isArray(req.body?.trades) && req.body.trades.length > 0) {
+      learningEngine.trainOnHistoricalTrades(req.body.trades);
+    }
+
+    // Trigger actual Google Drive writes
+    const rLearning = await backupLearningStateToGoogleDrive();
+    const rPortfolio = await backupPortfolioStateToGoogleDrive();
+
+    const profiledTokens = Object.keys(learningEngine.state?.assetReputations || {}).length;
+    const totalBytes = ((rLearning && rLearning.bytesWritten) || 0) + ((rPortfolio && rPortfolio.bytesWritten) || 0);
+
+    res.json({
+      success: true,
+      profiledTokens,
+      bytesWritten: totalBytes,
+      learningDriveResult: rLearning,
+      portfolioDriveResult: rPortfolio,
+      learningEngineState: learningEngine.state || {}
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // -------------------------------------------------------------
@@ -1364,8 +1514,9 @@ wss.on('connection', (ws) => {
         }
         broadcastStateUpdate();
       } else if (msg.type === 'SET_GOOGLE_SHEET_URL') {
-        State.googleSheetUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
-        State.masterLedgerUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
+        if (msg.masterLedgerUrl) State.masterLedgerUrl = msg.masterLedgerUrl;
+        if (msg.learningSheetUrl) State.learningSheetUrl = msg.learningSheetUrl;
+        saveDiskState();
         broadcastStateUpdate();
       } else if (msg.type === 'SYNC_P2P_RATE') {
         broadcastStateUpdate();
@@ -1399,9 +1550,11 @@ syncTradesFromGoogleSheets().catch(() => {});
 // Connect zero-latency Binance WebSocket stream (Singapore <5ms)
 connectBinanceGlobalStream();
 
-// Recurring 2-minute background sync with Google Sheets ledger
+// Recurring 2-minute background sync with Google Sheets ledger & Drive
 setInterval(() => {
   syncTradesFromGoogleSheets().catch(() => {});
+  backupLearningStateToGoogleDrive().catch(() => {});
+  backupPortfolioStateToGoogleDrive().catch(() => {});
 }, 120000);
 
 // Fast 1.0s Sentry & Autopilot Evaluator
