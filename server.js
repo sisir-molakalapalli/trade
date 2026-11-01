@@ -1201,17 +1201,11 @@ async function recordTradeToCloudLedger(trade) {
 
   const targetUrl = State.masterLedgerUrl;
   try {
-    console.log(`[Cloud Ledger] Dispatching trade ${record.pair} (${record.type}) to Sisir_Quant_Trade_Ledger...`);
+    console.log(`[Cloud Ledger] Dispatching trade ${record.pair} (${record.type}) strictly to Sisir_Quant_Trade_Ledger...`);
     const res = await safePostJson(targetUrl, record, 10000);
-    console.log(`[Cloud Ledger Success] Successfully logged:`, JSON.stringify(res));
+    console.log(`[Cloud Ledger Response]`, JSON.stringify(res));
   } catch (err) {
     console.error(`[Cloud Ledger Error]`, err.message);
-    if (State.learningSheetUrl && State.learningSheetUrl !== targetUrl) {
-      try {
-        console.log(`[Cloud Ledger Fallback] Dispatching trade to secondary endpoint...`);
-        await safePostJson(State.learningSheetUrl, record, 10000);
-      } catch (e2) {}
-    }
   }
 
   learningEngine.recordTradeOutcome(
