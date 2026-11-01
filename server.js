@@ -94,7 +94,7 @@ const State = {
     pacingMode: 'BALANCED'
   },
   usdtToInrRate: 94.94,
-  googleSheetUrl: 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec',
+  googleSheetUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec',
   masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec'
 };
 
@@ -140,7 +140,8 @@ async function safeFetch(url, timeoutMs = 4000) {
 async function checkVeteranOrderFlowAndVSA(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const url = `https://api.binance.com/api/v3/klines?symbol=${cleanSym}&interval=5m&limit=12`;
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=5m&limit=12`;
     const klines = await safeFetch(url, 3500);
 
     if (!Array.isArray(klines) || klines.length < 6) {
@@ -204,7 +205,8 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
 async function checkMicrostructureMomentumAndVwap(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const url = `https://api.binance.com/api/v3/klines?symbol=${cleanSym}&interval=15m&limit=16`;
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=15m&limit=16`;
     const klines = await safeFetch(url, 3500);
 
     if (!Array.isArray(klines) || klines.length < 8) {
@@ -212,9 +214,12 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
     }
 
     const curBar = klines[klines.length - 1];
+    const prevBar = klines[klines.length - 2];
     const curClose = parseFloat(curBar[4]);
     const curOpen = parseFloat(curBar[1]);
-    const change15mPct = curOpen > 0 ? ((curClose - curOpen) / curOpen) * 100 : 0;
+    const curChange15m = curOpen > 0 ? ((curClose - curOpen) / curOpen) * 100 : 0;
+    const prevChange15m = parseFloat(prevBar[1]) > 0 ? ((parseFloat(prevBar[4]) - parseFloat(prevBar[1])) / parseFloat(prevBar[1])) * 100 : 0;
+    const change15mPct = Math.max(curChange15m, prevChange15m);
 
     const bar4Ago = klines[klines.length - 5];
     const open1hAgo = parseFloat(bar4Ago[1]);
@@ -238,16 +243,17 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
     const vwap4h = sumVol > 0 ? (sumTypicalPriceVol / sumVol) : curClose;
     const distFrom4hHighPct = high4h > 0 ? ((high4h - curClose) / high4h) * 100 : 0;
 
-    const curVol = parseFloat(curBar[5]);
+    // Use completed candle volume for reliable RVOL comparison
+    const completedVol = parseFloat(prevBar[5]);
     let avgVol = 0;
-    for (let i = klines.length - 9; i < klines.length - 1; i++) {
+    for (let i = klines.length - 10; i < klines.length - 2; i++) {
       avgVol += parseFloat(klines[i][5]);
     }
     avgVol = avgVol / 8;
-    const rvol = avgVol > 0 ? (curVol / avgVol) : 1.0;
+    const rvol = avgVol > 0 ? (completedVol / avgVol) : 1.0;
 
     // Strict 1h trend mandate
-    if (change1hPct < 0.20) {
+    if (change1hPct < 0.20 && curChange15m < 0.50) {
       return { passed: false, reason: `1h trend is negative or flat (${change1hPct.toFixed(2)}%)` };
     }
 
@@ -257,8 +263,8 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
     }
 
     // Dual-Track Momentum: Track A (Ignition) or Track B (Base Expansion)
-    const isTrackA = (change15mPct >= 0.70 && rvol >= 1.30 && distFrom4hHighPct <= 2.50);
-    const isTrackB = (change15mPct >= 0.15 && change1hPct >= 1.00 && distFrom4hHighPct <= 3.20 && curClose >= vwap4h);
+    const isTrackA = (change15mPct >= 0.50 && rvol >= 1.10 && distFrom4hHighPct <= 2.80);
+    const isTrackB = (curClose >= vwap4h && distFrom4hHighPct <= 3.50 && (change1hPct >= 0.80 || curChange15m >= 0.30));
 
     if (!isTrackA && !isTrackB) {
       return { 
@@ -287,7 +293,8 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
 async function check1hTrendAlignment(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const url = `https://api.binance.com/api/v3/klines?symbol=${cleanSym}&interval=1h&limit=24`;
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=1h&limit=24`;
     const klines = await safeFetch(url, 3500);
 
     if (!Array.isArray(klines) || klines.length < 20) {
@@ -321,7 +328,8 @@ async function check1hTrendAlignment(symbol) {
 async function fetchRealOrderBookDepth(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const url = `https://api.binance.com/api/v3/depth?symbol=${cleanSym}&limit=20`;
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/depth?symbol=${pairSym}&limit=20`;
     const depth = await safeFetch(url, 2500);
 
     if (!depth || !Array.isArray(depth.bids) || !Array.isArray(depth.asks)) return null;
@@ -399,16 +407,25 @@ async function runDynamicScreener() {
 // SPOT BUY EXECUTION
 // -------------------------------------------------------------
 async function executeSpotBuy(symbol, coin, book, microMom) {
-  const sym = symbol.replace(/[^A-Z0-9]/g, '');
+  const sym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
   const pairKey = `${sym}USDT`;
   const livePrice = Number(coin.priceUSDT || coin.price || 1.0);
 
-  // Dynamic compounding allocation: 15% of free cash
-  const freeCash = Number(State.portfolio.cashUSDT) || 1000.00;
+  // Dynamic compounding allocation: minimum $10.00 floor for small accounts ($11 capital)
+  const freeCash = Number(State.portfolio.cashUSDT) || 11.00;
   const allocPct = Number(State.portfolio.allocationPct || 15.0);
-  const notional = Math.max(15.00, Math.min(freeCash * (allocPct / 100), freeCash));
+  
+  let notional;
+  if (freeCash <= 25.00) {
+    notional = Math.min(freeCash, Math.max(10.05, Number((freeCash * 0.95).toFixed(2))));
+  } else {
+    notional = Math.max(10.50, Math.min(freeCash * (allocPct / 100), freeCash));
+  }
 
-  if (freeCash < notional || freeCash < 15.00) return;
+  if (freeCash < 10.00 || notional < 10.00) {
+    console.warn(`[Autopilot Skipped] Insufficient cash for Binance $10 min notional: $${freeCash.toFixed(2)} USDT available`);
+    return;
+  }
 
   const qty = notional / livePrice;
   State.portfolio.cashUSDT = Number((freeCash - notional).toFixed(4));
@@ -453,39 +470,40 @@ async function evaluateAutopilotEntries() {
     const coin = State.universe[k];
     if (!coin || !coin.symbol) continue;
 
-    const sym = coin.symbol.replace(/[^A-Z0-9]/g, '');
-    const pairKey = `${sym}USDT`;
+    const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
+    const pairKey = `${baseSym}USDT`;
     if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
 
     // Strict positive momentum checks
     const change24h = Number(coin.priceChangePct || coin.change24h || 0);
-    if (change24h < 1.50) continue;
+    if (change24h < 1.20) continue;
 
     const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
-    if (posInRange < 0.65) continue;
+    if (posInRange < 0.60) continue;
 
     const intradayRange = Number(coin.intradayRangePct || 4.5);
-    if (intradayRange < 4.0) continue;
+    if (intradayRange < 3.5) continue;
 
-    if (State.cooldowns[sym] && State.cooldowns[sym].until > Date.now()) continue;
+    if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
 
-    // Order flow and VSA validation
-    const orderFlow = await checkVeteranOrderFlowAndVSA(sym);
+    // Order flow and VSA validation with full pair symbol
+    const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
     if (!orderFlow.passed) continue;
 
-    // Microstructure momentum & VWAP validation
-    const microMom = await checkMicrostructureMomentumAndVwap(sym);
+    // Microstructure momentum & VWAP validation with full pair symbol
+    const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
     if (!microMom.passed) continue;
 
     // 1-Hour Trend Alignment
-    const trend1h = await check1hTrendAlignment(sym);
+    const trend1h = await check1hTrendAlignment(pairKey);
     if (!trend1h.passed) continue;
 
     // 20-level Order book check
-    const book = await fetchRealOrderBookDepth(sym);
-    if (!book || book.obi < 0.54 || book.spreadPct > 0.08) continue;
+    const book = await fetchRealOrderBookDepth(pairKey);
+    if (!book || book.obi < 0.52 || book.spreadPct > 0.08) continue;
 
-    await executeSpotBuy(sym, coin, book, microMom);
+    console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, 15m ${microMom.change15mPct}%`);
+    await executeSpotBuy(pairKey, coin, book, microMom);
   }
 }
 
@@ -853,34 +871,27 @@ function sanitizeAndAuditTradeHistory(logs) {
  * Actively syncs and parses trades from both Master Ledger and Learning Sheet.
  */
 async function syncTradesFromGoogleSheets() {
-  const endpoints = [
-    State.masterLedgerUrl,
-    State.googleSheetUrl
-  ].filter(Boolean);
+  const masterUrl = State.masterLedgerUrl || 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
 
-  let fetchedTrades = [];
-
-  for (const url of endpoints) {
-    try {
-      const fullUrl = url.includes('?') ? `${url}&action=GET_ALL` : `${url}?action=GET_ALL`;
-      const data = await safeFetch(fullUrl, 8000);
-      if (data && Array.isArray(data.trades) && data.trades.length > 0) {
-        fetchedTrades = fetchedTrades.concat(data.trades);
-      } else if (Array.isArray(data) && data.length > 0) {
-        fetchedTrades = fetchedTrades.concat(data);
-      }
-    } catch (err) {
-      console.warn(`[Sync Ledger] Fetch notice from ${url}:`, err.message);
+  try {
+    const fullUrl = masterUrl.includes('?') ? `${masterUrl}&action=GET_ALL` : `${masterUrl}?action=GET_ALL`;
+    const data = await safeFetch(fullUrl, 8000);
+    let fetchedTrades = [];
+    if (data && Array.isArray(data.trades) && data.trades.length > 0) {
+      fetchedTrades = data.trades;
+    } else if (Array.isArray(data) && data.length > 0) {
+      fetchedTrades = data;
     }
-  }
 
-  if (fetchedTrades.length > 0) {
-    const combined = [...State.tradeLogs, ...fetchedTrades];
-    State.tradeLogs = sanitizeAndAuditTradeHistory(combined);
-    saveDiskState();
-    broadcastStateUpdate();
-    console.log(`[Sync Ledger] Successfully synchronized ${State.tradeLogs.length} verified trades from Google Sheets.`);
-    return State.tradeLogs;
+    if (fetchedTrades.length > 0) {
+      State.tradeLogs = sanitizeAndAuditTradeHistory(fetchedTrades);
+      saveDiskState();
+      broadcastStateUpdate();
+      console.log(`[Sync Ledger] Successfully synchronized ${State.tradeLogs.length} verified trades exclusively from Sisir_Quant_Trade_Ledger.`);
+      return State.tradeLogs;
+    }
+  } catch (err) {
+    console.warn(`[Sync Ledger] Notice from Sisir_Quant_Trade_Ledger:`, err.message);
   }
   return State.tradeLogs;
 }
