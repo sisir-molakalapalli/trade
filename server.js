@@ -1060,6 +1060,26 @@ app.post('/api/trades/sync-strict-sheet', async (req, res) => {
   }
 });
 
+app.get('/api/settings/googlesheet/sync', async (req, res) => {
+  try {
+    const trades = await syncTradesFromGoogleSheets();
+    res.json({ success: true, count: trades.length });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/quota/reconcile', (req, res) => {
+  const count = State.tradeLogs.length;
+  res.json({
+    success: true,
+    executed24hCount: count,
+    quotaRemaining: '∞',
+    formattedReset: 'Dynamic Reserve Active',
+    rollingTrades24h: State.tradeLogs.slice(0, 20)
+  });
+});
+
 app.post('/api/drive/sync-files-now', (req, res) => {
   res.json({ success: true, profiledTokens: Object.keys(learningEngine.state?.assetReputations || {}).length });
 });
@@ -1120,6 +1140,26 @@ wss.on('connection', (ws) => {
         broadcastStateUpdate();
       } else if (msg.type === 'TOGGLE_AUTOPILOT') {
         State.autopilotEnabled = Boolean(msg.enabled);
+        broadcastStateUpdate();
+      } else if (msg.type === 'SET_CASH' && !isNaN(parseFloat(msg.cashUSDT))) {
+        State.portfolio.cashUSDT = parseFloat(msg.cashUSDT);
+        saveDiskState();
+        broadcastStateUpdate();
+      } else if (msg.type === 'SET_SIZING_CONFIG') {
+        if (!isNaN(parseFloat(msg.allocationPct))) {
+          State.portfolio.allocationPct = parseFloat(msg.allocationPct);
+        }
+        if (msg.sizingMode) State.portfolio.sizingMode = msg.sizingMode;
+        saveDiskState();
+        broadcastStateUpdate();
+      } else if (msg.type === 'SET_DYNAMIC_GOVERNOR') {
+        if (State.tradeFrequencyController) {
+          State.tradeFrequencyController.dynamicGovernorEnabled = Boolean(msg.enabled);
+        }
+        broadcastStateUpdate();
+      } else if (msg.type === 'SYNC_P2P_RATE') {
+        broadcastStateUpdate();
+      } else if (msg.type === 'RECONCILE_QUOTA') {
         broadcastStateUpdate();
       } else if (msg.type === 'CLOSE_POSITION' && msg.pairKey) {
         delete State.activePositions[msg.pairKey];
