@@ -248,14 +248,14 @@ class LearningEngine {
 
   recalculateDynamicHurdles(activeBagsCount = 0, rollingTrades24hCount = 0) {
     let scoreOffset = 0;
-    let wickCeiling = 0.40;
+    let wickCeiling = 0.38;
     let minOdds = 45;
 
-    // Real-time active bag coupling
+    // Real-time active bag coupling: gentle scaling to prevent starvation
     if (activeBagsCount > 0) {
-      scoreOffset = Math.min(8, activeBagsCount * 2);
-      wickCeiling = Math.max(0.20, Number((0.40 - (activeBagsCount * 0.05)).toFixed(2)));
-      minOdds = Math.min(65, 45 + (activeBagsCount * 5));
+      scoreOffset = Math.min(4, activeBagsCount * 1); // Max +4 pts offset (80 -> 81/84)
+      wickCeiling = Math.max(0.25, Number((0.38 - (activeBagsCount * 0.03)).toFixed(2)));
+      minOdds = Math.min(55, 45 + (activeBagsCount * 3));
     }
 
     this.state.dynamicHurdles = {
