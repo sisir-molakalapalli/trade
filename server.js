@@ -768,6 +768,123 @@ function normalizeDateToIndianFormat(dateVal, id, timeVal) {
   return '01/11/2026';
 }
 
+/**
+ * Robustly parses trade date and time into epoch milliseconds.
+ * Ensures recent trades (even with sequential IDs) sort to the top.
+ */
+function getTradeTimeMs(t) {
+  if (!t) return 0;
+  const dStr = String(t.date || '').trim();
+  const tStr = String(t.time || '').trim();
+  const slashMatch = dStr.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})/);
+  if (slashMatch) {
+    const day = parseInt(slashMatch[1], 10);
+    const month = parseInt(slashMatch[2], 10) - 1;
+    const year = parseInt(slashMatch[3], 10);
+    let hours = 0, minutes = 0, seconds = 0;
+    const timeMatch = tStr.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (timeMatch) {
+      hours = parseInt(timeMatch[1], 10);
+      minutes = parseInt(timeMatch[2], 10);
+      seconds = timeMatch[3] ? parseInt(timeMatch[3], 10) : 0;
+    }
+    const dt = new Date(year, month, day, hours, minutes, seconds);
+    if (!isNaN(dt.getTime())) return dt.getTime();
+  }
+
+  const idNum = Number(t.id);
+  if (!isNaN(idNum) && idNum > 1600000000000 && idNum < 2500000000000) {
+    return idNum;
+  }
+  return idNum || 0;
+}
+
+function sanitizeAndAuditTradeHistory(logs) {
+  if (!Array.isArray(logs)) return [];
+  const seenSignatures = new Set();
+
+  return logs.filter(t => {
+    if (!t || typeof t !== 'object') return false;
+    const p = String(t.pair || t.Pair || t.symbol || t.Symbol || '').trim().toUpperCase();
+    if (!p || p === 'CRYPTO/USDT' || p.includes('CRYPTO') || p === 'UNKNOWN/USDT' || !p.includes('USDT')) return false;
+
+    // Support all possible header permutations from Google Sheets
+    const entry = Number(t.entryPriceUSDT || t['Entry Price (USDT)'] || t['Entry (USDT)'] || t.entryPrice || t.entry || t.Entry || 0);
+    const exit = Number(t.exitPriceUSDT || t['Exit Price (USDT)'] || t['Exit (USDT)'] || t.exitPrice || t.exit || t.Exit || 0);
+    if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) return false;
+
+    return true;
+  }).map(t => {
+    const rawPair = String(t.pair || t.Pair || t.symbol || '').trim().toUpperCase();
+    const pair = rawPair.includes('/') ? rawPair : `${rawPair.replace('USDT', '')}/USDT`;
+    const entry = Number(t.entryPriceUSDT || t['Entry Price (USDT)'] || t['Entry (USDT)'] || t.entryPrice || t.entry || t.Entry || 1);
+    const exit = Number(t.exitPriceUSDT || t['Exit Price (USDT)'] || t['Exit (USDT)'] || t.exitPrice || t.exit || t.Exit || entry);
+    let pnlUSDT = Number(t.pnlUSDT !== undefined ? t.pnlUSDT : (t['PnL (USDT)'] !== undefined ? t['PnL (USDT)'] : t.pnl));
+    if (isNaN(pnlUSDT)) {
+      pnlUSDT = (exit - entry) * (50 / entry);
+    }
+    const tradeId = Number(t.id) || Date.now();
+    const cleanDate = normalizeDateToIndianFormat(t.date, tradeId, t.time);
+    const cleanTime = String(t.time || '').trim() || '00:00:00';
+
+    return {
+      ...t,
+      id: tradeId,
+      date: cleanDate,
+      time: cleanTime,
+      pair,
+      type: String(t.type || t.Type || 'EXIT').trim().toUpperCase(),
+      entryPriceUSDT: entry,
+      exitPriceUSDT: exit,
+      notionalUSDT: Number(t.notionalUSDT || t['Notional (USDT)'] || 50),
+      pnlUSDT: Number(pnlUSDT.toFixed(4)),
+      pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2))
+    };
+  }).filter(t => {
+    const timeMinute = String(t.time || '').slice(0, 5);
+    const sig = `${t.pair}_${t.date}_${timeMinute}_${t.entryPriceUSDT.toFixed(4)}_${t.exitPriceUSDT.toFixed(4)}_${t.type}`;
+    if (seenSignatures.has(sig)) return false;
+    seenSignatures.add(sig);
+    return true;
+  }).sort((a, b) => getTradeTimeMs(b) - getTradeTimeMs(a));
+}
+
+/**
+ * Actively syncs and parses trades from both Master Ledger and Learning Sheet.
+ */
+async function syncTradesFromGoogleSheets() {
+  const endpoints = [
+    State.masterLedgerUrl,
+    State.googleSheetUrl
+  ].filter(Boolean);
+
+  let fetchedTrades = [];
+
+  for (const url of endpoints) {
+    try {
+      const fullUrl = url.includes('?') ? `${url}&action=GET_ALL` : `${url}?action=GET_ALL`;
+      const data = await safeFetch(fullUrl, 8000);
+      if (data && Array.isArray(data.trades) && data.trades.length > 0) {
+        fetchedTrades = fetchedTrades.concat(data.trades);
+      } else if (Array.isArray(data) && data.length > 0) {
+        fetchedTrades = fetchedTrades.concat(data);
+      }
+    } catch (err) {
+      console.warn(`[Sync Ledger] Fetch notice from ${url}:`, err.message);
+    }
+  }
+
+  if (fetchedTrades.length > 0) {
+    const combined = [...State.tradeLogs, ...fetchedTrades];
+    State.tradeLogs = sanitizeAndAuditTradeHistory(combined);
+    saveDiskState();
+    broadcastStateUpdate();
+    console.log(`[Sync Ledger] Successfully synchronized ${State.tradeLogs.length} verified trades from Google Sheets.`);
+    return State.tradeLogs;
+  }
+  return State.tradeLogs;
+}
+
 async function recordTradeToCloudLedger(trade) {
   const tradeId = Number(trade.id || Date.now());
   const now = new Date();
@@ -923,8 +1040,13 @@ app.post('/api/trades/purge-empty', (req, res) => {
   res.json({ success: true, trades: State.tradeLogs });
 });
 
-app.post('/api/trades/sync-strict-sheet', (req, res) => {
-  res.json({ success: true, trades: State.tradeLogs });
+app.post('/api/trades/sync-strict-sheet', async (req, res) => {
+  try {
+    const trades = await syncTradesFromGoogleSheets();
+    res.json({ success: true, count: trades.length, trades });
+  } catch (err) {
+    res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs });
+  }
 });
 
 app.post('/api/drive/sync-files-now', (req, res) => {
@@ -1006,10 +1128,17 @@ wss.on('connection', (ws) => {
 // -------------------------------------------------------------
 loadDiskState();
 
-// Initial screener run
+// Initial screener run and background Google Sheets trade sync
 runDynamicScreener().then(() => {
   console.log('[Screener] Initialized', Object.keys(State.universe).length, 'Binance Spot USDT pairs.');
 }).catch(() => {});
+
+syncTradesFromGoogleSheets().catch(() => {});
+
+// Recurring 2-minute background sync with Google Sheets ledger
+setInterval(() => {
+  syncTradesFromGoogleSheets().catch(() => {});
+}, 120000);
 
 // Fast 2.5s Sentry & Autopilot Evaluator
 setInterval(async () => {
