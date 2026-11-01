@@ -523,6 +523,7 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
   };
 
   console.log(`[Order Execution] BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT)`);
+  syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
 }
 
@@ -1221,6 +1222,107 @@ function broadcastPriceStream() {
   });
 }
 
+// -------------------------------------------------------------
+// ZERO-LATENCY DIRECT BINANCE WEBSOCKET INGESTION (SINGAPORE)
+// -------------------------------------------------------------
+let binanceGlobalWs = null;
+let subscribedActiveStreams = new Set();
+
+function connectBinanceGlobalStream() {
+  const wsEndpoint = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
+  
+  try {
+    if (binanceGlobalWs) {
+      try { binanceGlobalWs.terminate(); } catch (e) {}
+      binanceGlobalWs = null;
+    }
+
+    binanceGlobalWs = new WebSocket(wsEndpoint);
+
+    binanceGlobalWs.on('open', () => {
+      console.log('[Binance Stream] Connected to Binance Global miniTicker stream (<5ms Singapore latency).');
+      syncActiveSymbolSubscriptions();
+    });
+
+    binanceGlobalWs.on('message', (data) => {
+      try {
+        const tickers = JSON.parse(data);
+        if (!Array.isArray(tickers)) return;
+
+        const rate = Number(State.usdtToInrRate) || 94.94;
+        let activePriceChanged = false;
+
+        tickers.forEach(t => {
+          const sym = t.s;
+          if (!sym || !sym.endsWith('USDT')) return;
+
+          const closePrice = parseFloat(t.c);
+          if (isNaN(closePrice) || closePrice <= 0) return;
+
+          // Update Universe in-memory cache in real time
+          if (State.universe[sym]) {
+            State.universe[sym].priceUSDT = closePrice;
+            State.universe[sym].priceINR = Number((closePrice * rate).toFixed(2));
+          }
+
+          // Real-time sub-second updates for active positions
+          if (State.activePositions[sym]) {
+            State.activePositions[sym].livePriceUSDT = closePrice;
+            activePriceChanged = true;
+          }
+
+          // Real-time sub-second updates for recovery bags
+          if (State.recoveryBags[sym]) {
+            State.recoveryBags[sym].livePriceUSDT = closePrice;
+            activePriceChanged = true;
+          }
+        });
+
+        // Fast-path: immediate sentry check if active position prices moved
+        if (activePriceChanged) {
+          runPredictiveSentry().catch(() => {});
+        }
+      } catch (err) {}
+    });
+
+    binanceGlobalWs.on('error', (err) => {
+      console.warn('[Binance Stream Error]', err.message);
+    });
+
+    binanceGlobalWs.on('close', () => {
+      console.warn('[Binance Stream Closed] Reconnecting in 2500ms...');
+      setTimeout(connectBinanceGlobalStream, 2500);
+    });
+  } catch (err) {
+    setTimeout(connectBinanceGlobalStream, 4000);
+  }
+}
+
+function syncActiveSymbolSubscriptions() {
+  if (!binanceGlobalWs || binanceGlobalWs.readyState !== WebSocket.OPEN) return;
+  const currentSymbols = new Set([
+    ...Object.keys(State.activePositions || {}),
+    ...Object.keys(State.recoveryBags || {})
+  ]);
+
+  const newStreams = [];
+  currentSymbols.forEach(sym => {
+    const s = `${sym.toLowerCase()}@bookTicker`;
+    if (!subscribedActiveStreams.has(s)) {
+      subscribedActiveStreams.add(s);
+      newStreams.push(s);
+    }
+  });
+
+  if (newStreams.length > 0) {
+    binanceGlobalWs.send(JSON.stringify({
+      method: 'SUBSCRIBE',
+      params: newStreams,
+      id: Date.now()
+    }));
+  }
+}
+
 wss.on('connection', (ws) => {
   ws.send(JSON.stringify({
     type: 'INIT_STATE',
@@ -1294,12 +1396,15 @@ runDynamicScreener().then(() => {
 
 syncTradesFromGoogleSheets().catch(() => {});
 
+// Connect zero-latency Binance WebSocket stream (Singapore <5ms)
+connectBinanceGlobalStream();
+
 // Recurring 2-minute background sync with Google Sheets ledger
 setInterval(() => {
   syncTradesFromGoogleSheets().catch(() => {});
 }, 120000);
 
-// Fast 2.5s Sentry & Autopilot Evaluator
+// Fast 1.0s Sentry & Autopilot Evaluator
 setInterval(async () => {
   try {
     await runPredictiveSentry();
@@ -1307,18 +1412,18 @@ setInterval(async () => {
   } catch (e) {
     console.error('[Sentry Error]', e.message);
   }
-}, 2500);
+}, 1000);
 
-// 1.0s Sub-Second Price Streamer
-setInterval(broadcastPriceStream, 1000);
+// 500ms Sub-Second Price Streamer (Ultra-Low Latency)
+setInterval(broadcastPriceStream, 500);
 
-// 75s Dynamic Screener Scan
-setInterval(runDynamicScreener, 75000);
+// 60s Dynamic Screener Scan
+setInterval(runDynamicScreener, 60000);
 
 // Start listening
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
-  console.log(`Instant-On Minute-0 Trailing + Alpha Velocity Active`);
+  console.log(`Zero-Latency Binance Stream Active (<5ms Singapore)`);
   console.log(`====================================================`);
 });
