@@ -69,6 +69,7 @@ const State = {
   universe: {},
   cooldowns: {},
   subsystems: {
+    timeMachine: { status: 'ONLINE', replaysCompleted: 0, lastEvaluatedSymbol: '--', lastWinOddsPct: 55, minOddsFloorPct: 45 },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 12, cadenceSec: 75, liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
@@ -332,6 +333,73 @@ async function check1hTrendAlignment(symbol) {
 }
 
 // -------------------------------------------------------------
+// TIME MACHINE 48-CANDLE HISTORICAL REPLAY ODDS ENGINE
+// -------------------------------------------------------------
+async function evaluateTimeMachineBreakoutOdds(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=15m&limit=48`;
+    const klines = await safeFetch(url, 3500);
+
+    if (!Array.isArray(klines) || klines.length < 24) {
+      return { passed: true, oddsPct: 55, setupsDetected: 0, minOddsRequired: 45 };
+    }
+
+    let setupsDetected = 0;
+    let continuationWins = 0;
+
+    for (let i = 2; i < klines.length - 2; i++) {
+      const open = parseFloat(klines[i][1]);
+      const close = parseFloat(klines[i][4]);
+      const barGain = open > 0 ? ((close - open) / open) * 100 : 0;
+
+      // Identify past impulse breakouts (>= +0.80%)
+      if (barGain >= 0.80) {
+        setupsDetected++;
+        const nextHigh1 = parseFloat(klines[i + 1][2]);
+        const nextHigh2 = (i + 2 < klines.length) ? parseFloat(klines[i + 2][2]) : nextHigh1;
+        const maxContinuation = Math.max(nextHigh1, nextHigh2);
+        const continuationPct = close > 0 ? ((maxContinuation - close) / close) * 100 : 0;
+
+        if (continuationPct >= 0.80) {
+          continuationWins++;
+        }
+      }
+    }
+
+    let oddsPct = 55;
+    if (setupsDetected >= 2) {
+      oddsPct = Math.round((continuationWins / setupsDetected) * 100);
+    } else {
+      oddsPct = 52;
+    }
+
+    const minOddsRequired = (learningEngine?.state?.dynamicHurdles?.minOddsRequired) || 45;
+    const passed = oddsPct >= minOddsRequired;
+
+    // Update real-time subsystem state for the operations feed
+    if (State.subsystems && State.subsystems.timeMachine) {
+      State.subsystems.timeMachine.replaysCompleted = (State.subsystems.timeMachine.replaysCompleted || 0) + 1;
+      State.subsystems.timeMachine.lastEvaluatedSymbol = pairSym.replace('USDT', '');
+      State.subsystems.timeMachine.lastWinOddsPct = oddsPct;
+      State.subsystems.timeMachine.minOddsFloorPct = minOddsRequired;
+      State.subsystems.timeMachine.status = 'ACTIVE';
+    }
+
+    return {
+      passed,
+      oddsPct,
+      setupsDetected,
+      minOddsRequired,
+      reason: passed ? 'Optimal continuation probability' : `Low continuation odds (${oddsPct}% < ${minOddsRequired}%)`
+    };
+  } catch (err) {
+    return { passed: true, oddsPct: 55, setupsDetected: 0, minOddsRequired: 45 };
+  }
+}
+
+// -------------------------------------------------------------
 // 20-LEVEL REAL ORDER BOOK DEPTH FETCH
 // -------------------------------------------------------------
 async function fetchRealOrderBookDepth(symbol) {
@@ -516,11 +584,18 @@ async function evaluateAutopilotEntries() {
     const trend1h = await check1hTrendAlignment(pairKey);
     if (!trend1h.passed) continue;
 
+    // Time Machine 48-Candle Historical Replay Odds Gate
+    const timeMachine = await evaluateTimeMachineBreakoutOdds(pairKey);
+    if (!timeMachine.passed) {
+      console.log(`[Time Machine Reject] ${pairKey}: Odds ${timeMachine.oddsPct}% < ${timeMachine.minOddsRequired}%`);
+      continue;
+    }
+
     // 20-level Order book check
     const book = await fetchRealOrderBookDepth(pairKey);
     if (!book || book.obi < 0.52 || book.spreadPct > 0.08) continue;
 
-    console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, 15m ${microMom.change15mPct}%`);
+    console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, TM Odds ${timeMachine.oddsPct}%, 15m ${microMom.change15mPct}%`);
     await executeSpotBuy(pairKey, coin, book, microMom);
   }
 }
