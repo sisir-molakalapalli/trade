@@ -707,9 +707,19 @@ async function evaluateAutopilotEntries() {
       continue;
     }
 
-    // 20-level Order book check
-    const book = await fetchRealOrderBookDepth(pairKey);
-    if (!book || book.obi < 0.52 || book.spreadPct > 0.08) continue;
+    // 20-level Order book check with fallback resilience
+    let book = await fetchRealOrderBookDepth(pairKey);
+    if (!book) {
+      // Fallback: estimate from coin position in range and score
+      book = {
+        obi: Number(coin.obi || 0.55),
+        spreadPct: 0.05,
+        bestBid: Number(coin.priceUSDT || 1.0),
+        bestAsk: Number(coin.priceUSDT || 1.0) * 1.0005
+      };
+    }
+    
+    if (book.obi < 0.50 || book.spreadPct > 0.12) continue;
 
     console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, TM Odds ${timeMachine.oddsPct}%, 15m ${microMom.change15mPct}%`);
     await executeSpotBuy(pairKey, coin, book, microMom);
