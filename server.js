@@ -342,9 +342,30 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
     const prevBar = klines[klines.length - 2];
     const curClose = parseFloat(curBar[4]);
     const curOpen = parseFloat(curBar[1]);
+    const curHigh = parseFloat(curBar[2]);
+    const curLow = parseFloat(curBar[3]);
     const curChange15m = curOpen > 0 ? ((curClose - curOpen) / curOpen) * 100 : 0;
     const prevChange15m = parseFloat(prevBar[1]) > 0 ? ((parseFloat(prevBar[4]) - parseFloat(prevBar[1])) / parseFloat(prevBar[1])) * 100 : 0;
     const change15mPct = Math.max(curChange15m, prevChange15m);
+
+    // Safeguard 3: Upper Rejection Wick Checks (Anti-Apex Trap)
+    const prevOpen = parseFloat(prevBar[1]);
+    const prevHigh = parseFloat(prevBar[2]);
+    const prevLow = parseFloat(prevBar[3]);
+    const prevClose = parseFloat(prevBar[4]);
+    const prevRange = prevHigh - prevLow;
+    const prevUpperWick = prevRange > 0 ? (prevHigh - Math.max(prevOpen, prevClose)) / prevRange : 0;
+
+    const curRange = curHigh - curLow;
+    const curUpperWick = curRange > 0 ? (curHigh - Math.max(curOpen, curClose)) / curRange : 0;
+
+    // Reject if completed bar had a severe rejection wick (> 38%) or live bar is an active rejection trap
+    if (prevRange > 0 && prevUpperWick > 0.38 && prevChange15m < 0.20) {
+      return { passed: false, reason: `Upper rejection wick on 15m (${(prevUpperWick * 100).toFixed(1)}% > 38%)` };
+    }
+    if (curRange > 0 && curUpperWick > 0.38 && curClose < (curOpen + curRange * 0.40)) {
+      return { passed: false, reason: `Live 15m candle severe upper rejection wick (${(curUpperWick * 100).toFixed(1)}%)` };
+    }
 
     const bar4Ago = klines[klines.length - 5];
     const open1hAgo = parseFloat(bar4Ago[1]);
@@ -387,14 +408,18 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       return { passed: false, reason: `Price below 15m VWAP ($${curClose.toFixed(4)} < $${vwap4h.toFixed(4)})` };
     }
 
+    // Safeguard 1: Mandatory RVOL on All Tracks (prevents 0-volume noise entries while avoiding starvation)
+    // Dynamic minimum 15m gain calibrated to prevent entering tick noise
+    const min15mGain = Math.max(0.40, (change1hPct >= 1.50 ? 0.30 : 0.45));
+
     // Dual-Track Momentum: Track A (Ignition) or Track B (Base Expansion)
-    const isTrackA = (change15mPct >= 0.50 && rvol >= 1.10 && distFrom4hHighPct <= 2.80);
-    const isTrackB = (curClose >= vwap4h && distFrom4hHighPct <= 3.50 && (change1hPct >= 0.80 || curChange15m >= 0.30));
+    const isTrackA = (change15mPct >= 0.50 && rvol >= 1.15 && distFrom4hHighPct <= 2.80);
+    const isTrackB = (curClose >= vwap4h && distFrom4hHighPct <= 3.20 && rvol >= 1.15 && (change1hPct >= 0.80 || curChange15m >= min15mGain));
 
     if (!isTrackA && !isTrackB) {
       return { 
         passed: false, 
-        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, 1h: ${change1hPct.toFixed(2)}%, DD: ${distFrom4hHighPct.toFixed(2)}%)` 
+        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%, DD: ${distFrom4hHighPct.toFixed(2)}%)` 
       };
     }
 
@@ -450,7 +475,7 @@ async function check1hTrendAlignment(symbol) {
 // -------------------------------------------------------------
 // TIME MACHINE 48-CANDLE HISTORICAL REPLAY ODDS ENGINE
 // -------------------------------------------------------------
-async function evaluateTimeMachineBreakoutOdds(symbol) {
+async function evaluateTimeMachineBreakoutOdds(symbol, currentMomentum = null) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
@@ -483,11 +508,22 @@ async function evaluateTimeMachineBreakoutOdds(symbol) {
       }
     }
 
-    let oddsPct = 55;
+    // Safeguard 2: Eliminating Unconditioned 52% Free Pass with Calibrated Ignition Exception
+    let oddsPct = 50;
     if (setupsDetected >= 2) {
       oddsPct = Math.round((continuationWins / setupsDetected) * 100);
     } else {
-      oddsPct = 52;
+      // Ignition Exception: Protects fresh breakouts (e.g. BEMX, DASH) from being starved
+      const isIgnitionSurge = currentMomentum && (
+        (Number(currentMomentum.change15mPct || 0) >= 1.40 && Number(currentMomentum.rvol || 0) >= 1.40) ||
+        (Number(currentMomentum.change1hPct || 0) >= 1.80 && Number(currentMomentum.rvol || 0) >= 1.25)
+      );
+
+      if (isIgnitionSurge) {
+        oddsPct = 58; // Approved via Ignition Exception
+      } else {
+        oddsPct = 25; // Blocked: low historical setups and no explosive ignition
+      }
     }
 
     const minOddsRequired = (learningEngine?.state?.dynamicHurdles?.minOddsRequired) || 45;
@@ -700,8 +736,8 @@ async function evaluateAutopilotEntries() {
     const trend1h = await check1hTrendAlignment(pairKey);
     if (!trend1h.passed) continue;
 
-    // Time Machine 48-Candle Historical Replay Odds Gate
-    const timeMachine = await evaluateTimeMachineBreakoutOdds(pairKey);
+    // Time Machine 48-Candle Historical Replay Odds Gate (with microMom passed to support Ignition Exception)
+    const timeMachine = await evaluateTimeMachineBreakoutOdds(pairKey, microMom);
     if (!timeMachine.passed) {
       console.log(`[Time Machine Reject] ${pairKey}: Odds ${timeMachine.oddsPct}% < ${timeMachine.minOddsRequired}%`);
       continue;
