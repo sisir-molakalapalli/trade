@@ -66,8 +66,8 @@ class LearningEngine {
       const reason = String(trade.reason || '');
 
       let outcomeType = 'OTHER';
-      if (type.includes('TP1') || type.includes('RUNNER') || type.includes('PROFIT')) {
-        outcomeType = type.includes('TP1') ? 'TP1' : 'RUNNER';
+      if (type.includes('TP1') || type.includes('RUNNER') || type.includes('PROFIT') || type.includes('VELOCITY')) {
+        outcomeType = type.includes('TP1') ? 'TP1' : (type.includes('RUNNER') ? 'RUNNER' : 'TP1');
       } else if (type.includes('DISASTER') || type.includes('-6.50%') || pnl < -1.5) {
         outcomeType = 'HARD DISASTER';
       } else if (type.includes('RECOVERY') || type.includes('STEP') || reason.toLowerCase().includes('relief') || reason.toLowerCase().includes('bounce')) {
@@ -84,7 +84,7 @@ class LearningEngine {
         multiplier = 1.10;
         rep.wins = (rep.wins || 0) + 1;
       } else if (outcomeType === 'HARD DISASTER' || pnl < -2.0) {
-        multiplier = 0.40; // Severe penalty for catastrophic drawdowns like HAEDAL
+        multiplier = 0.40;
         rep.disasters = (rep.disasters || 0) + 1;
       } else {
         multiplier = 0.95;
@@ -212,10 +212,10 @@ class LearningEngine {
     let multiplier = 1.0;
     let attributionReason = '';
 
-    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('EXHAUSTION')) {
+    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('EXHAUSTION') || outcomeType.includes('VELOCITY')) {
       multiplier = 1.12;
       rep.wins++;
-      attributionReason = `Clean breakout win (+${pnl.toFixed(2)}$${eff !== null ? `, ${eff}% peak capture` : ''}). Credit score boosted.`;
+      attributionReason = `Clean breakout / velocity win (+${pnl.toFixed(2)}$${eff !== null ? `, ${eff}% peak capture` : ''}). Credit score boosted.`;
     } else if (outcomeType.includes('HARD DISASTER') || outcomeType.includes('-6.50%') || pnl < -2.0) {
       multiplier = 0.50;
       rep.disasters++;
