@@ -35,7 +35,7 @@ process.on('unhandledRejection', (reason) => {
   console.error('[Server Sentry] Unhandled Rejection intercepted:', reason);
 });
 
-// Import Autonomous Learning Engine
+// Import Autonomous Learning Engine with safe fallback
 let learningEngine;
 try {
   learningEngine = require('./learning_engine');
@@ -103,7 +103,7 @@ const State = {
     pacingMode: 'HIGH_VELOCITY'
   },
   usdtToInrRate: 94.94,
-  // Dedicated Separate Cloud Endpoints
+  // Dedicated Cloud Endpoints
   masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec',
   learningSheetUrl: 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec'
 };
@@ -1209,27 +1209,43 @@ async function recordTradeToCloudLedger(trade) {
   State.tradeLogs.unshift(record);
   saveDiskState();
 
-  const targetUrl = State.masterLedgerUrl;
+  const targetUrl = (trade.targetUrl || State.masterLedgerUrl || '').trim();
   let success = false;
+  let lastError = null;
+  let cloudResponse = null;
 
   // Primary: Fast POST dispatch with redirect following
   try {
     console.log(`[Cloud Ledger] Dispatching trade ${record.pair} (${record.type}) strictly to Sisir_Quant_Trade_Ledger...`);
     const res = await safePostJson(targetUrl, record, 15000);
     console.log(`[Cloud Ledger Response]`, JSON.stringify(res));
-    success = true;
+    if (res && res.success !== false) {
+      success = true;
+      cloudResponse = res;
+    } else {
+      lastError = new Error(res?.error || res?.message || 'POST returned unsuccessful status');
+    }
   } catch (err) {
+    lastError = err;
     console.error(`[Cloud Ledger POST Error] ${err.message}. Retrying via GET fallback transport...`);
   }
 
   // Fail-Safe Secondary: GET transport fallback
   if (!success) {
     try {
-      const getUrl = `${targetUrl}?action=RECORD_TRADE&data=${encodeURIComponent(JSON.stringify(record))}`;
+      const getUrl = targetUrl.includes('?') 
+        ? `${targetUrl}&action=RECORD_TRADE&data=${encodeURIComponent(JSON.stringify(record))}`
+        : `${targetUrl}?action=RECORD_TRADE&data=${encodeURIComponent(JSON.stringify(record))}`;
       const getRes = await safeFetch(getUrl, 15000);
       console.log(`[Cloud Ledger GET Fallback Response]`, JSON.stringify(getRes));
-      success = true;
+      if (getRes && getRes.success !== false) {
+        success = true;
+        cloudResponse = getRes;
+      } else {
+        lastError = new Error(getRes?.error || 'GET returned unsuccessful status');
+      }
     } catch (err2) {
+      lastError = err2;
       console.error(`[Cloud Ledger Critical Error] Failed both POST and GET dispatch: ${err2.message}`);
     }
   }
@@ -1242,6 +1258,12 @@ async function recordTradeToCloudLedger(trade) {
   );
 
   broadcastStateUpdate();
+
+  if (!success) {
+    throw lastError || new Error('Failed to record trade to Google Sheets');
+  }
+
+  return { success: true, cloudResponse };
 }
 
 function saveDiskState() {
@@ -1373,6 +1395,16 @@ app.post('/api/trades/sync-strict-sheet', async (req, res) => {
   }
 });
 
+app.post('/api/ledger/set-url', (req, res) => {
+  const { url } = req.body;
+  if (url && typeof url === 'string') {
+    State.masterLedgerUrl = url.trim();
+    saveDiskState();
+    return res.json({ success: true, masterLedgerUrl: State.masterLedgerUrl });
+  }
+  res.status(400).json({ success: false, error: 'Invalid URL' });
+});
+
 app.post('/api/ledger/test', async (req, res) => {
   const testUrl = (req.body.url || State.masterLedgerUrl || '').trim();
   if (!testUrl) return res.status(400).json({ success: false, error: 'Missing ledger URL' });
@@ -1383,11 +1415,21 @@ app.post('/api/ledger/test', async (req, res) => {
     return res.json({ success: true, source: 'SERVER_PROXY', data });
   } catch (err) {
     console.error(`[Ledger Test Error]`, err.message);
+    const msg = err.message || '';
+    if (msg.includes('404')) {
+      return res.status(502).json({ 
+        success: false, 
+        error: 'Google returned HTTP 404 (Not Found). The Web App has not been deployed yet, or the URL is incorrect. Follow the Deployment steps in Apps Script.' 
+      });
+    }
     return res.status(502).json({ success: false, error: err.message });
   }
 });
 
 app.post('/api/ledger/send-test-trade', async (req, res) => {
+  const targetUrl = (req.body.url || State.masterLedgerUrl || '').trim();
+  if (!targetUrl) return res.status(400).json({ success: false, error: 'Missing ledger URL' });
+
   const testTrade = {
     id: Date.now(),
     date: new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }),
@@ -1399,14 +1441,15 @@ app.post('/api/ledger/send-test-trade', async (req, res) => {
     notionalUSDT: 10.00,
     pnlUSDT: 0.0500,
     pnlINR: Number((0.05 * State.usdtToInrRate).toFixed(2)),
-    reason: 'Connection test from terminal UI'
+    reason: 'Connection test from terminal UI',
+    targetUrl: targetUrl
   };
 
   try {
-    await recordTradeToCloudLedger(testTrade);
-    res.json({ success: true, trade: testTrade });
+    const writeResult = await recordTradeToCloudLedger(testTrade);
+    res.json({ success: true, trade: testTrade, cloudResult: writeResult });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(502).json({ success: false, error: err.message });
   }
 });
 
