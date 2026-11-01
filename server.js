@@ -35,14 +35,29 @@ learningEngine.setGoogleDriveSyncCallback((payload) => {
 
 // -------------------------------------------------------------
 // CLOUD LEDGER TRADE DISPATCHER (GOOGLE SHEETS APPEND)
+// Single-dispatch with signature guard to eliminate duplicate rows
 // -------------------------------------------------------------
+const dispatchedTradeSignatures = new Set();
+
 async function recordTradeToCloudLedger(trade) {
   if (!trade) return;
 
-  const targetUrls = new Set();
-  if (TRADE_LEDGER_URL) targetUrls.add(TRADE_LEDGER_URL);
-  if (State.googleSheetUrl) targetUrls.add(State.googleSheetUrl);
-  if (GOOGLE_SHEET_URL) targetUrls.add(GOOGLE_SHEET_URL);
+  // 1. Prevent duplicate network dispatch of the exact same trade record
+  const timeMinute = String(trade.time || '').slice(0, 5);
+  const sig = `${trade.pair}_${trade.date}_${timeMinute}_${trade.entryPriceUSDT}_${trade.exitPriceUSDT}_${trade.type}`;
+  if (dispatchedTradeSignatures.has(sig)) {
+    console.log(`[Cloud Ledger] Skipping duplicate network dispatch for ${sig}`);
+    return;
+  }
+  dispatchedTradeSignatures.add(sig);
+  if (dispatchedTradeSignatures.size > 200) {
+    const oldest = Array.from(dispatchedTradeSignatures).slice(0, 50);
+    oldest.forEach(s => dispatchedTradeSignatures.delete(s));
+  }
+
+  // 2. Select ONLY ONE primary target URL to prevent duplicate writes
+  const primaryUrl = TRADE_LEDGER_URL || State.googleSheetUrl || GOOGLE_SHEET_URL;
+  if (!primaryUrl) return;
 
   const payload = {
     id: trade.id || Date.now(),
@@ -52,6 +67,7 @@ async function recordTradeToCloudLedger(trade) {
     type: trade.type || 'EXIT',
     entryPriceUSDT: Number(trade.entryPriceUSDT || 0),
     exitPriceUSDT: Number(trade.exitPriceUSDT || 0),
+    notionalUSDT: Number(trade.notionalUSDT || 50.00),
     pnlUSDT: Number(trade.pnlUSDT || 0),
     pnlINR: Number(trade.pnlINR || 0),
     regime: trade.regime || State.marketRegime || 'BALANCED',
@@ -59,24 +75,22 @@ async function recordTradeToCloudLedger(trade) {
     reason: trade.reason || 'Settled trade'
   };
 
-  for (const url of targetUrls) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12000);
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(payload),
-        redirect: 'follow',
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-      if (res.ok) {
-        console.log(`[Cloud Ledger] Synced closed trade ${payload.pair} (${payload.type}) to ${url.slice(0, 48)}...`);
-      }
-    } catch (e) {
-      console.error('[Cloud Ledger Sync Error]', e.message);
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(primaryUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (res.ok) {
+      console.log(`[Cloud Ledger] Synced closed trade ${payload.pair} (${payload.type}) to ${primaryUrl.slice(0, 48)}...`);
     }
+  } catch (e) {
+    console.error('[Cloud Ledger Sync Error]', e.message);
   }
 }
 
@@ -904,6 +918,8 @@ function isValidTradeRecord(t) {
 function sanitizeAndAuditTradeHistory(logs) {
   if (!Array.isArray(logs)) return [];
   const map = new Map();
+  const seenSignatures = new Set();
+
   logs.forEach(l => {
     if (!isValidTradeRecord(l)) return;
     const rawPair = String(l.pair || l.Pair || l.symbol || l.Symbol || l.asset || '').trim().toUpperCase();
@@ -929,8 +945,17 @@ function sanitizeAndAuditTradeHistory(logs) {
     l.notionalUSDT = Number(l.notionalUSDT) || 50.00;
     l.type = String(l.type || l.Type || 'EXIT').trim().toUpperCase();
 
-    const dedupKey = `${l.pair}_${l.id}`;
-    map.set(dedupKey, l);
+    // Canonical content fingerprint to eliminate duplicate rows from sheets
+    const timeMinute = String(l.time || '').slice(0, 5);
+    const contentSig = `${l.pair}_${l.date}_${timeMinute}_${l.entryPriceUSDT}_${l.exitPriceUSDT}_${l.type}`;
+    const idKey = `${l.pair}_${l.id}`;
+
+    if (seenSignatures.has(contentSig) || map.has(idKey)) {
+      return; // Skip duplicate record
+    }
+
+    seenSignatures.add(contentSig);
+    map.set(idKey, l);
   });
   return Array.from(map.values()).sort((a, b) => b.id - a.id);
 }
@@ -1490,8 +1515,7 @@ async function runDynamicScreener() {
 }
 
 async function evaluateAutopilotEntries() {
-  const currentCount = Object.keys(State.activePositions).length;
-  if (currentCount >= State.tradeFrequencyController.maxConcurrentPositions) return;
+  let currentCount = Object.keys(State.activePositions).length;
 
   const freeCash = State.portfolio.cashUSDT;
   if (freeCash < 20.00) return;
@@ -1510,6 +1534,27 @@ async function evaluateAutopilotEntries() {
   const evalList = (State.candidatePool && State.candidatePool.length > 0)
     ? State.candidatePool
     : Object.keys(State.universe).map(k => ({ pair: k, ...State.universe[k] }));
+
+  // PILLAR 4: OPPORTUNITY COST CAPITAL ROTATION
+  // If active slots are full, check if any stale trade can be rotated into a premier A+ setup
+  if (currentCount >= State.tradeFrequencyController.maxConcurrentPositions) {
+    for (const pKey of Object.keys(State.activePositions)) {
+      const p = State.activePositions[pKey];
+      const pAgeMin = (Date.now() - (p.openedAt || Date.now())) / 60000;
+      // Stale trade: held > 75m, not yet TP1, floating in small profit (+0.10% to +0.45%)
+      if (pAgeMin >= 75 && !p.tp1Secured && p.gainPct >= 0.10 && p.gainPct <= 0.45) {
+        const topCandidate = evalList[0];
+        if (topCandidate && topCandidate.pair !== pKey && (topCandidate.score || 0) >= 85) {
+          console.log(`[Alpha Velocity Rotation] Rotating stale trade ${pKey} (${Math.round(pAgeMin)}m, +${p.gainPct.toFixed(2)}%) for A+ candidate ${topCandidate.pair} (Score ${topCandidate.score})`);
+          closeActivePositionManual(pKey);
+          currentCount--;
+          break;
+        }
+      }
+    }
+  }
+
+  if (currentCount >= State.tradeFrequencyController.maxConcurrentPositions) return;
 
   for (const item of evalList) {
     const pair = item.pair;
@@ -1531,12 +1576,10 @@ async function evaluateAutopilotEntries() {
     if (!trendCheck.passed) continue;
 
     // DUAL-TRACK UPSTREAM SELECTION GATE: VWAP & 4H HIGH PROXIMITY
-    // Permanently blocks distribution bleeders (EIGEN, LINK, PYTH, PENDLE, WLD)
     const vwapCheck = await checkMicrostructureMomentumAndVwap(pair);
     if (!vwapCheck.passed) continue;
 
     // VETERAN ORDER-FLOW, CVD & WYCKOFF VSA GATE
-    // Evaluates real executed taker volume delta (Binance kline[9]), Effort vs. Result (CLV), and 5m market structure
     const orderFlowCheck = await checkVeteranOrderFlowAndVSA(pair);
     if (!orderFlowCheck.passed) continue;
 
@@ -1590,13 +1633,19 @@ function executeSpotBuy(pair, candidate, book, volFactor, entrySnapshot) {
 
   State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT - finalNotional).toFixed(2));
 
+  // Volatility-Adaptive TP1 Target (1.20% to 2.20%)
+  const tokenRange = candidate.intradayRangePct || 4.5;
+  const adaptiveTp1Pct = Math.min(2.20, Math.max(1.20, Number((tokenRange * 0.28).toFixed(2))));
+  const tp1Price = Number((entryPrice * (1 + (adaptiveTp1Pct / 100))).toFixed(6));
+
   State.activePositions[pair] = {
     pairSymbol: candidate.symbol || pair.replace('USDT', ''),
     entryPriceUSDT: entryPrice,
     livePriceUSDT: entryPrice,
     qty,
     notionalUSDT: finalNotional,
-    tp1: Number((entryPrice * 1.018).toFixed(6)),
+    tp1: tp1Price,
+    targetTp1Pct: adaptiveTp1Pct,
     tp1Secured: false,
     sl: Number((entryPrice * 0.95).toFixed(6)),
     peakPriceUSDT: entryPrice,
@@ -1636,6 +1685,9 @@ async function runPredictiveSentry() {
       const gainPct = ((live - pos.entryPriceUSDT) / pos.entryPriceUSDT) * 100;
       pos.gainPct = Number(gainPct.toFixed(2));
 
+      const holdMinutes = Number(((Date.now() - (pos.openedAt || Date.now())) / 60000).toFixed(1));
+      pos.holdMinutes = holdMinutes;
+
       if (live > (pos.peakPriceUSDT || pos.entryPriceUSDT)) {
         pos.peakPriceUSDT = live;
       }
@@ -1649,9 +1701,9 @@ async function runPredictiveSentry() {
 
       // ==============================================================
       // DPEE PHASE 1: MICROSTRUCTURE ORDER BOOK FLIP DETECTION
-      // (When up >= 1.40% or peaked >= 1.50%, exit immediately if buyers flee)
+      // Evaluated earlier starting at +0.80% (lowered from +1.40%)
       // ==============================================================
-      if (gainPct >= 1.40 || peakGainPct >= 1.50) {
+      if (gainPct >= 0.80 || peakGainPct >= 0.95) {
         const book = await fetchRealOrderBookDepth(k);
         if (book && book.obi < 0.38) {
           const exitCash = pos.qty * live;
@@ -1678,7 +1730,7 @@ async function runPredictiveSentry() {
 
           State.tradeLogs.unshift(tradeRecord);
           recordTradeToCloudLedger(tradeRecord);
-          learningEngine.recordTradeOutcome(k, pos.tp1Secured ? 'RUNNER' : 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+          learningEngine.recordTradeOutcome(k, pos.tp1Secured ? 'RUNNER' : 'TP1', profit, holdMinutes / 60, pos.entrySnapshot, peakEff);
           State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
           delete State.activePositions[k];
           saveStateToDisk();
@@ -1687,10 +1739,9 @@ async function runPredictiveSentry() {
         }
 
         // ==============================================================
-        // DPEE PHASE 2: 1-MINUTE CANDLE REJECTION WICK TRIGGER
-        // (If price rejected >= 40% from the 1m intra-bar high, top is in)
+        // DPEE PHASE 2: 1-MINUTE CANDLE REJECTION WICK TRIGGER (>= +0.90%)
         // ==============================================================
-        if (gainPct >= 1.50) {
+        if (gainPct >= 0.90) {
           const wickCheck = await check1mExhaustionWick(k);
           if (wickCheck.exhausted) {
             const exitCash = pos.qty * live;
@@ -1717,13 +1768,136 @@ async function runPredictiveSentry() {
 
             State.tradeLogs.unshift(tradeRecord);
             recordTradeToCloudLedger(tradeRecord);
-            learningEngine.recordTradeOutcome(k, pos.tp1Secured ? 'RUNNER' : 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+            learningEngine.recordTradeOutcome(k, pos.tp1Secured ? 'RUNNER' : 'TP1', profit, holdMinutes / 60, pos.entrySnapshot, peakEff);
             State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
             delete State.activePositions[k];
             saveStateToDisk();
             broadcastState();
             continue;
           }
+        }
+      }
+
+      // ==============================================================
+      // ALPHA VELOCITY ENGINE: DYNAMIC TIME-DECAY EXITS
+      // ==============================================================
+      if (!pos.tp1Secured) {
+        // VELOCITY RULE 1: Held 45 - 90 mins with stalled momentum >= +0.70% -> Bank 100% at Market
+        if (holdMinutes >= 45 && holdMinutes < 90 && gainPct >= 0.70) {
+          const exitCash = pos.qty * live;
+          const profit = exitCash - pos.notionalUSDT;
+          State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+          State.portfolio.realizedPnL += Number(profit.toFixed(4));
+
+          const tradeRecord = {
+            id: Date.now(),
+            date: new Date().toLocaleDateString('en-GB'),
+            time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+            pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+            type: 'VELOCITY EXIT (+0.7% STALL)',
+            entryPriceUSDT: pos.entryPriceUSDT,
+            exitPriceUSDT: live,
+            notionalUSDT: pos.notionalUSDT,
+            pnlUSDT: Number(profit.toFixed(4)),
+            pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+            regime: State.marketRegime || 'BALANCED',
+            volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+            peakEfficiencyPct: peakEff,
+            reason: `Alpha Velocity: Stalled breakout banked at +${gainPct.toFixed(2)}% after ${Math.round(holdMinutes)}m (Preserving velocity)`
+          };
+
+          State.tradeLogs.unshift(tradeRecord);
+          recordTradeToCloudLedger(tradeRecord);
+          learningEngine.recordTradeOutcome(k, 'TP1', profit, holdMinutes / 60, pos.entrySnapshot, peakEff);
+          State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+          delete State.activePositions[k];
+          saveStateToDisk();
+          broadcastState();
+          continue;
+        }
+
+        // VELOCITY RULE 2: Held 90 - 150 mins with consolidation drift >= +0.25% -> Scratch/Fee Profit Exit
+        if (holdMinutes >= 90 && holdMinutes < 150 && gainPct >= 0.25) {
+          const exitCash = pos.qty * live;
+          const profit = exitCash - pos.notionalUSDT;
+          State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+          State.portfolio.realizedPnL += Number(profit.toFixed(4));
+
+          const tradeRecord = {
+            id: Date.now(),
+            date: new Date().toLocaleDateString('en-GB'),
+            time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+            pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+            type: 'VELOCITY EXIT (SCRATCH)',
+            entryPriceUSDT: pos.entryPriceUSDT,
+            exitPriceUSDT: live,
+            notionalUSDT: pos.notionalUSDT,
+            pnlUSDT: Number(profit.toFixed(4)),
+            pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+            regime: State.marketRegime || 'BALANCED',
+            volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+            peakEfficiencyPct: peakEff,
+            reason: `Alpha Velocity: Consolidation profit banked at +${gainPct.toFixed(2)}% after ${Math.round(holdMinutes)}m`
+          };
+
+          State.tradeLogs.unshift(tradeRecord);
+          recordTradeToCloudLedger(tradeRecord);
+          learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, holdMinutes / 60, pos.entrySnapshot, peakEff);
+          State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+          delete State.activePositions[k];
+          saveStateToDisk();
+          broadcastState();
+          continue;
+        }
+
+        // VELOCITY RULE 3: Held >= 150 mins and NEGATIVE (<= 0.00%) -> TRANSFERS TO RECOVERY BAG
+        // Adheres strictly to Zero Realized Loss: Dips held in background bags, freeing active slots!
+        if (holdMinutes >= 150 && gainPct <= 0.00) {
+          State.recoveryBags[k] = {
+            ...pos,
+            movedAt: Date.now(),
+            targetStep: 'STEP 1 (+0.30%)',
+            targetExitPriceUSDT: Number((pos.entryPriceUSDT * 1.003).toFixed(6)),
+            transferReason: `Stagnant active trade (${Math.round(holdMinutes)}m at ${gainPct.toFixed(2)}%) transferred to recovery bag`
+          };
+          delete State.activePositions[k];
+          saveStateToDisk();
+          broadcastState();
+          continue;
+        }
+
+        // VELOCITY RULE 4: Held >= 150 mins and POSITIVE (> 0.00%) -> Bank green profit at market
+        if (holdMinutes >= 150 && gainPct > 0.00) {
+          const exitCash = pos.qty * live;
+          const profit = exitCash - pos.notionalUSDT;
+          State.portfolio.cashUSDT += Number(exitCash.toFixed(2));
+          State.portfolio.realizedPnL += Number(profit.toFixed(4));
+
+          const tradeRecord = {
+            id: Date.now(),
+            date: new Date().toLocaleDateString('en-GB'),
+            time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+            pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
+            type: 'VELOCITY EXIT (150M TIME CAP)',
+            entryPriceUSDT: pos.entryPriceUSDT,
+            exitPriceUSDT: live,
+            notionalUSDT: pos.notionalUSDT,
+            pnlUSDT: Number(profit.toFixed(4)),
+            pnlINR: Number((profit * State.usdtToInrRate).toFixed(2)),
+            regime: State.marketRegime || 'BALANCED',
+            volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
+            peakEfficiencyPct: peakEff,
+            reason: `Alpha Velocity: Position exited in profit (+${gainPct.toFixed(2)}%) after ${Math.round(holdMinutes)}m time cap`
+          };
+
+          State.tradeLogs.unshift(tradeRecord);
+          recordTradeToCloudLedger(tradeRecord);
+          learningEngine.recordTradeOutcome(k, 'TP1', profit, holdMinutes / 60, pos.entrySnapshot, peakEff);
+          State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
+          delete State.activePositions[k];
+          saveStateToDisk();
+          broadcastState();
+          continue;
         }
       }
 
@@ -1762,7 +1936,7 @@ async function runPredictiveSentry() {
 
             State.tradeLogs.unshift(tradeRecord);
             recordTradeToCloudLedger(tradeRecord);
-            learningEngine.recordTradeOutcome(k, 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+            learningEngine.recordTradeOutcome(k, 'TP1', profit, holdMinutes / 60, pos.entrySnapshot, peakEff);
             State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
             delete State.activePositions[k];
             saveStateToDisk();
@@ -1801,7 +1975,7 @@ async function runPredictiveSentry() {
 
             State.tradeLogs.unshift(tradeRecord);
             recordTradeToCloudLedger(tradeRecord);
-            learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+            learningEngine.recordTradeOutcome(k, 'RECOVERY', profit, holdMinutes / 60, pos.entrySnapshot, peakEff);
             State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
             delete State.activePositions[k];
             saveStateToDisk();
@@ -1812,9 +1986,10 @@ async function runPredictiveSentry() {
       }
 
       // ==============================================================
-      // B. TP1 HIT (+1.80%): BANK 50% POSITION & ACTIVATE RUNNER
+      // B. TP1 HIT (Adaptive +1.20% to +2.20%): BANK 50% & TRAIL RUNNER
       // ==============================================================
-      if (!pos.tp1Secured && gainPct >= 1.80) {
+      const targetTp1 = pos.targetTp1Pct || 1.80;
+      if (!pos.tp1Secured && gainPct >= targetTp1) {
         pos.tp1Secured = true;
         const bankedCash = (pos.notionalUSDT * 0.5) * (1 + (gainPct / 100));
         const profit = bankedCash - (pos.notionalUSDT * 0.5);
@@ -1832,7 +2007,7 @@ async function runPredictiveSentry() {
           date: new Date().toLocaleDateString('en-GB'),
           time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
           pair: k.includes('/') ? k : `${k.replace('USDT', '')}/USDT`,
-          type: 'TP1 (50% BANKED)',
+          type: `TP1 (50% BANKED @ +${gainPct.toFixed(1)}%)`,
           entryPriceUSDT: pos.entryPriceUSDT,
           exitPriceUSDT: live,
           notionalUSDT: Number(pos.notionalUSDT.toFixed(2)),
@@ -1841,23 +2016,22 @@ async function runPredictiveSentry() {
           regime: State.marketRegime || 'BALANCED',
           volatilityPct: State.activeThresholds?.marketAvgRange || 4.5,
           peakEfficiencyPct: 100,
-          reason: 'TP1 secured: 50% banked at +1.80%, DPEE runner activated'
+          reason: `Adaptive TP1 secured: 50% banked at +${gainPct.toFixed(2)}%, DPEE runner activated`
         };
         State.tradeLogs.unshift(tradeRecord);
         recordTradeToCloudLedger(tradeRecord);
-        learningEngine.recordTradeOutcome(k, 'TP1', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, 100);
+        learningEngine.recordTradeOutcome(k, 'TP1', profit, holdMinutes / 60, pos.entrySnapshot, 100);
       }
 
       // ==============================================================
-      // C. DPEE PARABOLIC COMPRESSION RUNNER TRAIL (INVERSE RATCHET)
-      // (The higher and faster it pumps, the tighter the trail hugs peak!)
+      // C. DPEE PARABOLIC COMPRESSION RUNNER TRAIL
       // ==============================================================
       if (pos.tp1Secured) {
-        let trailPct = 0.0040; // 0.40% trail for +1.80% to +2.20%
+        let trailPct = 0.0040;
         if (peakGainPct >= 3.20) {
-          trailPct = 0.0022; // 0.22% ultra-tight trail on parabolic spikes!
+          trailPct = 0.0022;
         } else if (peakGainPct >= 2.20) {
-          trailPct = 0.0030; // 0.30% tight compression trail (locks in +2.40% moves)
+          trailPct = 0.0030;
         }
 
         const trailPrice = pos.peakPriceUSDT * (1 - trailPct);
@@ -1890,7 +2064,7 @@ async function runPredictiveSentry() {
 
           State.tradeLogs.unshift(tradeRecord);
           recordTradeToCloudLedger(tradeRecord);
-          learningEngine.recordTradeOutcome(k, 'RUNNER', profit, (Date.now() - pos.openedAt) / 3600000, pos.entrySnapshot, peakEff);
+          learningEngine.recordTradeOutcome(k, 'RUNNER', profit, holdMinutes / 60, pos.entrySnapshot, peakEff);
           State.cooldowns[k] = { until: Date.now() + (90 * 60 * 1000) };
           delete State.activePositions[k];
           saveStateToDisk();
@@ -1908,7 +2082,8 @@ async function runPredictiveSentry() {
           ...pos,
           movedAt: Date.now(),
           targetStep: 'STEP 1 (+0.30%)',
-          targetExitPriceUSDT: Number((pos.entryPriceUSDT * 1.003).toFixed(6))
+          targetExitPriceUSDT: Number((pos.entryPriceUSDT * 1.003).toFixed(6)),
+          transferReason: `Retest dip (${gainPct.toFixed(2)}%) transferred to recovery bag`
         };
         delete State.activePositions[k];
         saveStateToDisk();
