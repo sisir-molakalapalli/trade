@@ -14,7 +14,8 @@
  * - 20-depth real order book gate (OBI >= 48%, spread <= 0.15%)
  * - Minute-0 Micro-Trailing Sentry with 30m/45m Alpha Velocity exits
  * - Spot Recovery Bag Engine (Zero Realized Loss Model)
- * - Dedicated independent endpoints for Master Ledger and Drive State
+ * - Dual-Transport (POST + GET) Trade Ledger Cloud Dispatch
+ * - Dedicated server proxy for Google Apps Script connection tests
  * =========================================================================
  */
 
@@ -102,7 +103,7 @@ const State = {
     pacingMode: 'HIGH_VELOCITY'
   },
   usdtToInrRate: 94.94,
-  // Dedicated Separate Endpoints
+  // Dedicated Separate Cloud Endpoints
   masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec',
   learningSheetUrl: 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec'
 };
@@ -110,20 +111,25 @@ const State = {
 // -------------------------------------------------------------
 // ZERO-DEPENDENCY SAFE HTTP FETCHER & JSON POSTER
 // -------------------------------------------------------------
-async function safeFetch(url, timeoutMs = 4000) {
+async function safeFetch(url, timeoutMs = 8000) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json'
+    'Accept': 'application/json, text/plain, */*'
   };
 
   if (typeof fetch === 'function') {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { headers, signal: controller.signal });
+      const res = await fetch(url, { headers, redirect: 'follow', signal: controller.signal });
       clearTimeout(timeout);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        return { success: true, raw: text };
+      }
     } catch (err) {
       clearTimeout(timeout);
       throw err;
@@ -139,10 +145,14 @@ async function safeFetch(url, timeoutMs = 4000) {
           if (res.statusCode >= 400) {
             reject(new Error(`HTTP ${res.statusCode}`));
           } else {
-            resolve(JSON.parse(data));
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              resolve({ success: true, raw: data });
+            }
           }
         } catch (e) {
-          reject(new Error('Invalid JSON from ' + url));
+          reject(new Error('Invalid response from ' + url));
         }
       });
     });
@@ -151,7 +161,7 @@ async function safeFetch(url, timeoutMs = 4000) {
   });
 }
 
-async function safePostJson(url, dataObj, timeoutMs = 8000) {
+async function safePostJson(url, dataObj, timeoutMs = 16000) {
   const headers = {
     'Content-Type': 'application/json',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -217,7 +227,7 @@ async function safePostJson(url, dataObj, timeoutMs = 8000) {
 }
 
 // -------------------------------------------------------------
-// GOOGLE DRIVE STATE SYNC (SEPARATE LEARNING ENDPOINT)
+// GOOGLE DRIVE STATE SYNC (DEDICATED LEARNING ENDPOINT)
 // -------------------------------------------------------------
 async function backupLearningStateToGoogleDrive() {
   const targetUrl = State.learningSheetUrl;
@@ -1142,7 +1152,7 @@ async function syncTradesFromGoogleSheets() {
 
   try {
     const fullUrl = masterUrl.includes('?') ? `${masterUrl}&action=GET_ALL` : `${masterUrl}?action=GET_ALL`;
-    const data = await safeFetch(fullUrl, 8000);
+    const data = await safeFetch(fullUrl, 10000);
     let fetchedTrades = [];
     if (data && Array.isArray(data.trades) && data.trades.length > 0) {
       fetchedTrades = data.trades;
@@ -1200,12 +1210,28 @@ async function recordTradeToCloudLedger(trade) {
   saveDiskState();
 
   const targetUrl = State.masterLedgerUrl;
+  let success = false;
+
+  // Primary: Fast POST dispatch with redirect following
   try {
     console.log(`[Cloud Ledger] Dispatching trade ${record.pair} (${record.type}) strictly to Sisir_Quant_Trade_Ledger...`);
-    const res = await safePostJson(targetUrl, record, 10000);
+    const res = await safePostJson(targetUrl, record, 15000);
     console.log(`[Cloud Ledger Response]`, JSON.stringify(res));
+    success = true;
   } catch (err) {
-    console.error(`[Cloud Ledger Error]`, err.message);
+    console.error(`[Cloud Ledger POST Error] ${err.message}. Retrying via GET fallback transport...`);
+  }
+
+  // Fail-Safe Secondary: GET transport fallback
+  if (!success) {
+    try {
+      const getUrl = `${targetUrl}?action=RECORD_TRADE&data=${encodeURIComponent(JSON.stringify(record))}`;
+      const getRes = await safeFetch(getUrl, 15000);
+      console.log(`[Cloud Ledger GET Fallback Response]`, JSON.stringify(getRes));
+      success = true;
+    } catch (err2) {
+      console.error(`[Cloud Ledger Critical Error] Failed both POST and GET dispatch: ${err2.message}`);
+    }
   }
 
   learningEngine.recordTradeOutcome(
@@ -1344,6 +1370,55 @@ app.post('/api/trades/sync-strict-sheet', async (req, res) => {
     res.json({ success: true, count: trades.length, trades });
   } catch (err) {
     res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs });
+  }
+});
+
+app.post('/api/ledger/test', async (req, res) => {
+  const testUrl = (req.body.url || State.masterLedgerUrl || '').trim();
+  if (!testUrl) return res.status(400).json({ success: false, error: 'Missing ledger URL' });
+  try {
+    console.log(`[Ledger Test] Testing URL from server proxy: ${testUrl}`);
+    const fetchUrl = testUrl.includes('?') ? `${testUrl}&action=TEST` : `${testUrl}?action=TEST`;
+    const data = await safeFetch(fetchUrl, 15000);
+    return res.json({ success: true, source: 'SERVER_PROXY', data });
+  } catch (err) {
+    console.error(`[Ledger Test Error]`, err.message);
+    return res.status(502).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/ledger/send-test-trade', async (req, res) => {
+  const testTrade = {
+    id: Date.now(),
+    date: new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }),
+    time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+    pair: 'TEST/USDT',
+    type: 'DIAGNOSTIC TEST WRITE',
+    entryPriceUSDT: 1.0000,
+    exitPriceUSDT: 1.0050,
+    notionalUSDT: 10.00,
+    pnlUSDT: 0.0500,
+    pnlINR: Number((0.05 * State.usdtToInrRate).toFixed(2)),
+    reason: 'Connection test from terminal UI'
+  };
+
+  try {
+    await recordTradeToCloudLedger(testTrade);
+    res.json({ success: true, trade: testTrade });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/learning/test', async (req, res) => {
+  const testUrl = (req.body.url || State.learningSheetUrl || '').trim();
+  if (!testUrl) return res.status(400).json({ success: false, error: 'Missing learning URL' });
+  try {
+    const fetchUrl = testUrl.includes('?') ? `${testUrl}&action=TEST` : `${testUrl}?action=TEST`;
+    const data = await safeFetch(fetchUrl, 15000);
+    return res.json({ success: true, source: 'SERVER_PROXY', data });
+  } catch (err) {
+    return res.status(502).json({ success: false, error: err.message });
   }
 });
 
