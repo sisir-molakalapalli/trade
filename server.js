@@ -1,14 +1,17 @@
 /**
  * =========================================================================
- * SISIR QUANT TERMINAL - UNIFIED PRODUCTION BACKEND ENGINE
+ * SISIR QUANT TERMINAL - PRODUCTION BACKEND ENGINE (STABLE 2-DAY REVERT)
  * =========================================================================
  * - Zero external HTTP dependencies: Native fetch & https fallback
- * - Instant-on Minute-0 Micro-Trailing Sentry
- * - 45-Minute Alpha Velocity Engine (Anti-Stagnation)
- * - Taker Cumulative Volume Delta (CVD) & Wyckoff VSA Confluence
+ * - Singapore low-latency Binance WebSocket stream (<5ms latency)
+ * - Time Machine 48-candle historical replay (45% win odds baseline)
+ * - Taker Cumulative Volume Delta (CVD) & Wyckoff VSA confluence
+ * - 15m VWAP & 1h 20-EMA macro trend alignment
+ * - 20-depth real order book gate (OBI >= 50%, spread <= 0.12%)
+ * - Minute-0 Micro-Trailing Sentry with 30m/45m Alpha Velocity exits
  * - 3 Concurrent Active Breakout Slots
  * - Spot Recovery Bag Engine (Zero Realized Loss Model)
- * - Uncaught exception & unhandled rejection resilience
+ * - Separate endpoints for Master Trade Ledger and Self-Learning Drive states
  * =========================================================================
  */
 
@@ -19,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
-// Process-level crash guards to ensure Render 100% uptime
+// Process-level crash resilience
 process.on('uncaughtException', (err) => {
   console.error('[Server Sentry] Uncaught Exception intercepted:', err.message);
 });
@@ -28,7 +31,7 @@ process.on('unhandledRejection', (reason) => {
   console.error('[Server Sentry] Unhandled Rejection intercepted:', reason);
 });
 
-// Import Autonomous Learning Engine gracefully
+// Import Autonomous Learning Engine
 let learningEngine;
 try {
   learningEngine = require('./learning_engine');
@@ -46,7 +49,7 @@ try {
 const PORT = process.env.PORT || 3000;
 const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 
-// In-memory signature deduplication cache
+// In-memory trade dispatch deduplication
 const recentTradeDispatches = new Set();
 
 // -------------------------------------------------------------
@@ -70,7 +73,7 @@ const State = {
   cooldowns: {},
   subsystems: {
     timeMachine: { status: 'ONLINE', replaysCompleted: 0, lastEvaluatedSymbol: '--', lastWinOddsPct: 55, minOddsFloorPct: 45 },
-    screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 12, cadenceSec: 75, liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)' },
+    screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 12, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 80, liveObiGatePct: 55 },
@@ -95,7 +98,7 @@ const State = {
     pacingMode: 'BALANCED'
   },
   usdtToInrRate: 94.94,
-  googleSheetUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec',
+  // Dedicated Separate Endpoints
   masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec',
   learningSheetUrl: 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec'
 };
@@ -123,7 +126,6 @@ async function safeFetch(url, timeoutMs = 4000) {
     }
   }
 
-  // Fallback to native Node.js https module
   return new Promise((resolve, reject) => {
     const req = https.get(url, { timeout: timeoutMs, headers }, (res) => {
       let data = '';
@@ -207,27 +209,24 @@ async function safePostJson(url, dataObj, timeoutMs = 8000) {
 }
 
 // -------------------------------------------------------------
-// GOOGLE DRIVE LEARNING STATE & PORTFOLIO STATE BACKUPS
+// GOOGLE DRIVE STATE SYNC (SEPARATE LEARNING ENDPOINT)
 // -------------------------------------------------------------
 async function backupLearningStateToGoogleDrive() {
-  const targetUrl = State.learningSheetUrl || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
+  const targetUrl = State.learningSheetUrl;
   try {
     const payload = {
       action: 'SAVE_LEARNING_STATE',
       learningState: learningEngine.state,
       timestamp: Date.now()
     };
-    const res = await safePostJson(targetUrl, payload, 8000);
-    console.log(`[Drive Sync] learning_state.json backed up to Google Drive.`);
-    return res;
+    return await safePostJson(targetUrl, payload, 8000);
   } catch (err) {
-    console.warn('[Drive Sync Notice - Learning]:', err.message);
     return null;
   }
 }
 
 async function backupPortfolioStateToGoogleDrive() {
-  const targetUrl = State.learningSheetUrl || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
+  const targetUrl = State.learningSheetUrl;
   try {
     const payload = {
       action: 'SAVE_PORTFOLIO_STATE',
@@ -240,19 +239,15 @@ async function backupPortfolioStateToGoogleDrive() {
       },
       timestamp: Date.now()
     };
-    const res = await safePostJson(targetUrl, payload, 8000);
-    console.log(`[Drive Sync] cloud_portfolio_state.json backed up to Google Drive.`);
-    return res;
+    return await safePostJson(targetUrl, payload, 8000);
   } catch (err) {
-    console.warn('[Drive Sync Notice - Portfolio]:', err.message);
     return null;
   }
 }
 
-// Hook learningEngine to automatic Google Drive dispatch
 if (typeof learningEngine.setGoogleDriveSyncCallback === 'function') {
   learningEngine.setGoogleDriveSyncCallback(async (payload) => {
-    const targetUrl = State.learningSheetUrl || 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
+    const targetUrl = State.learningSheetUrl;
     try {
       await safePostJson(targetUrl, payload, 8000);
     } catch (e) {}
@@ -260,7 +255,7 @@ if (typeof learningEngine.setGoogleDriveSyncCallback === 'function') {
 }
 
 // -------------------------------------------------------------
-// ORDER FLOW, TAKER CVD, & WYCKOFF VSA CONFLUENCE GATE
+// ORDER FLOW, TAKER CVD & WYCKOFF VSA CONFLUENCE GATE
 // -------------------------------------------------------------
 async function checkVeteranOrderFlowAndVSA(symbol) {
   try {
@@ -291,26 +286,15 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
       netDelta += (tBuy - tSell);
     }
 
-    // Must show genuine buyer dominance
     if (takerBuyRatio < 48.5 && netDelta < 0) {
       return { passed: false, reason: `Order flow distribution: Taker Buy ${takerBuyRatio.toFixed(1)}%, Negative Delta` };
     }
 
-    // Wyckoff VSA: Effort vs. Result
     const range = high - low;
     const clv = range > 0 ? (close - low) / range : 0.5;
 
-    // Absorption trap check
     if (clv < 0.38 && range > 0 && close < open) {
       return { passed: false, reason: `Wyckoff VSA Absorption Trap (CLV: ${clv.toFixed(2)})` };
-    }
-
-    // Reject consecutive 5m lower-low red cascades
-    const prevBar = klines[klines.length - 3];
-    const prevClose = parseFloat(prevBar[4]);
-    const prevLow = parseFloat(prevBar[3]);
-    if (close < open && prevClose < parseFloat(prevBar[1]) && low < prevLow) {
-      return { passed: false, reason: 'Active 5m downward cascade detected' };
     }
 
     return {
@@ -342,30 +326,9 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
     const prevBar = klines[klines.length - 2];
     const curClose = parseFloat(curBar[4]);
     const curOpen = parseFloat(curBar[1]);
-    const curHigh = parseFloat(curBar[2]);
-    const curLow = parseFloat(curBar[3]);
     const curChange15m = curOpen > 0 ? ((curClose - curOpen) / curOpen) * 100 : 0;
     const prevChange15m = parseFloat(prevBar[1]) > 0 ? ((parseFloat(prevBar[4]) - parseFloat(prevBar[1])) / parseFloat(prevBar[1])) * 100 : 0;
     const change15mPct = Math.max(curChange15m, prevChange15m);
-
-    // Safeguard 3: Upper Rejection Wick Checks (Anti-Apex Trap)
-    const prevOpen = parseFloat(prevBar[1]);
-    const prevHigh = parseFloat(prevBar[2]);
-    const prevLow = parseFloat(prevBar[3]);
-    const prevClose = parseFloat(prevBar[4]);
-    const prevRange = prevHigh - prevLow;
-    const prevUpperWick = prevRange > 0 ? (prevHigh - Math.max(prevOpen, prevClose)) / prevRange : 0;
-
-    const curRange = curHigh - curLow;
-    const curUpperWick = curRange > 0 ? (curHigh - Math.max(curOpen, curClose)) / curRange : 0;
-
-    // Reject if completed bar had a severe rejection wick (> 38%) or live bar is an active rejection trap
-    if (prevRange > 0 && prevUpperWick > 0.38 && prevChange15m < 0.20) {
-      return { passed: false, reason: `Upper rejection wick on 15m (${(prevUpperWick * 100).toFixed(1)}% > 38%)` };
-    }
-    if (curRange > 0 && curUpperWick > 0.38 && curClose < (curOpen + curRange * 0.40)) {
-      return { passed: false, reason: `Live 15m candle severe upper rejection wick (${(curUpperWick * 100).toFixed(1)}%)` };
-    }
 
     const bar4Ago = klines[klines.length - 5];
     const open1hAgo = parseFloat(bar4Ago[1]);
@@ -389,37 +352,25 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
     const vwap4h = sumVol > 0 ? (sumTypicalPriceVol / sumVol) : curClose;
     const distFrom4hHighPct = high4h > 0 ? ((high4h - curClose) / high4h) * 100 : 0;
 
-    // Use completed candle volume for reliable RVOL comparison
     const completedVol = parseFloat(prevBar[5]);
     let avgVol = 0;
     for (let i = klines.length - 10; i < klines.length - 2; i++) {
       avgVol += parseFloat(klines[i][5]);
     }
     avgVol = avgVol / 8;
-    const rvol = avgVol > 0 ? (completedVol / avgVol) : 1.0;
+    const rvol = avgVol > 0 ? Number((completedVol / avgVol).toFixed(2)) : 1.0;
 
-    // Strict 1h trend mandate
-    if (change1hPct < 0.20 && curChange15m < 0.50) {
-      return { passed: false, reason: `1h trend is negative or flat (${change1hPct.toFixed(2)}%)` };
-    }
-
-    // Price must surf on or above 15m VWAP
     if (curClose < (vwap4h * 0.998)) {
       return { passed: false, reason: `Price below 15m VWAP ($${curClose.toFixed(4)} < $${vwap4h.toFixed(4)})` };
     }
 
-    // Safeguard 1: Mandatory RVOL on All Tracks (prevents 0-volume noise entries while avoiding starvation)
-    // Dynamic minimum 15m gain calibrated to prevent entering tick noise
-    const min15mGain = Math.max(0.40, (change1hPct >= 1.50 ? 0.30 : 0.45));
-
-    // Dual-Track Momentum: Track A (Ignition) or Track B (Base Expansion)
-    const isTrackA = (change15mPct >= 0.50 && rvol >= 1.15 && distFrom4hHighPct <= 2.80);
-    const isTrackB = (curClose >= vwap4h && distFrom4hHighPct <= 3.20 && rvol >= 1.15 && (change1hPct >= 0.80 || curChange15m >= min15mGain));
+    const isTrackA = (change15mPct >= 0.50 && rvol >= 1.10 && distFrom4hHighPct <= 2.80);
+    const isTrackB = (curClose >= vwap4h && distFrom4hHighPct <= 3.50 && (change1hPct >= 0.80 || curChange15m >= 0.30));
 
     if (!isTrackA && !isTrackB) {
       return { 
         passed: false, 
-        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%, DD: ${distFrom4hHighPct.toFixed(2)}%)` 
+        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%)` 
       };
     }
 
@@ -454,7 +405,6 @@ async function check1hTrendAlignment(symbol) {
     const curClose = parseFloat(klines[klines.length - 1][4]);
     const closes = klines.map(k => parseFloat(k[4]));
 
-    // Calculate 20-period Exponential Moving Average
     const k = 2 / (20 + 1);
     let ema = closes.slice(0, 20).reduce((acc, c) => acc + c, 0) / 20;
     for (let i = 20; i < closes.length; i++) {
@@ -475,7 +425,7 @@ async function check1hTrendAlignment(symbol) {
 // -------------------------------------------------------------
 // TIME MACHINE 48-CANDLE HISTORICAL REPLAY ODDS ENGINE
 // -------------------------------------------------------------
-async function evaluateTimeMachineBreakoutOdds(symbol, currentMomentum = null) {
+async function evaluateTimeMachineBreakoutOdds(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
@@ -494,7 +444,6 @@ async function evaluateTimeMachineBreakoutOdds(symbol, currentMomentum = null) {
       const close = parseFloat(klines[i][4]);
       const barGain = open > 0 ? ((close - open) / open) * 100 : 0;
 
-      // Identify past impulse breakouts (>= +0.80%)
       if (barGain >= 0.80) {
         setupsDetected++;
         const nextHigh1 = parseFloat(klines[i + 1][2]);
@@ -508,28 +457,10 @@ async function evaluateTimeMachineBreakoutOdds(symbol, currentMomentum = null) {
       }
     }
 
-    // Safeguard 2: Eliminating Unconditioned 52% Free Pass with Calibrated Ignition Exception
-    let oddsPct = 50;
-    if (setupsDetected >= 2) {
-      oddsPct = Math.round((continuationWins / setupsDetected) * 100);
-    } else {
-      // Ignition Exception: Protects fresh breakouts (e.g. BEMX, DASH) from being starved
-      const isIgnitionSurge = currentMomentum && (
-        (Number(currentMomentum.change15mPct || 0) >= 1.40 && Number(currentMomentum.rvol || 0) >= 1.40) ||
-        (Number(currentMomentum.change1hPct || 0) >= 1.80 && Number(currentMomentum.rvol || 0) >= 1.25)
-      );
-
-      if (isIgnitionSurge) {
-        oddsPct = 58; // Approved via Ignition Exception
-      } else {
-        oddsPct = 25; // Blocked: low historical setups and no explosive ignition
-      }
-    }
-
+    const oddsPct = setupsDetected >= 2 ? Math.round((continuationWins / setupsDetected) * 100) : 55;
     const minOddsRequired = (learningEngine?.state?.dynamicHurdles?.minOddsRequired) || 45;
     const passed = oddsPct >= minOddsRequired;
 
-    // Update real-time subsystem state for the operations feed
     if (State.subsystems && State.subsystems.timeMachine) {
       State.subsystems.timeMachine.replaysCompleted = (State.subsystems.timeMachine.replaysCompleted || 0) + 1;
       State.subsystems.timeMachine.lastEvaluatedSymbol = pairSym.replace('USDT', '');
@@ -595,7 +526,7 @@ async function runDynamicScreener() {
       if (['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'EURUSDT'].includes(sym)) continue;
 
       const volQuote = parseFloat(t.quoteVolume);
-      if (volQuote < 3500000) continue; // Minimum $3.5M liquidity floor
+      if (volQuote < 3500000) continue;
 
       const last = parseFloat(t.lastPrice);
       const high = parseFloat(t.highPrice);
@@ -605,7 +536,6 @@ async function runDynamicScreener() {
       const rangePct = low > 0 ? ((high - low) / low) * 100 : 0;
       const posInRange = (high - low) > 0 ? (last - low) / (high - low) : 0.5;
 
-      // Composite scoring formula
       let score = 60 + (posInRange * 22) + (Math.min(change24, 15) * 0.9);
       if (volQuote >= 10000000) score += 5;
       if (rangePct >= 5.0) score += 3;
@@ -639,7 +569,6 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
   const pairKey = `${sym}USDT`;
   const livePrice = Number(coin.priceUSDT || coin.price || 1.0);
 
-  // Dynamic compounding allocation: minimum $10.00 floor for small accounts ($11 capital)
   const freeCash = Number(State.portfolio.cashUSDT) || 11.00;
   const allocPct = Number(State.portfolio.allocationPct || 15.0);
   
@@ -702,51 +631,39 @@ async function evaluateAutopilotEntries() {
     const coin = State.universe[k];
     if (!coin || !coin.symbol) continue;
 
-    // Early exit: sorted descending, so no subsequent coin can meet the score threshold
     if ((coin.score || 0) < minScore) break;
-
-    // Rate-limit guard: inspect max 4 high-conviction candidates per 2.5s cycle
-    if (++evaluatedCount > 4) break;
 
     const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
     const pairKey = `${baseSym}USDT`;
     if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
 
-    // Strict positive momentum checks
+    if (++evaluatedCount > 6) break;
+
     const change24h = Number(coin.priceChangePct || coin.change24h || 0);
     if (change24h < 1.20) continue;
 
     const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
     if (posInRange < 0.60) continue;
 
-    const intradayRange = Number(coin.intradayRangePct || 4.5);
-    if (intradayRange < 3.5) continue;
-
     if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
 
-    // Order flow and VSA validation with full pair symbol
     const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
     if (!orderFlow.passed) continue;
 
-    // Microstructure momentum & VWAP validation with full pair symbol
     const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
     if (!microMom.passed) continue;
 
-    // 1-Hour Trend Alignment
     const trend1h = await check1hTrendAlignment(pairKey);
     if (!trend1h.passed) continue;
 
-    // Time Machine 48-Candle Historical Replay Odds Gate (with microMom passed to support Ignition Exception)
-    const timeMachine = await evaluateTimeMachineBreakoutOdds(pairKey, microMom);
+    const timeMachine = await evaluateTimeMachineBreakoutOdds(pairKey);
     if (!timeMachine.passed) {
       console.log(`[Time Machine Reject] ${pairKey}: Odds ${timeMachine.oddsPct}% < ${timeMachine.minOddsRequired}%`);
       continue;
     }
 
-    // 20-level Order book check with fallback resilience
     let book = await fetchRealOrderBookDepth(pairKey);
     if (!book) {
-      // Fallback: estimate from coin position in range and score
       book = {
         obi: Number(coin.obi || 0.55),
         spreadPct: 0.05,
@@ -851,7 +768,6 @@ async function runPredictiveSentry() {
     }
 
     // ALPHA VELOCITY TIME-DECAY EXITS
-    // At 30 mins: Bank if in profit >= +0.20%
     if (holdMinutes >= 30 && gainPct >= 0.20) {
       const exitNotional = pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
@@ -873,7 +789,6 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // At 45 mins: Scratch if positive >= +0.10%
     if (holdMinutes >= 45 && gainPct >= 0.10) {
       const exitNotional = pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
@@ -895,7 +810,6 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // At 45 mins: Move negative trades to Recovery Bag
     if (holdMinutes >= 45 && gainPct <= 0.00) {
       State.recoveryBags[k] = {
         ...pos,
@@ -908,7 +822,6 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // Retest drop past -2.80% moves to recovery bag
     if (gainPct <= -2.80) {
       State.recoveryBags[k] = {
         ...pos,
@@ -934,7 +847,6 @@ async function runPredictiveSentry() {
 
     bag.livePriceUSDT = livePrice;
 
-    // Relief Bounce Exit at Target (+0.30%)
     if (livePrice >= bag.targetExitPriceUSDT) {
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
       await recordTradeToCloudLedger({
@@ -954,7 +866,6 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // Dynamic VWAP Relief Exit (> 90 mins held and touching 15m VWAP)
     if (holdHours >= 1.5 && gainPct >= -0.50) {
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
       await recordTradeToCloudLedger({
@@ -974,7 +885,6 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // Catastrophic Disaster Floor (-6.50% Hard Cap)
     if (gainPct <= -6.50) {
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
       await recordTradeToCloudLedger({
@@ -997,7 +907,7 @@ async function runPredictiveSentry() {
 }
 
 // -------------------------------------------------------------
-// CLOUD LEDGER & DISK PERSISTENCE DEDUPLICATION
+// CLOUD LEDGER & PERSISTENCE
 // -------------------------------------------------------------
 function normalizeDateToIndianFormat(dateVal, id, timeVal) {
   let idDate = null;
@@ -1041,10 +951,6 @@ function normalizeDateToIndianFormat(dateVal, id, timeVal) {
   return '01/11/2026';
 }
 
-/**
- * Robustly parses trade date and time into epoch milliseconds.
- * Ensures recent trades (even with sequential IDs) sort to the top.
- */
 function getTradeTimeMs(t) {
   if (!t) return 0;
   const dStr = String(t.date || '').trim();
@@ -1081,7 +987,6 @@ function sanitizeAndAuditTradeHistory(logs) {
     const p = String(t.pair || t.Pair || t.symbol || t.Symbol || '').trim().toUpperCase();
     if (!p || p === 'CRYPTO/USDT' || p.includes('CRYPTO') || p === 'UNKNOWN/USDT' || !p.includes('USDT')) return false;
 
-    // Support all possible header permutations from Google Sheets
     const entry = Number(t.entryPriceUSDT || t['Entry Price (USDT)'] || t['Entry (USDT)'] || t.entryPrice || t.entry || t.Entry || 0);
     const exit = Number(t.exitPriceUSDT || t['Exit Price (USDT)'] || t['Exit (USDT)'] || t.exitPrice || t.exit || t.Exit || 0);
     if (isNaN(entry) || entry <= 0 || isNaN(exit) || exit <= 0) return false;
@@ -1122,11 +1027,8 @@ function sanitizeAndAuditTradeHistory(logs) {
   }).sort((a, b) => getTradeTimeMs(b) - getTradeTimeMs(a));
 }
 
-/**
- * Actively syncs and parses trades from both Master Ledger and Learning Sheet.
- */
 async function syncTradesFromGoogleSheets() {
-  const masterUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
+  const masterUrl = State.masterLedgerUrl;
 
   try {
     const fullUrl = masterUrl.includes('?') ? `${masterUrl}&action=GET_ALL` : `${masterUrl}?action=GET_ALL`;
@@ -1146,7 +1048,7 @@ async function syncTradesFromGoogleSheets() {
       return State.tradeLogs;
     }
   } catch (err) {
-    console.warn(`[Sync Ledger] Notice from Sisir_Quant_Trade_Ledger:`, err.message);
+    console.warn(`[Sync Ledger] Notice:`, err.message);
   }
   return State.tradeLogs;
 }
@@ -1159,13 +1061,13 @@ async function recordTradeToCloudLedger(trade) {
 
   const record = {
     ...trade,
+    action: 'RECORD_TRADE',
     id: tradeId,
     date: cleanDate,
     time: cleanTime,
     pnlINR: Number((trade.pnlUSDT * State.usdtToInrRate).toFixed(2))
   };
 
-  // Content fingerprint deduplication
   const timeMinute = cleanTime.slice(0, 5);
   const signature = `${record.pair}_${cleanDate}_${timeMinute}_${record.entryPriceUSDT}_${record.exitPriceUSDT}_${record.type}`;
   if (recentTradeDispatches.has(signature)) return;
@@ -1178,17 +1080,14 @@ async function recordTradeToCloudLedger(trade) {
   State.tradeLogs.unshift(record);
   saveDiskState();
 
-  // Async dispatch strictly to Sisir_Quant_Trade_Ledger endpoint
-  const targetUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
+  const targetUrl = State.masterLedgerUrl;
   try {
-    if (typeof fetch === 'function') {
-      fetch(targetUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(record)
-      }).catch(() => {});
-    }
-  } catch (e) {}
+    console.log(`[Cloud Ledger] Dispatching trade ${record.pair} (${record.type}) to Sisir_Quant_Trade_Ledger...`);
+    const res = await safePostJson(targetUrl, record, 10000);
+    console.log(`[Cloud Ledger Success] Successfully logged:`, JSON.stringify(res));
+  } catch (err) {
+    console.error(`[Cloud Ledger Error]`, err.message);
+  }
 
   learningEngine.recordTradeOutcome(
     record.pair.replace('/USDT', 'USDT'),
@@ -1207,6 +1106,7 @@ function saveDiskState() {
       activePositions: State.activePositions,
       recoveryBags: State.recoveryBags,
       tradeLogs: State.tradeLogs.slice(0, 150),
+      masterLedgerUrl: State.masterLedgerUrl,
       learningSheetUrl: State.learningSheetUrl
     };
     fs.writeFileSync(DISK_STATE_FILE, JSON.stringify(data, null, 2), 'utf-8');
@@ -1221,15 +1121,10 @@ function loadDiskState() {
       if (parsed.activePositions) State.activePositions = parsed.activePositions;
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
+      if (parsed.masterLedgerUrl) State.masterLedgerUrl = parsed.masterLedgerUrl;
       if (parsed.learningSheetUrl) State.learningSheetUrl = parsed.learningSheetUrl;
     }
   } catch (e) {}
-  // Ensure URLs are strictly locked to respective production endpoints
-  State.googleSheetUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
-  State.masterLedgerUrl = 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec';
-  if (!State.learningSheetUrl) {
-    State.learningSheetUrl = 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec';
-  }
 }
 
 // -------------------------------------------------------------
@@ -1239,7 +1134,6 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Native CORS headers
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -1248,7 +1142,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve static frontend files
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.static(__dirname));
 
@@ -1260,7 +1153,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'ONLINE', engine: 'Sisir Quant Production Engine' });
 });
 
-app.get(['/pnl_dashboard', '/pnl_dashboard.html', '/net_in_hand_p_l_audit_terminal.html'], (req, res) => {
+app.get(['/pnl_dashboard', '/pnl_dashboard.html'], (req, res) => {
   const pnlHtml = path.join(__dirname, 'pnl_dashboard.html');
   if (fs.existsSync(pnlHtml)) {
     return res.sendFile(pnlHtml);
@@ -1281,7 +1174,6 @@ app.get('/api/state', (req, res) => {
     activeThresholds: State.activeThresholds,
     marketRegime: State.marketRegime,
     usdtToInrRate: State.usdtToInrRate,
-    googleSheetUrl: State.googleSheetUrl,
     masterLedgerUrl: State.masterLedgerUrl,
     learningSheetUrl: State.learningSheetUrl,
     learningEngineState: learningEngine.state || {}
@@ -1334,26 +1226,6 @@ app.post('/api/trades/sync-strict-sheet', async (req, res) => {
   }
 });
 
-app.get('/api/settings/googlesheet/sync', async (req, res) => {
-  try {
-    const trades = await syncTradesFromGoogleSheets();
-    res.json({ success: true, count: trades.length });
-  } catch (err) {
-    res.json({ success: false, error: err.message });
-  }
-});
-
-app.get('/api/quota/reconcile', (req, res) => {
-  const count = State.tradeLogs.length;
-  res.json({
-    success: true,
-    executed24hCount: count,
-    quotaRemaining: '∞',
-    formattedReset: 'Dynamic Reserve Active',
-    rollingTrades24h: State.tradeLogs.slice(0, 20)
-  });
-});
-
 app.post('/api/drive/sync-files-now', async (req, res) => {
   try {
     if (req.body && req.body.learningSheetUrl) {
@@ -1365,7 +1237,6 @@ app.post('/api/drive/sync-files-now', async (req, res) => {
       learningEngine.trainOnHistoricalTrades(req.body.trades);
     }
 
-    // Trigger actual Google Drive writes
     const rLearning = await backupLearningStateToGoogleDrive();
     const rPortfolio = await backupPortfolioStateToGoogleDrive();
 
@@ -1455,26 +1326,22 @@ function connectBinanceGlobalStream() {
           const closePrice = parseFloat(t.c);
           if (isNaN(closePrice) || closePrice <= 0) return;
 
-          // Update Universe in-memory cache in real time
           if (State.universe[sym]) {
             State.universe[sym].priceUSDT = closePrice;
             State.universe[sym].priceINR = Number((closePrice * rate).toFixed(2));
           }
 
-          // Real-time sub-second updates for active positions
           if (State.activePositions[sym]) {
             State.activePositions[sym].livePriceUSDT = closePrice;
             activePriceChanged = true;
           }
 
-          // Real-time sub-second updates for recovery bags
           if (State.recoveryBags[sym]) {
             State.recoveryBags[sym].livePriceUSDT = closePrice;
             activePriceChanged = true;
           }
         });
 
-        // Fast-path: immediate sentry check if active position prices moved
         if (activePriceChanged) {
           runPredictiveSentry().catch(() => {});
         }
@@ -1554,28 +1421,57 @@ wss.on('connection', (ws) => {
         if (msg.sizingMode) State.portfolio.sizingMode = msg.sizingMode;
         saveDiskState();
         broadcastStateUpdate();
-      } else if (msg.type === 'SET_DYNAMIC_GOVERNOR') {
-        if (State.tradeFrequencyController) {
-          State.tradeFrequencyController.dynamicGovernorEnabled = Boolean(msg.enabled);
-        }
-        broadcastStateUpdate();
       } else if (msg.type === 'SET_GOOGLE_SHEET_URL') {
         if (msg.masterLedgerUrl) State.masterLedgerUrl = msg.masterLedgerUrl;
         if (msg.learningSheetUrl) State.learningSheetUrl = msg.learningSheetUrl;
         saveDiskState();
         broadcastStateUpdate();
-      } else if (msg.type === 'SYNC_P2P_RATE') {
-        broadcastStateUpdate();
-      } else if (msg.type === 'RECONCILE_QUOTA') {
-        broadcastStateUpdate();
       } else if (msg.type === 'CLOSE_POSITION' && msg.pairKey) {
-        delete State.activePositions[msg.pairKey];
-        saveDiskState();
-        broadcastStateUpdate();
+        const pos = State.activePositions[msg.pairKey];
+        if (pos) {
+          const livePrice = Number(State.universe[msg.pairKey]?.priceUSDT || pos.livePriceUSDT || pos.entryPriceUSDT);
+          const entryPrice = Number(pos.entryPriceUSDT || livePrice);
+          const notional = Number(pos.notionalUSDT || 10.05);
+          const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * notional).toFixed(4));
+          recordTradeToCloudLedger({
+            id: Date.now(),
+            pair: pos.pair || `${msg.pairKey.replace('USDT', '')}/USDT`,
+            type: realizedGain >= 0 ? 'MANUAL PROFIT' : 'MANUAL EXIT',
+            entryPriceUSDT: entryPrice,
+            exitPriceUSDT: livePrice,
+            notionalUSDT: notional,
+            pnlUSDT: realizedGain,
+            reason: `Manual position close at $${livePrice.toFixed(4)}`
+          }).catch(() => {});
+          State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + notional + realizedGain).toFixed(4));
+          State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+          delete State.activePositions[msg.pairKey];
+          saveDiskState();
+          broadcastStateUpdate();
+        }
       } else if (msg.type === 'CLOSE_RECOVERY_BAG' && msg.pairKey) {
-        delete State.recoveryBags[msg.pairKey];
-        saveDiskState();
-        broadcastStateUpdate();
+        const bag = State.recoveryBags[msg.pairKey];
+        if (bag) {
+          const livePrice = Number(State.universe[msg.pairKey]?.priceUSDT || bag.livePriceUSDT || bag.entryPriceUSDT);
+          const entryPrice = Number(bag.entryPriceUSDT || livePrice);
+          const notional = Number(bag.notionalUSDT || 10.05);
+          const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * notional).toFixed(4));
+          recordTradeToCloudLedger({
+            id: Date.now(),
+            pair: bag.pair || `${msg.pairKey.replace('USDT', '')}/USDT`,
+            type: realizedGain >= 0 ? 'RECOVERY MANUAL EXIT' : 'BAG LIQUIDATION',
+            entryPriceUSDT: entryPrice,
+            exitPriceUSDT: livePrice,
+            notionalUSDT: notional,
+            pnlUSDT: realizedGain,
+            reason: `Manual bag liquidation at $${livePrice.toFixed(4)}`
+          }).catch(() => {});
+          State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + notional + realizedGain).toFixed(4));
+          State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+          delete State.recoveryBags[msg.pairKey];
+          saveDiskState();
+          broadcastStateUpdate();
+        }
       }
     } catch (e) {}
   });
@@ -1586,24 +1482,19 @@ wss.on('connection', (ws) => {
 // -------------------------------------------------------------
 loadDiskState();
 
-// Initial screener run and background Google Sheets trade sync
 runDynamicScreener().then(() => {
   console.log('[Screener] Initialized', Object.keys(State.universe).length, 'Binance Spot USDT pairs.');
 }).catch(() => {});
 
 syncTradesFromGoogleSheets().catch(() => {});
-
-// Connect zero-latency Binance WebSocket stream (Singapore <5ms)
 connectBinanceGlobalStream();
 
-// Recurring 2-minute background sync with Google Sheets ledger & Drive
 setInterval(() => {
   syncTradesFromGoogleSheets().catch(() => {});
   backupLearningStateToGoogleDrive().catch(() => {});
   backupPortfolioStateToGoogleDrive().catch(() => {});
 }, 120000);
 
-// Fast 1.0s Sentry & Autopilot Evaluator
 setInterval(async () => {
   try {
     await runPredictiveSentry();
@@ -1613,13 +1504,9 @@ setInterval(async () => {
   }
 }, 1000);
 
-// 500ms Sub-Second Price Streamer (Ultra-Low Latency)
 setInterval(broadcastPriceStream, 500);
-
-// 60s Dynamic Screener Scan
 setInterval(runDynamicScreener, 60000);
 
-// Start listening
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
