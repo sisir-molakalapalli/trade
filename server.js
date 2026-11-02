@@ -724,11 +724,11 @@ async function runPredictiveSentry() {
     pos.peakHighPrice = Math.max(pos.peakHighPrice || entryPrice, livePrice);
     const peakGain = pos.peakGainPct;
 
-    // Ratchet 1: Breakeven lock at +0.35%
-    if (peakGain >= 0.35 && (pos.ratchetStage === 'INITIAL' || !pos.ratchetStage)) {
+    // Ratchet 1: Breakeven lock at +0.30%
+    if (peakGain >= 0.30 && (pos.ratchetStage === 'INITIAL' || !pos.ratchetStage)) {
       pos.ratchetStage = 'BREAKEVEN_LOCKED';
-      pos.sl = Number((entryPrice * 1.0010).toFixed(6)); // +0.10% covers commission
-      logOperation('SENTRY', `${pos.pair}: Breakeven locked (+0.10% covers fees). Peak: +${peakGain.toFixed(2)}%`, 'success');
+      pos.sl = Number((entryPrice * 1.0030).toFixed(6)); // +0.30% locked
+      logOperation('SENTRY', `${pos.pair}: Breakeven locked (+0.30%). Peak: +${peakGain.toFixed(2)}%`, 'success');
     }
 
     // Ratchet 2: Profit lock at +0.70%
