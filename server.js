@@ -750,23 +750,21 @@ async function runDynamicScreener() {
       const rangePct = low > 0 ? ((high - low) / low) * 100 : 0;
       const posInRange = (high - low) > 0 ? (last - low) / (high - low) : 0.5;
 
-      let isPumpDump = false;
-      let pumpDumpReason = '';
-
-      if (volQuote < 70000000 && (change24 >= 7.5 || rangePct >= 9.0)) {
-        const pdResult = await checkDormantPumpAndDumpTrap(sym, volQuote, change24, rangePct);
-        if (pdResult.isTrap) {
-          isPumpDump = true;
-          pumpDumpReason = pdResult.reason;
-        }
-      }
-
       let score = 60 + (posInRange * 22) + (Math.min(change24, 15) * 0.9);
       if (volQuote >= 10000000) score += 5;
       if (rangePct >= 5.0) score += 3;
 
-      if (isPumpDump) {
-        score = 0;
+      let isPumpDump = false;
+      let pumpDumpReason = '';
+
+      // High-performance optimization: evaluate daily klines only on qualified candidates
+      if (score >= 70 && volQuote < 70000000 && (change24 >= 7.5 || rangePct >= 9.0)) {
+        const pdResult = await checkDormantPumpAndDumpTrap(sym, volQuote, change24, rangePct);
+        if (pdResult.isTrap) {
+          isPumpDump = true;
+          pumpDumpReason = pdResult.reason;
+          score = 0;
+        }
       }
 
       universe[sym] = {
@@ -859,6 +857,117 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
   logOperation('EXECUTION', `BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT). Self-Aware Trailing Armed.`, 'success');
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
+}
+
+// -------------------------------------------------------------
+// AUTOPILOT ENTRY EVALUATION ENGINE (HIGH-VELOCITY 5 SLOTS)
+// -------------------------------------------------------------
+let isEvaluatingEntries = false;
+
+async function evaluateAutopilotEntries() {
+  if (!State.autopilotEnabled || isEvaluatingEntries) return;
+
+  const currentCount = Object.keys(State.activePositions || {}).length;
+  const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 5;
+  if (currentCount >= maxSlots) return;
+
+  const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
+  learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
+
+  const minScore = State.activeThresholds?.scoreThreshold || 70;
+  const keys = Object.keys(State.universe || {});
+  if (keys.length === 0) return;
+
+  const sorted = [...keys].sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
+
+  isEvaluatingEntries = true;
+  try {
+    let evaluatedCount = 0;
+    for (const k of sorted) {
+      if (Object.keys(State.activePositions || {}).length >= maxSlots) break;
+      const coin = State.universe[k];
+      if (!coin || !coin.symbol) continue;
+
+      if (coin.isPumpAndDump) continue;
+      if ((coin.score || 0) < minScore) break;
+
+      const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
+      const pairKey = `${baseSym}USDT`;
+      if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
+
+      if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
+
+      if (++evaluatedCount > 25) break;
+
+      const change24h = Number(coin.priceChangePct || coin.change24h || 0);
+      const rangePct = Number(coin.intradayRangePct || 0);
+      if (change24h < 0.20 && rangePct < 3.0) continue;
+
+      const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
+      if (posInRange < 0.40) continue;
+
+      // Check 1: Binance Futures Funding Rate Overcrowded Long Veto (< +0.05%)
+      const fundingRate = State.futuresFundingMap[pairKey];
+      if (fundingRate !== undefined && fundingRate > 0.05) {
+        logOperation('FUTURES_GUARD', `Blocked ${pairKey}: Funding rate is +${fundingRate}%/8h (Crowded long squeeze risk).`, 'warning');
+        continue;
+      }
+
+      // Check 2: Custom Dormant Pump & Dump Trap (<$70M quote volume)
+      const volQuote = (coin.volumeM || 0) * 1000000;
+      if (volQuote < 70000000 && (change24h >= 7.5 || rangePct >= 9.0)) {
+        const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
+        if (pdCheck.isTrap) {
+          logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pdCheck.reason}`, 'danger');
+          continue;
+        }
+      }
+
+      // Check 3: Wyckoff Order Flow & Taker Buy CVD
+      const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
+      if (!orderFlow.passed) continue;
+
+      // Check 4: Microstructure Momentum & 15m VWAP
+      const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
+      if (!microMom.passed) continue;
+
+      // Check 5: 1h 20-EMA Macro Trend Alignment
+      const trend1h = await check1hTrendAlignment(pairKey);
+      if (!trend1h.passed) continue;
+
+      // Check 6: Time Machine 48-Candle Replay Odds Gate
+      const timeMachine = await evaluateTimeMachineBreakoutOdds(pairKey);
+      if (!timeMachine.passed) {
+        logOperation('TM_REJECT', `${pairKey} halted: TM odds ${timeMachine.oddsPct}% < ${timeMachine.minOddsRequired}% required continuation proof.`, 'warning');
+        continue;
+      }
+
+      logOperation('TM_PASSED', `${pairKey} PASSED Time Machine (${timeMachine.oddsPct}% odds). Inspecting live 20-depth Order Book...`, 'info');
+
+      // Check 7: 20-Level Real Order Book Liquidity & Spread Gate
+      let book = await fetchRealOrderBookDepth(pairKey);
+      if (!book) {
+        book = {
+          obi: Number(coin.obi || 0.55),
+          spreadPct: 0.05,
+          bestBid: Number(coin.priceUSDT || 1.0),
+          bestAsk: Number(coin.priceUSDT || 1.0) * 1.0005
+        };
+      }
+
+      if (book.obi < 0.40 || book.spreadPct > 0.25) {
+        logOperation('BOOK_VETO', `${pairKey} halted post-TM: OBI ${Math.round(book.obi * 100)}% (req >= 40%) or Spread ${book.spreadPct.toFixed(2)}% (req <= 0.25%).`, 'warning');
+        continue;
+      }
+
+      logOperation('BOOK_CLEAR', `${pairKey} Order Book verified: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%. Deploying capital...`, 'success');
+
+      console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, TM Odds ${timeMachine.oddsPct}%, 15m ${microMom.change15mPct}%`);
+      await executeSpotBuy(pairKey, coin, book, microMom);
+    }
+  } finally {
+    isEvaluatingEntries = false;
+  }
 }
 
 // -------------------------------------------------------------
@@ -1662,7 +1771,8 @@ function broadcastStateUpdate() {
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
     tradeLogs: State.tradeLogs,
-    subsystems: State.subsystems
+    subsystems: State.subsystems,
+    universe: State.universe
   });
   wss.clients.forEach(c => {
     if (c.readyState === WebSocket.OPEN) c.send(msg);
