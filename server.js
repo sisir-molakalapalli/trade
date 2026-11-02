@@ -97,8 +97,8 @@ const State = {
     pacingMode: 'HIGH_VELOCITY'
   },
   usdtToInrRate: 94.94,
-  masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbw3cTF2Q3X-2XZVlXRsBKp72Wx3esBn1O_jrMfvxPjMwTl0y2Lh9yW6_46tg/exec',
-  learningSheetUrl: 'https://script.google.com/macros/s/AKfycbxzrxMMqOXehqTy3id5Z7Flr6Hbz9Tyz3XnDEgb8NaNPvO2RsvvUD-qNxKIEmOx3s9z/exec'
+  masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbwwFkRk4O2oJYmgrRcQBpx3z5KBKEOCJoX6YzL1yJXdot93V1T08ewIGaF78O1n6Z1ktg/exec',
+  learningSheetUrl: 'https://script.google.com/macros/s/AKfycbwut72lTkCVcqIV2k7YlzlsIOwO3GXCKqlF-4UBxvTvJHckJApKKxzbfFp5JN0VLND8/exec'
 };
 
 // -------------------------------------------------------------
@@ -1398,10 +1398,16 @@ function loadDiskState() {
       if (parsed.activePositions) State.activePositions = parsed.activePositions;
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
-      if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
+      if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
         State.masterLedgerUrl = parsed.masterLedgerUrl;
+      } else {
+        State.masterLedgerUrl = 'https://script.google.com/macros/s/AKfycbwwFkRk4O2oJYmgrRcQBpx3z5KBKEOCJoX6YzL1yJXdot93V1T08ewIGaF78O1n6Z1ktg/exec';
       }
-      if (parsed.learningSheetUrl) State.learningSheetUrl = parsed.learningSheetUrl;
+      if (parsed.learningSheetUrl && !parsed.learningSheetUrl.includes('AKfycbxzrxMMq')) {
+        State.learningSheetUrl = parsed.learningSheetUrl;
+      } else {
+        State.learningSheetUrl = 'https://script.google.com/macros/s/AKfycbwut72lTkCVcqIV2k7YlzlsIOwO3GXCKqlF-4UBxvTvJHckJApKKxzbfFp5JN0VLND8/exec';
+      }
     }
   } catch (e) {}
 }
