@@ -76,14 +76,14 @@ const State = {
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 15, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M+)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
-    regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 75, liveObiGatePct: 45 },
+    regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 70, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% Floor • Self-Aware Apex Harvest' },
     recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Step 1 (+0.30% Target) / >3h Self-Aware Relief Trail', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
   marketRegime: 'BALANCED',
-  activeThresholds: { regime: 'BALANCED', scoreThreshold: 75, obiThreshold: 0.45, maxSpread: 0.20, marketAvgRange: 4.5 },
+  activeThresholds: { regime: 'BALANCED', scoreThreshold: 70, obiThreshold: 0.45, maxSpread: 0.20, marketAvgRange: 4.5 },
   tradeFrequencyController: {
     dynamicGovernorEnabled: true,
     quotaBypassEnabled: false,
@@ -183,6 +183,32 @@ function logOperation(category, message, level = 'info') {
 }
 
 // -------------------------------------------------------------
+// IN-MEMORY ZERO-LATENCY KLINE CACHE (ELIMINATES BINANCE RATE LIMITS)
+// -------------------------------------------------------------
+const klineCache = new Map();
+async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
+  const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+  const cacheKey = `${pairSym}_${interval}_${limit}`;
+  const now = Date.now();
+  const cached = klineCache.get(cacheKey);
+
+  if (cached && (now - cached.timestamp) < 20000) {
+    return cached.data;
+  }
+
+  const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=${interval}&limit=${limit}`;
+  const data = await safeFetch(url, timeoutMs);
+
+  if (Array.isArray(data) && data.length > 0) {
+    klineCache.set(cacheKey, { timestamp: now, data });
+  } else if (data && data.code && data.code < 0) {
+    console.warn(`[Binance API Notice] ${pairSym} returned: ${data.msg || data.code}`);
+  }
+  return data;
+}
+
+// -------------------------------------------------------------
 // BITCOIN MACRO & PUMP-AND-DUMP SHIELDS
 // -------------------------------------------------------------
 async function checkBtcMacroWeatherShield() {
@@ -258,8 +284,8 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=5m&limit=16`;
-    const klines = await safeFetch(url, 3000);
+    const klines = await getCachedKlines(pairSym, '5m', 16, 3000);
+
     if (!Array.isArray(klines) || klines.length < 3) {
       return { passed: true, takerBuyRatio: 50, recent3Delta: 0, vsaPattern: 'FALLBACK' };
     }
@@ -305,8 +331,7 @@ async function checkSelfAwareOrderFlow(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=5m&limit=5`;
-    const klines = await safeFetch(url, 2500);
+    const klines = await getCachedKlines(pairSym, '5m', 5, 2500);
 
     if (!Array.isArray(klines) || klines.length < 3) {
       return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50 };
@@ -344,8 +369,7 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=15m&limit=20`;
-    const klines = await safeFetch(url, 3500);
+    const klines = await getCachedKlines(pairSym, '15m', 20, 3500);
 
     if (!Array.isArray(klines) || klines.length < 8) {
       return { passed: false, reason: 'Insufficient 15m klines' };
@@ -396,13 +420,13 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       return { passed: false, reason: `Price below 15m VWAP ($${curClose.toFixed(4)} < $${vwap4h.toFixed(4)})` };
     }
 
-    const isTrackA = (change15mPct >= 0.40 && rvol >= 1.05 && distFrom4hHighPct <= 4.50);
-    const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 5.00 && (change1hPct >= 0.60 || curChange15m >= 0.25));
+    const isTrackA = (change15mPct >= 0.35 && rvol >= 1.00 && distFrom4hHighPct <= 5.50);
+    const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 6.00 && (change1hPct >= 0.50 || curChange15m >= 0.20));
 
     if (!isTrackA && !isTrackB) {
       return { 
         passed: false, 
-        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%, HighDist: ${distFrom4hHighPct.toFixed(2)}%)` 
+        reason: `Dual-Track Momentum: 15m ${change15mPct.toFixed(2)}%, RVOL ${rvol.toFixed(2)}x, 1h ${change1hPct.toFixed(2)}%, PeakDist ${distFrom4hHighPct.toFixed(2)}%` 
       };
     }
 
@@ -424,8 +448,8 @@ async function check1hTrendAlignment(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=1h&limit=24`;
-    const klines = await safeFetch(url, 3000);
+    const klines = await getCachedKlines(pairSym, '1h', 24, 3000);
+
     if (!Array.isArray(klines) || klines.length < 20) {
       return { passed: true, reason: 'Fallback pass' };
     }
@@ -436,7 +460,7 @@ async function check1hTrendAlignment(symbol) {
       const c = parseFloat(klines[i][4]);
       ema = (c * k) + (ema * (1 - k));
     }
-    if (curClose < (ema * 0.997)) {
+    if (curClose < (ema * 0.995)) {
       return { passed: false, reason: `Price below 1h 20-EMA ($${curClose.toFixed(4)} < $${ema.toFixed(4)})` };
     }
     return { passed: true, ema1h: Number(ema.toFixed(4)) };
@@ -588,9 +612,9 @@ async function runDynamicScreener() {
 
     State.universe = universe;
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
-    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75 && !c.isPumpAndDump).length;
+    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 70 && !c.isPumpAndDump).length;
 
-    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 75).`, 'info');
+    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 70).`, 'info');
     broadcastStateUpdate();
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
@@ -601,24 +625,46 @@ async function runDynamicScreener() {
 // AUTOPILOT ENTRY EVALUATOR (3 SLOTS & MAX 5 RECOVERY BAGS)
 // -------------------------------------------------------------
 let isEvaluatingEntries = false;
+let lastStandbyNotice = 0;
+let lastBagHoldNotice = 0;
+let lastBtcPauseNotice = 0;
+const candidateCooldownMemo = new Map();
 
 async function evaluateAutopilotEntries() {
   if (!State.autopilotEnabled || isEvaluatingEntries) return;
 
   const currentCount = Object.keys(State.activePositions || {}).length;
   const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 3;
-  if (currentCount >= maxSlots) return;
+  if (currentCount >= maxSlots) {
+    if (Date.now() - lastStandbyNotice > 30000) {
+      lastStandbyNotice = Date.now();
+      logOperation('AUTOPILOT', `All ${maxSlots} breakout slots occupied (${currentCount}/${maxSlots}). Monitoring trailing sentry.`, 'info');
+    }
+    return;
+  }
 
   const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
   const maxBagsLimit = State.tradeFrequencyController?.maxRecoveryBagsLimit || 5;
-  if (activeBagsCount >= maxBagsLimit) return;
+  if (activeBagsCount >= maxBagsLimit) {
+    if (Date.now() - lastBagHoldNotice > 30000) {
+      lastBagHoldNotice = Date.now();
+      logOperation('AUTOPILOT', `Max recovery bags active (${activeBagsCount}/${maxBagsLimit}). Awaiting relief recoveries before opening fresh trades.`, 'warning');
+    }
+    return;
+  }
 
   const isBtcHealthy = await checkBtcMacroWeatherShield();
-  if (!isBtcHealthy) return;
+  if (!isBtcHealthy) {
+    if (Date.now() - lastBtcPauseNotice > 30000) {
+      lastBtcPauseNotice = Date.now();
+      logOperation('BTC_WEATHER', `Entries paused: ${State.subsystems.btcMacroGate.reason}`, 'warning');
+    }
+    return;
+  }
 
   learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
 
-  const minScore = State.activeThresholds?.scoreThreshold || 75;
+  const minScore = State.activeThresholds?.scoreThreshold || 70;
   const keys = Object.keys(State.universe || {});
   if (keys.length === 0) return;
 
@@ -627,6 +673,8 @@ async function evaluateAutopilotEntries() {
   isEvaluatingEntries = true;
   try {
     let evaluatedCount = 0;
+    const now = Date.now();
+
     for (const k of sorted) {
       if (Object.keys(State.activePositions || {}).length >= maxSlots) break;
       if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
@@ -642,35 +690,52 @@ async function evaluateAutopilotEntries() {
       const pairKey = `${baseSym}USDT`;
       if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
 
-      if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
+      if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > now) continue;
 
-      if (++evaluatedCount > 25) break;
+      // Candidate Cooldown Memo: Skip pairs tested in the last 25 seconds to advance down the list
+      const nextAllowed = candidateCooldownMemo.get(pairKey) || 0;
+      if (nextAllowed > now) continue;
+
+      if (++evaluatedCount > 8) break;
 
       const change24h = Number(coin.priceChangePct || coin.change24h || 0);
       const rangePct = Number(coin.intradayRangePct || 0);
       if (change24h < 0.20 && rangePct < 3.0) continue;
 
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
-      if (posInRange < 0.45) continue;
+      if (posInRange < 0.40) continue;
 
       // Secondary Pre-Flight Pump & Dump Trap Veto
       const volQuote = (coin.volumeM || 0) * 1000000;
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
         const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
         if (pdCheck.isTrap) {
+          candidateCooldownMemo.set(pairKey, now + 120000);
           logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pdCheck.reason}`, 'danger');
           continue;
         }
       }
 
       const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
-      if (!orderFlow.passed) continue;
+      if (!orderFlow.passed) {
+        candidateCooldownMemo.set(pairKey, now + 25000);
+        logOperation('FLOW_VETO', `${pairKey} halted: ${orderFlow.reason || 'Negative Taker CVD'}`, 'warning');
+        continue;
+      }
 
       const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
-      if (!microMom.passed) continue;
+      if (!microMom.passed) {
+        candidateCooldownMemo.set(pairKey, now + 25000);
+        logOperation('MOM_VETO', `${pairKey} halted: ${microMom.reason}`, 'warning');
+        continue;
+      }
 
       const trend1h = await check1hTrendAlignment(pairKey);
-      if (!trend1h.passed) continue;
+      if (!trend1h.passed) {
+        candidateCooldownMemo.set(pairKey, now + 25000);
+        logOperation('TREND_VETO', `${pairKey} halted: ${trend1h.reason}`, 'warning');
+        continue;
+      }
 
       let book = await fetchRealOrderBookDepth(pairKey);
       if (!book) {
@@ -683,6 +748,7 @@ async function evaluateAutopilotEntries() {
       }
 
       if (book.obi < 0.45 || book.spreadPct > 0.20) {
+        candidateCooldownMemo.set(pairKey, now + 25000);
         logOperation('BOOK_VETO', `${pairKey} halted: OBI ${Math.round(book.obi * 100)}% (req >= 45%) or Spread ${book.spreadPct.toFixed(2)}% (req <= 0.20%).`, 'warning');
         continue;
       }
