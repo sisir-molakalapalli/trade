@@ -144,17 +144,7 @@ class LearningEngine {
     }
   }
 
-  restoreFromDrivePayload(payload) {
-    if (!payload) return;
-    const ls = payload.learningState || payload;
-    if (ls.assetReputations) this.state.assetReputations = { ...this.state.assetReputations, ...ls.assetReputations };
-    if (ls.bagSaturation24h !== undefined) this.state.bagSaturation24h = ls.bagSaturation24h;
-    if (ls.dynamicHurdles) this.state.dynamicHurdles = { ...this.state.dynamicHurdles, ...ls.dynamicHurdles };
-    if (Array.isArray(ls.failureClusters)) this.state.failureClusters = ls.failureClusters;
-    this.saveState();
-  }
-
-  createEntrySnapshot(sym, coinData, book, shortTerm, timeMachineOdds, btcMacro) {
+  createEntrySnapshot(sym, coinData, book, shortTerm, btcMacro) {
     return {
       timestamp: Date.now(),
       symbol: sym,
@@ -175,9 +165,7 @@ class LearningEngine {
         change24hPct: coinData?.priceChangePct || coinData?.change24h || 0,
         pricePositionInRange: coinData?.pricePositionInRange || 0.7,
         rvol: shortTerm?.rvol || 1.0,
-        timeMachineWinOdds: timeMachineOdds || 55,
-        btc15mMomentum: btcMacro?.btcChange15m || 0,
-        upperWickRatio: coinData?.lastUpperWickRatio || 0.20
+        btc15mMomentum: btcMacro?.btcChange15m || 0
       }
     };
   }
@@ -210,11 +198,11 @@ class LearningEngine {
     if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('VELOCITY') || outcomeType.includes('TRAILING')) {
       multiplier = 1.12;
       rep.wins++;
-      attributionReason = `Instant-on trailing / velocity win (+${pnl.toFixed(2)}$). Credit score boosted.`;
+      attributionReason = `Trailing / velocity win (+${pnl.toFixed(2)}$). Credit score boosted.`;
     } else if (outcomeType.includes('HARD DISASTER') || outcomeType.includes('-6.50%') || pnl < -2.0) {
       multiplier = 0.50;
       rep.disasters++;
-      attributionReason = `🚨 Catastrophic breakdown cut ($${pnl.toFixed(2)}). Severe penalty applied.`;
+      attributionReason = `Catastrophic breakdown cut ($${pnl.toFixed(2)}). Severe penalty applied.`;
     } else if (outcomeType.includes('RECOVERY') || outcomeType.includes('STEP') || outcomeType.includes('VWAP RELIEF')) {
       multiplier = hours >= 12 ? 0.88 : 0.96;
       attributionReason = `Routine bag resolution (${hours.toFixed(1)}h). Capital preserved.`;
@@ -247,8 +235,12 @@ class LearningEngine {
   }
 
   recalculateDynamicHurdles(activeBagsCount = 0, rollingTrades24hCount = 0) {
+    let offset = 0;
+    if (activeBagsCount > 0) {
+      offset = Math.min(6, activeBagsCount * 2);
+    }
     this.state.dynamicHurdles = {
-      scoreOffset: 0,
+      scoreOffset: offset,
       wickCeiling: 0.40,
       minOddsRequired: 45
     };
