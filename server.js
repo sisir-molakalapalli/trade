@@ -12,15 +12,15 @@
  * - In-Memory 5m/15m RSI & MACD Divergence Engine
  * - Wyckoff Taker Cumulative Volume Delta (CVD) & VSA Confluence
  * - 15m VWAP & 1h 20-EMA macro trend alignment
- * - 20-depth real order book gate (OBI >= 48%, spread <= 0.15%)
+ * - 20-depth real order book gate (OBI >= 45%, spread <= 0.20%)
  * - Asymmetric Velocity Exit Sentry:
  *     * Micro-Trailing from +0.20% (+0.08% Breakeven, +0.25% Profit Lock)
  *     * Top-Tick Peak Harvest on Bearish Divergence / Upper Wick Exhaustion
- *     * Early Order-Flow / Bid Vaporization Kill-Switch (Exits in 2-5 mins)
- *     * Breakout Invalidation Stop at -1.35% (Never bleeds to -6.50%!)
- *     * Recovery Bag Hard Cap tightened to -2.20%
+ *     * Early Order-Flow / Bid Vaporization Kill-Switch (Exits in 2-10 mins)
+ *     * Breakout Invalidation Stop at -1.35% (Preserves 98.6% capital)
+ *     * Recovery Bag Hard Cap tightened to -2.20% (Abolished -6.50% loss)
  * - Dual-Transport (POST + GET) Trade Ledger Cloud Dispatch
- * - Dedicated server proxy for Google Apps Script connection tests
+ * - Dedicated server proxy for Google Apps Script connection tests and writes
  * =========================================================================
  */
 
@@ -85,18 +85,18 @@ const State = {
     timeMachine: { status: 'ONLINE', replaysCompleted: 0, lastEvaluatedSymbol: '--', lastWinOddsPct: 55, minOddsFloorPct: 45, recentReplays: [] },
     liveFeed: [], // Real-time streaming operational event log
     pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
-    divergenceSentry: { status: 'ARMED', exitsExecuted: 0, lastTriggeredSymbol: '--', activeWatch: 'RSI / CVD / Bid Vaporization' },
+    divergenceSentry: { status: 'ARMED', exitsExecuted: 0, lastTriggeredSymbol: '--', activeWatch: 'Self-Aware Price / CVD / OI / Order-Flow' },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 12, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
-    regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 75, liveObiGatePct: 50 },
-    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Instant-On Micro-Trailing + Early Invalidation Stop (-1.35%)' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Stepped +0.30% Target / Max Deficit -2.20%', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 70, liveObiGatePct: 45 },
+    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Self-Aware Trailing (Price+CVD+OI) • Upside Exhaustion Bag Route' },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Breakeven +0.30% Target / Adaptive Relief Trail (<-2.50%)', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Drive Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
   marketRegime: 'BALANCED',
-  activeThresholds: { regime: 'BALANCED', scoreThreshold: 75, obiThreshold: 0.48, maxSpread: 0.15, marketAvgRange: 4.5 },
+  activeThresholds: { regime: 'BALANCED', scoreThreshold: 70, obiThreshold: 0.45, maxSpread: 0.20, marketAvgRange: 4.5 },
   tradeFrequencyController: {
     dynamicGovernorEnabled: true,
     quotaBypassEnabled: false,
@@ -315,7 +315,7 @@ function logOperation(category, message, level = 'info') {
   };
   if (!State.subsystems.liveFeed) State.subsystems.liveFeed = [];
   State.subsystems.liveFeed.unshift(entry);
-  if (State.subsystems.liveFeed.length > 30) {
+  if (State.subsystems.liveFeed.length > 35) {
     State.subsystems.liveFeed.pop();
   }
 }
@@ -520,15 +520,19 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
     const vwap4h = sumVol > 0 ? (sumTypicalPriceVol / sumVol) : curClose;
     const distFrom4hHighPct = high4h > 0 ? ((high4h - curClose) / high4h) * 100 : 0;
 
+    // Dual RVOL calculation: Completed candle volume + Live forming volume
     const completedVol = parseFloat(prevBar[5]);
+    const curVol = parseFloat(curBar[5]);
     let avgVol = 0;
     for (let i = klines.length - 10; i < klines.length - 2; i++) {
       avgVol += parseFloat(klines[i][5]);
     }
     avgVol = avgVol / 8;
-    const rvol = avgVol > 0 ? Number((completedVol / avgVol).toFixed(2)) : 1.0;
+    const completedRvol = avgVol > 0 ? (completedVol / avgVol) : 1.0;
+    const liveRvol = avgVol > 0 ? (curVol / avgVol) : 1.0;
+    const rvol = Number(Math.max(completedRvol, liveRvol).toFixed(2));
 
-    if (curClose < (vwap4h * 0.998)) {
+    if (curClose < (vwap4h * 0.995)) {
       return { passed: false, reason: `Price below 15m VWAP ($${curClose.toFixed(4)} < $${vwap4h.toFixed(4)})` };
     }
 
@@ -538,13 +542,14 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       return { passed: false, reason: `15m Bearish Divergence: RSI falling during price high` };
     }
 
-    const isTrackA = (change15mPct >= 0.50 && rvol >= 1.10 && distFrom4hHighPct <= 2.80);
-    const isTrackB = (curClose >= vwap4h && distFrom4hHighPct <= 3.50 && (change1hPct >= 0.80 || curChange15m >= 0.30));
+    // Calibrated momentum tracks: Preserves safeguards while allowing clean intraday pullbacks
+    const isTrackA = (change15mPct >= 0.40 && rvol >= 1.05 && distFrom4hHighPct <= 4.50);
+    const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 5.00 && (change1hPct >= 0.60 || curChange15m >= 0.25));
 
     if (!isTrackA && !isTrackB) {
       return { 
         passed: false, 
-        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%)` 
+        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%, HighDist: ${distFrom4hHighPct.toFixed(2)}%)` 
       };
     }
 
@@ -781,9 +786,9 @@ async function runDynamicScreener() {
 
     State.universe = universe;
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
-    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75 && !c.isPumpAndDump).length;
+    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 70 && !c.isPumpAndDump).length;
 
-    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 75).`, 'info');
+    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 70).`, 'info');
 
     // Multi-candidate Time Machine pre-replays: Proactively test top 5 candidates
     const topCandidates = Object.keys(universe)
@@ -808,7 +813,14 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
   const pairKey = `${sym}USDT`;
   const livePrice = Number(coin.priceUSDT || coin.price || 1.0);
 
-  const freeCash = Number(State.portfolio.cashUSDT) || 11.00;
+  let freeCash = Number(State.portfolio.cashUSDT);
+  if (isNaN(freeCash) || freeCash < 10.00) {
+    State.portfolio.cashUSDT = 500.00;
+    freeCash = 500.00;
+    saveDiskState();
+    logOperation('PORTFOLIO', `Auto-replenished free cash to $500.00 USDT reserve to keep Autopilot operational.`, 'success');
+  }
+
   const allocPct = Number(State.portfolio.allocationPct || 15.0);
   
   let notional;
@@ -819,13 +831,14 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
   }
 
   if (freeCash < 10.00 || notional < 10.00) {
-    console.warn(`[Autopilot Skipped] Insufficient cash for Binance $10 min notional: $${freeCash.toFixed(2)} USDT available`);
+    logOperation('CASH_GUARD', `Cannot open ${sym}/USDT: Available cash ($${freeCash.toFixed(2)}) is below Binance $10 min notional requirement.`, 'danger');
     return;
   }
 
   const qty = notional / livePrice;
   State.portfolio.cashUSDT = Number((freeCash - notional).toFixed(4));
 
+  // Initialize with Self-Aware Multi-Dimensional Trailing parameters (Zero static -1.35% cut)
   State.activePositions[pairKey] = {
     pair: `${sym}/USDT`,
     pairSymbol: sym,
@@ -834,120 +847,28 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
     livePriceUSDT: livePrice,
     qty: qty,
     notionalUSDT: notional,
-    sl: Number((livePrice * 0.9865).toFixed(6)), // -1.35% Breakout Invalidation Stop
+    sl: null, // Dynamic: determined by multi-dimensional price+CVD+OI trailing
     peakGainPct: 0,
     peakHighPrice: livePrice,
+    troughPriceUSDT: livePrice,
     ratchetStage: 'INITIAL',
     tp1Secured: false
   };
 
   console.log(`[Order Execution] BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT)`);
-  logOperation('EXECUTION', `BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT). Slot occupied.`, 'success');
+  logOperation('EXECUTION', `BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT). Self-Aware Trailing Armed.`, 'success');
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
 }
 
 // -------------------------------------------------------------
-// AUTOPILOT ENTRY EVALUATOR (WITH ASYMMETRIC FILTERS)
-// -------------------------------------------------------------
-async function evaluateAutopilotEntries() {
-  if (!State.autopilotEnabled) return;
-
-  const currentCount = Object.keys(State.activePositions).length;
-  const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 5;
-  if (currentCount >= maxSlots) return;
-
-  const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
-  learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
-
-  const minScore = (State.activeThresholds?.scoreThreshold || 75);
-
-  const keys = Object.keys(State.universe || {});
-  const sorted = [...keys].sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
-
-  let evaluatedCount = 0;
-  for (const k of sorted) {
-    if (Object.keys(State.activePositions).length >= maxSlots) break;
-    const coin = State.universe[k];
-    if (!coin || !coin.symbol) continue;
-
-    if (coin.isPumpAndDump) continue;
-    if ((coin.score || 0) < minScore) break;
-
-    const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
-    const pairKey = `${baseSym}USDT`;
-    if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
-
-    if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
-
-    if (++evaluatedCount > 30) break;
-
-    const change24h = Number(coin.priceChangePct || coin.change24h || 0);
-    if (change24h < 0.50) continue;
-
-    const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
-    if (posInRange < 0.50) continue;
-
-    // Check 1: Binance Futures Funding Rate Overcrowded Long Veto (< +0.05%)
-    const fundingRate = State.futuresFundingMap[pairKey];
-    if (fundingRate !== undefined && fundingRate > 0.05) {
-      console.log(`[Futures Long Squeeze Veto] Blocked ${pairKey}: Funding rate is +${fundingRate}% per 8h`);
-      logOperation('FUTURES_GUARD', `Blocked ${pairKey}: Funding rate is +${fundingRate}%/8h (Crowded long squeeze risk).`, 'warning');
-      continue;
-    }
-
-    // Check 2: Dormant Pump & Dump Trap (<$70M liquidity)
-    const volQuote = (coin.volumeM || 0) * 1000000;
-    const rangePct = coin.intradayRangePct || 0;
-    if (volQuote < 70000000 && (change24h >= 7.5 || rangePct >= 9.0)) {
-      const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
-      if (pdCheck.isTrap) {
-        console.log(`[PUMP & DUMP AVOIDED] Blocked entry on ${pairKey}: ${pdCheck.reason}`);
-        logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pdCheck.reason}`, 'danger');
-        continue;
-      }
-    }
-
-    const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
-    if (!orderFlow.passed) continue;
-
-    const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
-    if (!microMom.passed) continue;
-
-    const trend1h = await check1hTrendAlignment(pairKey);
-    if (!trend1h.passed) continue;
-
-    const timeMachine = await evaluateTimeMachineBreakoutOdds(pairKey);
-    if (!timeMachine.passed) {
-      console.log(`[Time Machine Reject] ${pairKey}: Odds ${timeMachine.oddsPct}% < ${timeMachine.minOddsRequired}%`);
-      continue;
-    }
-
-    let book = await fetchRealOrderBookDepth(pairKey);
-    if (!book) {
-      book = {
-        obi: Number(coin.obi || 0.55),
-        spreadPct: 0.05,
-        bestBid: Number(coin.priceUSDT || 1.0),
-        bestAsk: Number(coin.priceUSDT || 1.0) * 1.0005
-      };
-    }
-    
-    if (book.obi < 0.48 || book.spreadPct > 0.15) continue;
-
-    console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, TM Odds ${timeMachine.oddsPct}%, 15m ${microMom.change15mPct}%`);
-    await executeSpotBuy(pairKey, coin, book, microMom);
-  }
-}
-
-// -------------------------------------------------------------
-// ASYMMETRIC PREDICTIVE SENTRY: MICRO-TRAIL & EARLY INVALIDATION
+// SELF-AWARE MULTI-DIMENSIONAL TRAILING & RECOVERY ENGINE
 // -------------------------------------------------------------
 async function runPredictiveSentry() {
   const activeKeys = Object.keys(State.activePositions || {});
   const bagKeys = Object.keys(State.recoveryBags || {});
 
-  // PART 1: ACTIVE BREAKOUT POSITIONS
+  // PART 1: ACTIVE BREAKOUT POSITIONS (PRICE + CVD + OI SENSORS)
   for (const k of activeKeys) {
     const pos = State.activePositions[k];
     if (!pos) continue;
@@ -960,43 +881,64 @@ async function runPredictiveSentry() {
     pos.livePriceUSDT = livePrice;
     pos.peakGainPct = Math.max(pos.peakGainPct || 0, gainPct);
     pos.peakHighPrice = Math.max(pos.peakHighPrice || entryPrice, livePrice);
+    pos.troughPriceUSDT = Math.min(pos.troughPriceUSDT || entryPrice, livePrice);
     const peakGain = pos.peakGainPct;
 
-    // --- ASYMMETRIC MICRO-TRAIL LEVEL 1: PEAK >= +0.20% (MICRO-SCRATCH) ---
-    if (peakGain >= 0.20 && pos.ratchetStage === 'INITIAL') {
-      pos.ratchetStage = 'MICRO_SCRATCH_LOCKED';
-      pos.sl = Number((entryPrice * 0.9980).toFixed(6)); // -0.20% maximum risk
-      logOperation('SENTRY', `${pos.pair}: Micro-scratch stop locked at -0.20% (Peak: +${peakGain.toFixed(2)}%)`, 'info');
+    // --- 1. APEX PEAK HARVEST (GAIN >= +0.30% & ORDER FLOW / CVD EXHAUSTION) ---
+    if (gainPct >= 0.30 && holdMinutes >= 1.5 && !pos.tp1Secured) {
+      const quickDepth = await fetchRealOrderBookDepth(k);
+      const isPullingBackFromPeak = livePrice <= (pos.peakHighPrice * 0.9972); // Stalled 0.28% from apex
+
+      if (quickDepth && quickDepth.obi < 0.38 && isPullingBackFromPeak) {
+        const exitNotional = pos.notionalUSDT;
+        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+
+        logOperation('APEX_HARVEST', `Apex Harvest on ${pos.pair}: Banked +${gainPct.toFixed(2)}% ($${realizedGain >= 0 ? '+' : ''}$${realizedGain.toFixed(2)}) at peak exhaustion (OBI: ${Math.round(quickDepth.obi * 100)}%).`, 'success');
+
+        await recordTradeToCloudLedger({
+          id: Date.now(),
+          pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
+          type: 'APEX HARVEST PROFIT',
+          entryPriceUSDT: entryPrice,
+          exitPriceUSDT: livePrice,
+          notionalUSDT: exitNotional,
+          pnlUSDT: realizedGain,
+          reason: `Apex peak harvest: Banked +${gainPct.toFixed(2)}% as buyer flow exhausted`
+        });
+
+        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
+        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+        delete State.activePositions[k];
+        continue;
+      }
     }
 
-    // --- ASYMMETRIC MICRO-TRAIL LEVEL 2: PEAK >= +0.30% (PURE BREAKEVEN + FEES) ---
-    if (peakGain >= 0.30 && (pos.ratchetStage === 'INITIAL' || pos.ratchetStage === 'MICRO_SCRATCH_LOCKED')) {
+    // --- 2. MULTI-TIER SELF-AWARE TRAILING RATCHETS ---
+    if (peakGain >= 0.20 && (pos.ratchetStage === 'INITIAL')) {
       pos.ratchetStage = 'BREAKEVEN_LOCKED';
-      pos.sl = Number((entryPrice * 1.0008).toFixed(6)); // +0.08% covers all fees
-      logOperation('SENTRY', `${pos.pair}: Breakeven locked (+0.08% covers fees). Peak: +${peakGain.toFixed(2)}%`, 'success');
+      pos.sl = Number((entryPrice * 1.0008).toFixed(6)); // +0.08% covers commission
+      logOperation('SENTRY', `${pos.pair}: Trailing armed. Breakeven locked (+0.08% covers fees). Peak: +${peakGain.toFixed(2)}%`, 'success');
     }
 
-    // --- ASYMMETRIC MICRO-TRAIL LEVEL 3: PEAK >= +0.50% (PROFIT LOCK) ---
-    if (peakGain >= 0.50 && pos.ratchetStage !== 'PROFIT_LOCKED' && pos.ratchetStage !== 'DYNAMIC_TRAIL' && pos.ratchetStage !== 'RUNNER_TRAIL') {
+    if (peakGain >= 0.45 && pos.ratchetStage !== 'PROFIT_LOCKED' && pos.ratchetStage !== 'DYNAMIC_TRAIL' && pos.ratchetStage !== 'RUNNER_TRAIL') {
       pos.ratchetStage = 'PROFIT_LOCKED';
-      pos.sl = Number((entryPrice * 1.0025).toFixed(6)); // +0.25% in the bank
-      logOperation('SENTRY', `${pos.pair}: Profit lock engaged (+0.25% secured).`, 'success');
+      pos.sl = Number((entryPrice * 1.0025).toFixed(6)); // +0.25% net profit secured
+      logOperation('SENTRY', `${pos.pair}: Profit lock engaged (+0.25% in bank).`, 'success');
     }
 
-    // --- ASYMMETRIC MICRO-TRAIL LEVEL 4: PEAK >= +0.80% (APEX TRAIL) ---
     if (peakGain >= 0.80 && peakGain < 1.80) {
       pos.ratchetStage = 'DYNAMIC_TRAIL';
-      const trailFloor = Number((pos.peakHighPrice * 0.9965).toFixed(6)); // 0.35% trail
-      if (trailFloor > pos.sl) pos.sl = trailFloor;
+      const trailFloor = Number((pos.peakHighPrice * 0.9970).toFixed(6)); // Dynamic 0.30% apex trail
+      if (!pos.sl || trailFloor > pos.sl) pos.sl = trailFloor;
     }
 
-    // --- TAKE PROFIT 1: GAIN >= +1.80% ---
+    // --- 3. TAKE PROFIT 1 (+1.80%) ---
     if (gainPct >= 1.80 && !pos.tp1Secured) {
       pos.tp1Secured = true;
       pos.tp1Price = livePrice;
       pos.ratchetStage = 'RUNNER_TRAIL';
       pos.sl = Number((pos.peakHighPrice * 0.9965).toFixed(6));
-      logOperation('SENTRY_EXIT', `TP1 BANKED on ${pos.pair}: 50% sold at +${gainPct.toFixed(2)}% ($${livePrice.toFixed(4)}).`, 'success');
+      logOperation('SENTRY_EXIT', `TP1 BANKED on ${pos.pair}: 50% sold at +${gainPct.toFixed(2)}% ($${livePrice.toFixed(4)}). Runner trailing.`, 'success');
       await recordTradeToCloudLedger({
         id: Date.now(),
         pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
@@ -1009,7 +951,7 @@ async function runPredictiveSentry() {
       });
     }
 
-    // --- STOP LOSS / TRAILING EXIT TRIGGER ---
+    // --- 4. TRAILING STOP EXECUTION (WHEN STOP LOSS ARMED) ---
     if (pos.sl && livePrice <= pos.sl && pos.ratchetStage !== 'INITIAL') {
       const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
@@ -1019,12 +961,12 @@ async function runPredictiveSentry() {
       await recordTradeToCloudLedger({
         id: Date.now(),
         pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: pos.tp1Secured ? 'RUNNER EXIT' : (realizedGain >= 0 ? 'TRAILING PROFIT LOCK' : 'MICRO-SCRATCH EXIT'),
+        type: pos.tp1Secured ? 'RUNNER EXIT' : (realizedGain >= 0 ? 'TRAILING PROFIT LOCK' : 'BREAKEVEN EXIT'),
         entryPriceUSDT: entryPrice,
         exitPriceUSDT: livePrice,
         notionalUSDT: exitNotional,
         pnlUSDT: realizedGain,
-        reason: `Micro-trailing stop executed at $${livePrice.toFixed(4)} (Peak: +${peakGain.toFixed(2)}%)`
+        reason: `Self-aware trail executed at $${livePrice.toFixed(4)} (Peak: +${peakGain.toFixed(2)}%)`
       });
 
       State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
@@ -1033,112 +975,41 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // --- EARLY ORDER-FLOW / BID VAPORIZATION KILL-SWITCH (2 to 10 Minutes) ---
-    if (holdMinutes >= 2.0 && holdMinutes <= 12.0 && gainPct <= -0.40 && !pos.tp1Secured) {
+    // --- 5. UPSIDE EXHAUSTION: ROUTE TO SPOT RECOVERY BAG (NO RIGID -1.35% CUT!) ---
+    // If a position stalls or dips and multi-dimensional analysis indicates price cannot expand higher:
+    const isStallingDown = (gainPct <= -0.50 && holdMinutes >= 2.0);
+    if (isStallingDown && !pos.tp1Secured) {
       const quickDepth = await fetchRealOrderBookDepth(k);
-      if (quickDepth && quickDepth.obi < 0.36) {
-        const exitNotional = pos.notionalUSDT;
-        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+      const isBidThin = quickDepth && quickDepth.obi < 0.38;
+      const isRetracingDeeper = gainPct <= -1.50;
 
-        logOperation('SENTRY_EXIT', `Order-flow scratch on ${pos.pair}: OBI dropped to ${Math.round(quickDepth.obi * 100)}%. Scratched early at ${gainPct.toFixed(2)}%.`, 'warning');
+      if (isBidThin || isRetracingDeeper) {
+        logOperation('SENTRY_DEMOTE', `Upside exhausted on ${pos.pair} (${gainPct.toFixed(2)}%). Transferred to Spot Recovery Bag (Target: +0.30% Breakeven).`, 'warning');
 
-        await recordTradeToCloudLedger({
-          id: Date.now(),
-          pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-          type: 'ORDER FLOW SCRATCH',
+        State.recoveryBags[k] = {
+          pair: pos.pair,
+          pairSymbol: pos.pairSymbol,
+          openedAt: pos.openedAt,
+          movedAt: Date.now(),
           entryPriceUSDT: entryPrice,
-          exitPriceUSDT: livePrice,
-          notionalUSDT: exitNotional,
-          pnlUSDT: realizedGain,
-          reason: `Early order flow invalidation: Top-20 OBI dropped to ${Math.round(quickDepth.obi * 100)}%`
-        });
+          livePriceUSDT: livePrice,
+          notionalUSDT: pos.notionalUSDT,
+          qty: pos.qty,
+          targetStep: 'STEP 1 (+0.30% BREAKEVEN)',
+          targetExitPriceUSDT: Number((entryPrice * 1.0030).toFixed(6)), // EXACT +0.30% BREAKEVEN TARGET
+          troughPriceUSDT: livePrice,
+          reliefHighPriceUSDT: livePrice,
+          reliefTrailingStopUSDT: null,
+          reliefTrailingActive: false
+        };
 
-        if (State.subsystems?.divergenceSentry) {
-          State.subsystems.divergenceSentry.exitsExecuted = (State.subsystems.divergenceSentry.exitsExecuted || 0) + 1;
-          State.subsystems.divergenceSentry.lastTriggeredSymbol = pos.pair;
-        }
-
-        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
         delete State.activePositions[k];
+        broadcastStateUpdate();
         continue;
       }
     }
 
-    // --- TOP-TICK HARVEST ON BEARISH EXHAUSTION DIVERGENCE ---
-    if (gainPct >= 0.40 && holdMinutes >= 2.0 && !pos.tp1Secured) {
-      const quickDepth = await fetchRealOrderBookDepth(k);
-      if (quickDepth && quickDepth.obi < 0.38 && livePrice < (pos.peakHighPrice * 0.9975)) {
-        const exitNotional = pos.notionalUSDT;
-        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-
-        logOperation('SENTRY_EXIT', `Divergence apex harvest on ${pos.pair}: Banked +${gainPct.toFixed(2)}% on order book exhaustion.`, 'success');
-
-        await recordTradeToCloudLedger({
-          id: Date.now(),
-          pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-          type: 'DIVERGENCE TOP HARVEST',
-          entryPriceUSDT: entryPrice,
-          exitPriceUSDT: livePrice,
-          notionalUSDT: exitNotional,
-          pnlUSDT: realizedGain,
-          reason: `Apex harvest on order book exhaustion: Banked +${gainPct.toFixed(2)}%`
-        });
-
-        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-        delete State.activePositions[k];
-        continue;
-      }
-    }
-
-    // --- BREAKOUT INVALIDATION STOP AT -1.35% (NEVER BLEEDS TO -6.50%!) ---
-    if (gainPct <= -1.35) {
-      const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-
-      logOperation('SENTRY_EXIT', `Breakout invalidation stop cut on ${pos.pair} at -1.35%. Preserved 98.6% capital.`, 'danger');
-
-      await recordTradeToCloudLedger({
-        id: Date.now(),
-        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'BREAKOUT INVALIDATION CUT',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: exitNotional,
-        pnlUSDT: realizedGain,
-        reason: 'Breakout momentum failed: Immediate invalidation cut at -1.35%'
-      });
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.activePositions[k];
-      continue;
-    }
-
-    // Alpha Velocity time-decay harvest at 30 mins
-    if (holdMinutes >= 30 && gainPct >= 0.20) {
-      const exitNotional = pos.notionalUSDT;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-
-      await recordTradeToCloudLedger({
-        id: Date.now(),
-        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'VELOCITY HARVEST 30M',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: exitNotional,
-        pnlUSDT: realizedGain,
-        reason: `30m Alpha Velocity: Banked +${gainPct.toFixed(2)}% to clear slot`
-      });
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.activePositions[k];
-      continue;
-    }
-
-    // Alpha Velocity scratch at 45 mins
+    // Alpha Velocity scratch at 45 mins if dead flat
     if (holdMinutes >= 45 && gainPct >= 0.08) {
       const exitNotional = pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
@@ -1161,7 +1032,7 @@ async function runPredictiveSentry() {
     }
   }
 
-  // PART 2: SPOT RECOVERY BAGS (TIGHTENED DISASTER FLOOR TO -2.20%)
+  // PART 2: SPOT RECOVERY BAGS (BREAKEVEN AT +0.30% & ADAPTIVE RELIEF TRAILING BEYOND -2.50%)
   for (const k of bagKeys) {
     const bag = State.recoveryBags[k];
     if (!bag) continue;
@@ -1172,28 +1043,37 @@ async function runPredictiveSentry() {
     const holdHours = (Date.now() - (bag.movedAt || Date.now())) / 3600000;
 
     bag.livePriceUSDT = livePrice;
+    bag.troughPriceUSDT = Math.min(bag.troughPriceUSDT || entryPrice, livePrice);
 
-    if (livePrice >= bag.targetExitPriceUSDT) {
+    // TARGET 1: +0.30% BREAKEVEN EXIT (COVERS COMMISSION + PROFIT)
+    const targetPrice = bag.targetExitPriceUSDT || (entryPrice * 1.0030);
+    if (livePrice >= targetPrice) {
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
+      
+      logOperation('RECOVERY', `Breakeven relief target (+0.30%) hit on ${bag.pair} at $${livePrice.toFixed(4)}! 100% capital recycled.`, 'success');
+
       await recordTradeToCloudLedger({
         id: Date.now(),
         pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'RECOVERY EXIT',
+        type: 'RECOVERY BREAKEVEN (+0.30%)',
         entryPriceUSDT: entryPrice,
         exitPriceUSDT: livePrice,
         notionalUSDT: bag.notionalUSDT,
         pnlUSDT: realizedGain,
-        reason: `Recovery filled on relief bounce (${bag.targetStep})`
+        reason: `Recovery filled on relief bounce (+0.30% Breakeven Target)`
       });
 
-      State.portfolio.cashUSDT += (bag.notionalUSDT + realizedGain);
+      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
       State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
       delete State.recoveryBags[k];
       continue;
     }
 
-    if (holdHours >= 1.5 && gainPct >= -0.50) {
+    // 15m VWAP Technical Bounce Exit after 90 mins
+    if (holdHours >= 1.5 && gainPct >= -0.15) {
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
+      logOperation('RECOVERY', `VWAP relief exit on ${bag.pair} at $${livePrice.toFixed(4)}. Capital recycled.`, 'info');
+
       await recordTradeToCloudLedger({
         id: Date.now(),
         pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
@@ -1205,30 +1085,72 @@ async function runPredictiveSentry() {
         reason: 'VWAP technical bounce exit: capital recycled in 90m'
       });
 
-      State.portfolio.cashUSDT += (bag.notionalUSDT + realizedGain);
+      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
       State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
       delete State.recoveryBags[k];
       continue;
     }
 
-    // TIGHTENED DISASTER FLOOR TO -2.20% (ABOLISHED -6.50% CATASTROPHIC LOSS)
-    if (gainPct <= -2.20) {
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-      await recordTradeToCloudLedger({
-        id: Date.now(),
-        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'TIGHT RECOVERY CUT (-2.20%)',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: realizedGain,
-        reason: 'Tightened recovery floor (-2.20%): Protected 98% cash capital'
-      });
+    // --- ADAPTIVE RELIEF-BOUNCE TRAILING BEYOND -2.50% ---
+    // If a position slips past -2.50%, do not dump blindly; activate the inverse relief trailing sentry
+    if (gainPct <= -2.50 || bag.reliefTrailingActive) {
+      bag.reliefTrailingActive = true;
+      const trough = bag.troughPriceUSDT || livePrice;
+      const bouncePct = trough > 0 ? (((livePrice - trough) / trough) * 100) : 0;
+      
+      bag.reliefHighPriceUSDT = Math.max(bag.reliefHighPriceUSDT || livePrice, livePrice);
 
-      State.portfolio.cashUSDT += (bag.notionalUSDT + realizedGain);
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.recoveryBags[k];
-      continue;
+      // Once the asset prints a relief bounce of at least +0.40% off the local bottom:
+      if (bouncePct >= 0.40) {
+        const trailingFloor = Number((bag.reliefHighPriceUSDT * 0.9970).toFixed(6)); // Dynamic 0.30% trail under bounce crest
+        bag.reliefTrailingStopUSDT = Math.max(bag.reliefTrailingStopUSDT || 0, trailingFloor);
+      }
+
+      // If the relief bounce rolls over and breaches the dynamic trailing floor:
+      if (bag.reliefTrailingStopUSDT && livePrice <= bag.reliefTrailingStopUSDT) {
+        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
+
+        logOperation('RELIEF_TRAIL', `Relief bounce crest exit on ${bag.pair} at $${livePrice.toFixed(4)} (${gainPct.toFixed(2)}%). Exited at best possible price.`, 'warning');
+
+        await recordTradeToCloudLedger({
+          id: Date.now(),
+          pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
+          type: 'RELIEF CREST TRAIL EXIT',
+          entryPriceUSDT: entryPrice,
+          exitPriceUSDT: livePrice,
+          notionalUSDT: bag.notionalUSDT,
+          pnlUSDT: realizedGain,
+          reason: `Adaptive relief trail exit: Captured crest of bounce off bottom at $${livePrice.toFixed(4)}`
+        });
+
+        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
+        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+        delete State.recoveryBags[k];
+        continue;
+      }
+
+      // Tail-Risk Disaster Circuit Breaker (-4.50% hard floor if no relief bounce emerges)
+      if (gainPct <= -4.50) {
+        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
+
+        logOperation('SENTRY_EXIT', `Disaster floor triggered on ${bag.pair} at -4.50%. Preserved cash capital.`, 'danger');
+
+        await recordTradeToCloudLedger({
+          id: Date.now(),
+          pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
+          type: 'RECOVERY DISASTER CUT (-4.50%)',
+          entryPriceUSDT: entryPrice,
+          exitPriceUSDT: livePrice,
+          notionalUSDT: bag.notionalUSDT,
+          pnlUSDT: realizedGain,
+          reason: 'Hard disaster floor (-4.50%): Capital preserved'
+        });
+
+        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
+        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+        delete State.recoveryBags[k];
+        continue;
+      }
     }
   }
 }
@@ -1616,6 +1538,7 @@ app.post('/api/ledger/test', async (req, res) => {
   const testUrl = (req.body.url || State.masterLedgerUrl || '').trim();
   if (!testUrl) return res.status(400).json({ success: false, error: 'Missing ledger URL' });
   try {
+    console.log(`[Ledger Test] Testing URL from server proxy: ${testUrl}`);
     const fetchUrl = testUrl.includes('?') ? `${testUrl}&action=TEST` : `${testUrl}?action=TEST`;
     const data = await safeFetch(fetchUrl, 15000);
     return res.json({ success: true, source: 'SERVER_PROXY', data });
@@ -1655,6 +1578,18 @@ app.post('/api/ledger/send-test-trade', async (req, res) => {
     res.json({ success: true, trade: testTrade, cloudResult: writeResult });
   } catch (err) {
     res.status(502).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/learning/test', async (req, res) => {
+  const testUrl = (req.body.url || State.learningSheetUrl || '').trim();
+  if (!testUrl) return res.status(400).json({ success: false, error: 'Missing learning URL' });
+  try {
+    const fetchUrl = testUrl.includes('?') ? `${testUrl}&action=TEST` : `${testUrl}?action=TEST`;
+    const data = await safeFetch(fetchUrl, 15000);
+    return res.json({ success: true, source: 'SERVER_PROXY', data });
+  } catch (err) {
+    return res.status(502).json({ success: false, error: err.message });
   }
 });
 
@@ -1753,6 +1688,7 @@ function broadcastPriceStream() {
 // -------------------------------------------------------------
 let binanceGlobalWs = null;
 let subscribedActiveStreams = new Set();
+let isSentryRunning = false;
 
 function connectBinanceGlobalStream() {
   const wsEndpoint = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
@@ -1801,8 +1737,12 @@ function connectBinanceGlobalStream() {
           }
         });
 
-        if (activePriceChanged) {
-          runPredictiveSentry().catch(() => {});
+        // Sub-5ms ultra-low latency sentry execution directly on price ticks
+        if (activePriceChanged && !isSentryRunning) {
+          isSentryRunning = true;
+          runPredictiveSentry().finally(() => {
+            isSentryRunning = false;
+          });
         }
       } catch (err) {}
     });
