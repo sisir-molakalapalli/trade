@@ -1004,7 +1004,7 @@ async function runPredictiveSentry() {
 
         logOperation('APEX_HARVEST', `Apex Harvest on ${pos.pair}: Banked +${gainPct.toFixed(2)}% ($${realizedGain >= 0 ? '+' : ''}$${realizedGain.toFixed(2)}) at peak exhaustion (OBI: ${Math.round(quickDepth.obi * 100)}%).`, 'success');
 
-        await recordTradeToCloudLedger({
+        const tradePayload = {
           id: Date.now(),
           pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
           type: 'APEX HARVEST PROFIT',
@@ -1013,11 +1013,15 @@ async function runPredictiveSentry() {
           notionalUSDT: exitNotional,
           pnlUSDT: realizedGain,
           reason: `Apex peak harvest: Banked +${gainPct.toFixed(2)}% as buyer flow exhausted`
-        });
+        };
 
         State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
         State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
         delete State.activePositions[k];
+        saveDiskState();
+        broadcastStateUpdate();
+
+        recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
         continue;
       }
     }
@@ -1067,7 +1071,7 @@ async function runPredictiveSentry() {
       
       logOperation('SENTRY_EXIT', `Trailing stop executed on ${pos.pair} at $${livePrice.toFixed(4)} (${realizedGain >= 0 ? '+' : ''}$${realizedGain.toFixed(2)} USDT).`, realizedGain >= 0 ? 'success' : 'warning');
 
-      await recordTradeToCloudLedger({
+      const tradePayload = {
         id: Date.now(),
         pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
         type: pos.tp1Secured ? 'RUNNER EXIT' : (realizedGain >= 0 ? 'TRAILING PROFIT LOCK' : 'BREAKEVEN EXIT'),
@@ -1076,11 +1080,15 @@ async function runPredictiveSentry() {
         notionalUSDT: exitNotional,
         pnlUSDT: realizedGain,
         reason: `Self-aware trail executed at $${livePrice.toFixed(4)} (Peak: +${peakGain.toFixed(2)}%)`
-      });
+      };
 
       State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
       State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
       delete State.activePositions[k];
+      saveDiskState();
+      broadcastStateUpdate();
+
+      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
       continue;
     }
 
@@ -1498,7 +1506,8 @@ async function recordTradeToCloudLedger(trade) {
   broadcastStateUpdate();
 
   if (!success) {
-    throw lastError || new Error('Failed to record trade to Google Sheets');
+    console.error(`[Cloud Ledger Warning] Failed trade dispatch to Google Sheets: ${lastError ? lastError.message : 'Timeout'}`);
+    return { success: false, error: lastError ? lastError.message : 'Dispatch failed' };
   }
 
   return { success: true, cloudResponse };
