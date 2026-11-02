@@ -71,6 +71,7 @@ const State = {
   cooldowns: {},
   subsystems: {
     liveFeed: [],
+    pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 15, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M+)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
@@ -297,6 +298,70 @@ async function checkBtcMacroWeatherShield() {
     return true;
   } catch (e) {
     return true;
+  }
+}
+
+// -------------------------------------------------------------
+// DORMANT PUMP & DUMP TRAP SHIELD (<$70M LIQUIDITY & 24H SPIKE)
+// -------------------------------------------------------------
+const dormantCheckCache = new Map();
+
+async function checkDormantPumpAndDumpTrap(symbol, curVolQuote, change24h, rangePct) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+
+    const cacheKey = `${pairSym}_1d`;
+    const cached = dormantCheckCache.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp < 600000)) { // 10-minute cache to preserve API quota
+      return cached.result;
+    }
+
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=1d&limit=5`;
+    const klines = await safeFetch(url, 3000);
+
+    if (!Array.isArray(klines) || klines.length < 4) {
+      return { isTrap: false, reason: 'Insufficient daily history' };
+    }
+
+    // Inspect prior 3 closed daily bars (excluding today's live spike bar)
+    let priorVolSum = 0;
+    let priorRangeSum = 0;
+    for (let i = 0; i < klines.length - 1; i++) {
+      const bar = klines[i];
+      const high = parseFloat(bar[2]);
+      const low = parseFloat(bar[3]);
+      const quoteVol = parseFloat(bar[7]); // Quote volume in USDT
+      const barRange = low > 0 ? ((high - low) / low) * 100 : 0;
+      priorVolSum += quoteVol;
+      priorRangeSum += barRange;
+    }
+
+    const daysEvaluated = klines.length - 1;
+    const avgPriorDailyQuoteVol = priorVolSum / daysEvaluated;
+    const avgPriorDailyRange = priorRangeSum / daysEvaluated;
+
+    // A token is a dormant pump trap if:
+    // 1. Prior average daily volume was dormant (< $12M quote USDT)
+    // 2. Prior daily range was flat/dead (< 4.5% daily oscillation)
+    // 3. Suddenly today spiked (> +7.0% 24h change or > 8.5% intraday range)
+    const wasDormant = (avgPriorDailyQuoteVol < 12000000 || avgPriorDailyRange < 4.5);
+    const isSuddenSpike = (change24h >= 7.0 || rangePct >= 8.5);
+
+    if (wasDormant && isSuddenSpike) {
+      const result = {
+        isTrap: true,
+        reason: `Dormant Pump & Dump: Prior avg vol was $${(avgPriorDailyQuoteVol / 1000000).toFixed(1)}M/day (range ${avgPriorDailyRange.toFixed(1)}%) before sudden 24h spike (+${change24h.toFixed(1)}%)`
+      };
+      dormantCheckCache.set(cacheKey, { timestamp: Date.now(), result });
+      return result;
+    }
+
+    const result = { isTrap: false, reason: 'Sustained liquidity profile' };
+    dormantCheckCache.set(cacheKey, { timestamp: Date.now(), result });
+    return result;
+  } catch (err) {
+    return { isTrap: false, reason: `Dormant check error: ${err.message}` };
   }
 }
 
@@ -579,6 +644,22 @@ async function runDynamicScreener() {
       if (volQuote >= 10000000) score += 5;
       if (rangePct >= 5.0) score += 3;
 
+      let isPumpDump = false;
+      let pumpDumpReason = '';
+
+      // Dormant Pump & Dump Trap Check on sudden 24h spikes under $70M quote volume
+      if (volQuote < 70000000 && (change24 >= 7.0 || rangePct >= 8.5)) {
+        const pdResult = await checkDormantPumpAndDumpTrap(sym, volQuote, change24, rangePct);
+        if (pdResult.isTrap) {
+          isPumpDump = true;
+          pumpDumpReason = pdResult.reason;
+          score = 0; // Strictly zero out score so it cannot be screened
+          State.subsystems.pumpDumpTrap.trappedTokensDetected++;
+          State.subsystems.pumpDumpTrap.lastBlockedSymbol = sym;
+          logOperation('TRAP_GUARD', `Avoided trap on ${sym}: ${pdResult.reason}`, 'danger');
+        }
+      }
+
       universe[sym] = {
         symbol: sym.replace('USDT', ''),
         priceUSDT: last,
@@ -588,13 +669,15 @@ async function runDynamicScreener() {
         pricePositionInRange: Number(posInRange.toFixed(2)),
         score: Math.min(99, Math.round(score)),
         volumeM: Math.round(volQuote / 1000000),
-        obi: 0.55
+        obi: 0.55,
+        isPumpAndDump: isPumpDump,
+        pumpDumpReason: pumpDumpReason
       };
     }
 
     State.universe = universe;
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
-    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75).length;
+    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75 && !c.isPumpAndDump).length;
 
     logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 75).`, 'info');
     broadcastStateUpdate();
@@ -689,6 +772,9 @@ async function evaluateAutopilotEntries() {
       const coin = State.universe[k];
       if (!coin || !coin.symbol) continue;
 
+      // Gate: Strictly reject flagged pump-and-dump spikes
+      if (coin.isPumpAndDump) continue;
+
       if ((coin.score || 0) < minScore) break;
 
       const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
@@ -705,6 +791,16 @@ async function evaluateAutopilotEntries() {
 
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
       if (posInRange < 0.45) continue;
+
+      // Secondary Pre-Flight Pump & Dump Trap Veto
+      const volQuote = (coin.volumeM || 0) * 1000000;
+      if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
+        const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
+        if (pdCheck.isTrap) {
+          logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pdCheck.reason}`, 'danger');
+          continue;
+        }
+      }
 
       const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
       if (!orderFlow.passed) continue;
