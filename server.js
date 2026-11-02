@@ -103,6 +103,501 @@ const State = {
 };
 
 // -------------------------------------------------------------
+// CORE NETWORK & LOGGING UTILITIES
+// -------------------------------------------------------------
+function safeFetch(url, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(url);
+      const isHttps = u.protocol === 'https:';
+      const client = isHttps ? https : http;
+      const req = client.get(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SisirQuant/3.0' },
+        timeout: timeoutMs
+      }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            resolve(data);
+          }
+        });
+      });
+      req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout fetching ${url}`)); });
+      req.on('error', err => reject(err));
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+function safePostJson(url, postData, timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(url);
+      const isHttps = u.protocol === 'https:';
+      const client = isHttps ? https : http;
+      const bodyStr = JSON.stringify(postData);
+      const req = client.request(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(bodyStr),
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SisirQuant/3.0'
+        },
+        timeout: timeoutMs
+      }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            resolve({ raw: data });
+          }
+        });
+      });
+      req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout posting to ${url}`)); });
+      req.on('error', err => reject(err));
+      req.write(bodyStr);
+      req.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+function logOperation(category, message, level = 'info') {
+  const now = new Date();
+  const time = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+  const logItem = { time, category, message, level };
+  if (!Array.isArray(State.subsystems.liveFeed)) {
+    State.subsystems.liveFeed = [];
+  }
+  State.subsystems.liveFeed.unshift(logItem);
+  if (State.subsystems.liveFeed.length > 50) {
+    State.subsystems.liveFeed.pop();
+  }
+}
+
+// -------------------------------------------------------------
+// BITCOIN MACRO & PUMP-AND-DUMP SHIELDS
+// -------------------------------------------------------------
+async function checkBtcMacroWeatherShield() {
+  try {
+    const url = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=2';
+    const klines = await safeFetch(url, 3000);
+    if (!Array.isArray(klines) || klines.length === 0) return true;
+    const curBar = klines[klines.length - 1];
+    const open = parseFloat(curBar[1]);
+    const close = parseFloat(curBar[4]);
+    const change15m = open > 0 ? ((close - open) / open) * 100 : 0;
+    State.subsystems.btcMacroGate.btcChange15m = Number(change15m.toFixed(2));
+    if (change15m <= -0.35) {
+      State.subsystems.btcMacroGate.status = 'PAUSED';
+      State.subsystems.btcMacroGate.allowAltcoinEntries = false;
+      State.subsystems.btcMacroGate.reason = `BTC 15m dip ${change15m.toFixed(2)}% <= -0.35%`;
+      return false;
+    }
+    State.subsystems.btcMacroGate.status = 'NORMAL';
+    State.subsystems.btcMacroGate.allowAltcoinEntries = true;
+    State.subsystems.btcMacroGate.reason = 'BTC macro healthy';
+    return true;
+  } catch (err) {
+    return true;
+  }
+}
+
+const pumpDumpCache = {};
+async function checkDormantPumpAndDumpTrap(symbol, volQuote, change24h, rangePct) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    if (pumpDumpCache[pairSym] && pumpDumpCache[pairSym].until > Date.now()) {
+      return pumpDumpCache[pairSym].result;
+    }
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=1d&limit=5`;
+    const klines = await safeFetch(url, 3000);
+    if (!Array.isArray(klines) || klines.length < 3) {
+      return { isTrap: false, reason: '' };
+    }
+    let totalPriorVol = 0;
+    let maxPriorRange = 0;
+    const count = klines.length - 1;
+    for (let i = 0; i < count; i++) {
+      const qVol = parseFloat(klines[i][7]);
+      const h = parseFloat(klines[i][2]);
+      const l = parseFloat(klines[i][3]);
+      const r = l > 0 ? ((h - l) / l) * 100 : 0;
+      totalPriorVol += qVol;
+      if (r > maxPriorRange) maxPriorRange = r;
+    }
+    const avgPriorVol = totalPriorVol / Math.max(1, count);
+    const isTrap = (avgPriorVol < 12000000 || maxPriorRange < 4.5);
+    const result = {
+      isTrap,
+      reason: isTrap ? `Dormant spike: prior avg vol $${(avgPriorVol / 1e6).toFixed(1)}M < $12M or flat range` : ''
+    };
+    if (isTrap) {
+      State.subsystems.pumpDumpTrap.trappedTokensDetected++;
+      State.subsystems.pumpDumpTrap.lastBlockedSymbol = pairSym;
+    }
+    pumpDumpCache[pairSym] = { until: Date.now() + 600000, result };
+    return result;
+  } catch (e) {
+    return { isTrap: false, reason: '' };
+  }
+}
+
+// -------------------------------------------------------------
+// WYCKOFF ORDER FLOW & MICROSTRUCTURE GATES
+// -------------------------------------------------------------
+async function checkVeteranOrderFlowAndVSA(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=5m&limit=16`;
+    const klines = await safeFetch(url, 3000);
+    if (!Array.isArray(klines) || klines.length < 3) {
+      return { passed: true, takerBuyRatio: 50, recent3Delta: 0, vsaPattern: 'FALLBACK' };
+    }
+    const curBar = klines[klines.length - 1];
+    const open = parseFloat(curBar[1]);
+    const high = parseFloat(curBar[2]);
+    const low = parseFloat(curBar[3]);
+    const close = parseFloat(curBar[4]);
+    const vol = parseFloat(curBar[5]);
+    const takerBuyVol = parseFloat(curBar[9]);
+    const takerBuyRatio = vol > 0 ? (takerBuyVol / vol) * 100 : 50;
+
+    let netDelta = 0;
+    for (let i = klines.length - 3; i < klines.length; i++) {
+      const bVol = parseFloat(klines[i][5]);
+      const bTaker = parseFloat(klines[i][9]);
+      netDelta += (bTaker - (bVol - bTaker));
+    }
+
+    const range = high - low;
+    const clv = range > 0 ? (close - low) / range : 0.5;
+
+    if (takerBuyRatio < 44.0 && netDelta < 0) {
+      return { passed: false, reason: `Negative Taker CVD (Buy: ${takerBuyRatio.toFixed(1)}%)` };
+    }
+
+    if (clv < 0.35 && range > 0 && close < open) {
+      return { passed: false, reason: `Wyckoff VSA Absorption Trap (CLV: ${clv.toFixed(2)})` };
+    }
+
+    return {
+      passed: true,
+      takerBuyRatio: Number(takerBuyRatio.toFixed(1)),
+      recent3Delta: Number(netDelta.toFixed(2)),
+      vsaPattern: clv >= 0.65 ? 'STRONG_BUY_EFFORT' : 'NEUTRAL_ABSORPTION'
+    };
+  } catch (err) {
+    return { passed: true, takerBuyRatio: 50, recent3Delta: 0, vsaPattern: 'FALLBACK' };
+  }
+}
+
+async function checkSelfAwareOrderFlow(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=5m&limit=5`;
+    const klines = await safeFetch(url, 2500);
+
+    if (!Array.isArray(klines) || klines.length < 3) {
+      return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50 };
+    }
+
+    const curBar = klines[klines.length - 1];
+    const open = parseFloat(curBar[1]);
+    const high = parseFloat(curBar[2]);
+    const low = parseFloat(curBar[3]);
+    const close = parseFloat(curBar[4]);
+    const vol = parseFloat(curBar[5]);
+    const takerBuyVol = parseFloat(curBar[9]);
+
+    const takerBuyRatio = vol > 0 ? (takerBuyVol / vol) * 100 : 50;
+    const range = high - low;
+    const clv = range > 0 ? (close - low) / range : 0.5;
+    const upperWickRatio = range > 0 ? (high - Math.max(open, close)) / range : 0;
+
+    const isApexExhausted = (takerBuyRatio < 42.0 && upperWickRatio >= 0.35) || (clv < 0.30 && range > 0);
+    const isUpsideDead = (takerBuyRatio < 40.0 && close < open && clv < 0.35);
+
+    return {
+      isApexExhausted,
+      isUpsideDead,
+      takerBuyRatio: Number(takerBuyRatio.toFixed(1)),
+      clv: Number(clv.toFixed(2)),
+      upperWickRatio: Number(upperWickRatio.toFixed(2))
+    };
+  } catch (err) {
+    return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50 };
+  }
+}
+
+async function checkMicrostructureMomentumAndVwap(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=15m&limit=20`;
+    const klines = await safeFetch(url, 3500);
+
+    if (!Array.isArray(klines) || klines.length < 8) {
+      return { passed: false, reason: 'Insufficient 15m klines' };
+    }
+
+    const curBar = klines[klines.length - 1];
+    const prevBar = klines[klines.length - 2];
+    const curClose = parseFloat(curBar[4]);
+    const curOpen = parseFloat(curBar[1]);
+    const curChange15m = curOpen > 0 ? ((curClose - curOpen) / curOpen) * 100 : 0;
+    const prevChange15m = parseFloat(prevBar[1]) > 0 ? ((parseFloat(prevBar[4]) - parseFloat(prevBar[1])) / parseFloat(prevBar[1])) * 100 : 0;
+    const change15mPct = Math.max(curChange15m, prevChange15m);
+
+    const bar4Ago = klines[klines.length - 5];
+    const open1hAgo = parseFloat(bar4Ago[1]);
+    const change1hPct = open1hAgo > 0 ? ((curClose - open1hAgo) / open1hAgo) * 100 : 0;
+
+    let high4h = 0;
+    let sumTypicalPriceVol = 0;
+    let sumVol = 0;
+
+    klines.forEach(k => {
+      const h = parseFloat(k[2]);
+      const l = parseFloat(k[3]);
+      const c = parseFloat(k[4]);
+      const v = parseFloat(k[5]);
+      if (h > high4h) high4h = h;
+      const typical = (h + l + c) / 3;
+      sumTypicalPriceVol += (typical * v);
+      sumVol += v;
+    });
+
+    const vwap4h = sumVol > 0 ? (sumTypicalPriceVol / sumVol) : curClose;
+    const distFrom4hHighPct = high4h > 0 ? ((high4h - curClose) / high4h) * 100 : 0;
+
+    const completedVol = parseFloat(prevBar[5]);
+    const curVol = parseFloat(curBar[5]);
+    let avgVol = 0;
+    for (let i = klines.length - 10; i < klines.length - 2; i++) {
+      avgVol += parseFloat(klines[i][5]);
+    }
+    avgVol = avgVol / 8;
+    const completedRvol = avgVol > 0 ? (completedVol / avgVol) : 1.0;
+    const liveRvol = avgVol > 0 ? (curVol / avgVol) : 1.0;
+    const rvol = Number(Math.max(completedRvol, liveRvol).toFixed(2));
+
+    if (curClose < (vwap4h * 0.995)) {
+      return { passed: false, reason: `Price below 15m VWAP ($${curClose.toFixed(4)} < $${vwap4h.toFixed(4)})` };
+    }
+
+    const isTrackA = (change15mPct >= 0.40 && rvol >= 1.05 && distFrom4hHighPct <= 4.50);
+    const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 5.00 && (change1hPct >= 0.60 || curChange15m >= 0.25));
+
+    if (!isTrackA && !isTrackB) {
+      return { 
+        passed: false, 
+        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%, HighDist: ${distFrom4hHighPct.toFixed(2)}%)` 
+      };
+    }
+
+    return {
+      passed: true,
+      change15mPct: Number(change15mPct.toFixed(2)),
+      change1hPct: Number(change1hPct.toFixed(2)),
+      distFrom4hHighPct: Number(distFrom4hHighPct.toFixed(2)),
+      isAboveVwap: true,
+      rvol: Number(rvol.toFixed(2)),
+      selectionTrack: isTrackA ? 'TRACK_A_IGNITION' : 'TRACK_B_BASE_EXPANSION'
+    };
+  } catch (err) {
+    return { passed: false, reason: `Microstructure error: ${err.message}` };
+  }
+}
+
+async function check1hTrendAlignment(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=1h&limit=24`;
+    const klines = await safeFetch(url, 3000);
+    if (!Array.isArray(klines) || klines.length < 20) {
+      return { passed: true, reason: 'Fallback pass' };
+    }
+    const curClose = parseFloat(klines[klines.length - 1][4]);
+    const k = 2 / (20 + 1);
+    let ema = parseFloat(klines[0][4]);
+    for (let i = 1; i < klines.length; i++) {
+      const c = parseFloat(klines[i][4]);
+      ema = (c * k) + (ema * (1 - k));
+    }
+    if (curClose < (ema * 0.997)) {
+      return { passed: false, reason: `Price below 1h 20-EMA ($${curClose.toFixed(4)} < $${ema.toFixed(4)})` };
+    }
+    return { passed: true, ema1h: Number(ema.toFixed(4)) };
+  } catch (err) {
+    return { passed: true, reason: 'Error fallback' };
+  }
+}
+
+async function fetchRealOrderBookDepth(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/depth?symbol=${pairSym}&limit=20`;
+    const data = await safeFetch(url, 2500);
+    if (!data || !Array.isArray(data.bids) || !Array.isArray(data.asks) || data.bids.length === 0 || data.asks.length === 0) {
+      return null;
+    }
+    const bestBid = parseFloat(data.bids[0][0]);
+    const bestAsk = parseFloat(data.asks[0][0]);
+    const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0.05;
+
+    let bidVol = 0;
+    let askVol = 0;
+    data.bids.forEach(b => bidVol += parseFloat(b[1]));
+    data.asks.forEach(a => askVol += parseFloat(a[1]));
+    const total = bidVol + askVol;
+    const obi = total > 0 ? (bidVol / total) : 0.55;
+
+    return {
+      bestBid,
+      bestAsk,
+      spreadPct: Number(spreadPct.toFixed(3)),
+      obi: Number(obi.toFixed(3)),
+      bidDepth: bidVol,
+      askDepth: askVol
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function executeSpotBuy(symbol, coin, book, microMom) {
+  const sym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
+  const pairKey = `${sym}USDT`;
+  const livePrice = Number(coin.priceUSDT || coin.price || 1.0);
+
+  let freeCash = Number(State.portfolio.cashUSDT);
+  if (isNaN(freeCash) || freeCash < 10.00) {
+    State.portfolio.cashUSDT = 500.00;
+    freeCash = 500.00;
+    saveDiskState();
+    logOperation('PORTFOLIO', `Auto-replenished free cash to $500.00 USDT reserve to keep Autopilot operational.`, 'success');
+  }
+
+  const allocPct = Number(State.portfolio.allocationPct || 15.0);
+  let notional;
+  if (freeCash <= 25.00) {
+    notional = Math.min(freeCash, Math.max(10.05, Number((freeCash * 0.95).toFixed(2))));
+  } else {
+    notional = Math.max(10.50, Math.min(freeCash * (allocPct / 100), freeCash));
+  }
+
+  if (freeCash < 10.00 || notional < 10.00) {
+    logOperation('CASH_GUARD', `Cannot open ${sym}/USDT: Available cash ($${freeCash.toFixed(2)}) is below Binance $10 min notional requirement.`, 'danger');
+    return;
+  }
+
+  const qty = notional / livePrice;
+  State.portfolio.cashUSDT = Number((freeCash - notional).toFixed(4));
+
+  State.activePositions[pairKey] = {
+    pair: `${sym}/USDT`,
+    pairSymbol: sym,
+    openedAt: Date.now(),
+    entryPriceUSDT: livePrice,
+    livePriceUSDT: livePrice,
+    qty: qty,
+    notionalUSDT: notional,
+    sl: Number((livePrice * 1.0035).toFixed(6)), // Minimum +0.35% exit floor
+    peakGainPct: 0,
+    peakHighPrice: livePrice,
+    ratchetStage: 'INITIAL',
+    tp1Secured: false
+  };
+
+  console.log(`[Order Execution] BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT)`);
+  logOperation('EXECUTION', `BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT). Slot occupied.`, 'success');
+  syncActiveSymbolSubscriptions();
+  broadcastStateUpdate();
+}
+
+async function runDynamicScreener() {
+  try {
+    const url = 'https://api.binance.com/api/v3/ticker/24hr';
+    const tickers = await safeFetch(url, 4500);
+    if (!Array.isArray(tickers)) return;
+
+    const universe = {};
+    for (const t of tickers) {
+      const sym = t.symbol;
+      if (!sym.endsWith('USDT')) continue;
+      if (sym.includes('UP') || sym.includes('DOWN') || sym.includes('BULL') || sym.includes('BEAR')) continue;
+      if (['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'EURUSDT'].includes(sym)) continue;
+
+      const volQuote = parseFloat(t.quoteVolume);
+      if (volQuote < 3500000) continue;
+
+      const last = parseFloat(t.lastPrice);
+      const high = parseFloat(t.highPrice);
+      const low = parseFloat(t.lowPrice);
+      const change24 = parseFloat(t.priceChangePercent);
+
+      const rangePct = low > 0 ? ((high - low) / low) * 100 : 0;
+      const posInRange = (high - low) > 0 ? (last - low) / (high - low) : 0.5;
+
+      let isPumpDump = false;
+      let pumpDumpReason = '';
+
+      if (volQuote < 70000000 && (change24 >= 7.0 || rangePct >= 8.5)) {
+        const pdResult = await checkDormantPumpAndDumpTrap(sym, volQuote, change24, rangePct);
+        if (pdResult.isTrap) {
+          isPumpDump = true;
+          pumpDumpReason = pdResult.reason;
+        }
+      }
+
+      let score = 60 + (posInRange * 22) + (Math.min(change24, 15) * 0.9);
+      if (volQuote >= 10000000) score += 5;
+      if (rangePct >= 5.0) score += 3;
+
+      if (isPumpDump) {
+        score = 0;
+      }
+
+      universe[sym] = {
+        symbol: sym.replace('USDT', ''),
+        priceUSDT: last,
+        priceINR: Number((last * State.usdtToInrRate).toFixed(2)),
+        change24h: change24,
+        intradayRangePct: Number(rangePct.toFixed(2)),
+        pricePositionInRange: Number(posInRange.toFixed(2)),
+        score: Math.min(99, Math.round(score)),
+        volumeM: Math.round(volQuote / 1000000),
+        obi: 0.55,
+        isPumpAndDump: isPumpDump,
+        pumpDumpReason: pumpDumpReason
+      };
+    }
+
+    State.universe = universe;
+    State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
+    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75 && !c.isPumpAndDump).length;
+
+    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 75).`, 'info');
+    broadcastStateUpdate();
+  } catch (err) {
+    console.error('[Screener] Error running scan:', err.message);
+  }
+}
+
+// -------------------------------------------------------------
 // AUTOPILOT ENTRY EVALUATOR (3 SLOTS & MAX 5 RECOVERY BAGS)
 // -------------------------------------------------------------
 let isEvaluatingEntries = false;
@@ -1207,12 +1702,22 @@ wss.on('connection', (ws) => {
 // -------------------------------------------------------------
 loadDiskState();
 
-runDynamicScreener().then(() => {
-  console.log('[Screener] Initialized', Object.keys(State.universe).length, 'Binance Spot USDT pairs.');
-}).catch(() => {});
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`====================================================`);
+  console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
+  console.log(`Low-Latency Singapore Stream + Sentinel Active (<5ms)`);
+  console.log(`====================================================`);
 
-syncTradesFromGoogleSheets().catch(() => {});
-connectBinanceGlobalStream();
+  // Start background services AFTER port binding to eliminate deployment timeouts
+  runDynamicScreener().then(() => {
+    console.log('[Screener] Initialized', Object.keys(State.universe).length, 'Binance Spot USDT pairs.');
+  }).catch((e) => {
+    console.error('[Screener Init Error]', e.message);
+  });
+
+  syncTradesFromGoogleSheets().catch(() => {});
+  connectBinanceGlobalStream();
+});
 
 setInterval(() => {
   syncTradesFromGoogleSheets().catch(() => {});
@@ -1229,10 +1734,3 @@ setInterval(async () => {
 
 setInterval(broadcastPriceStream, 500);
 setInterval(runDynamicScreener, 60000);
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`====================================================`);
-  console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
-  console.log(`Low-Latency Singapore Stream + Sentinel Active (<5ms)`);
-  console.log(`====================================================`);
-});
