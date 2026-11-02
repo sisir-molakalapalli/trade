@@ -4,9 +4,9 @@
  * =========================================================================
  * - Low-latency Singapore Binance WebSocket stream (<5ms latency)
  * - 5 Concurrent Active Breakout Slots (High-Velocity Execution)
- * - Classic 6-Gate Confluence (BTC Macro, Wyckoff CVD, 15m VWAP, 1h 20-EMA, Depth)
- * - Minute-0 Trailing Ratchets (+0.35% BE Lock, +0.70% Profit Lock, +1.80% TP1)
- * - Spot Recovery Bag Engine (Transfer at -2.80% -> Target +0.30% Breakeven)
+ * - Strict Active Position Rule: Never close below +0.35% (Demote to Bag on failure)
+ * - Self-Aware Multi-Dimensional Trailing (Taker CVD, CLV, Rejection Wicks, Apex Harvest)
+ * - Spot Recovery Bag Engine (Target: +0.30% Breakeven / >3h Self-Aware Relief Trailing)
  * - 90-Minute 15m VWAP Technical Bounce Relief Exit
  * - Emergency Disaster Circuit Breaker Floor (-6.50%)
  * - Dual-Transport (POST + GET) Cloud Ledger Dispatch strictly to Sisir_Quant_Trade_Ledger
@@ -75,8 +75,8 @@ const State = {
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 75, liveObiGatePct: 45 },
-    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Progressive Trailing Ratchets + TP1 (+1.80%)' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Step 1 (+0.30% Target) / -6.50% Disaster Floor', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% Floor • Self-Aware Apex Harvest' },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Step 1 (+0.30% Target) / >3h Self-Aware Relief Trail', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -284,7 +284,6 @@ async function checkBtcMacroWeatherShield() {
 
     State.subsystems.btcMacroGate.btcChange15m = Number(btc15mChange.toFixed(2));
 
-    // If BTC drops more than -0.35% in 15m, pause all altcoin entries
     if (btc15mChange <= -0.35) {
       State.subsystems.btcMacroGate.allowAltcoinEntries = false;
       State.subsystems.btcMacroGate.status = 'PAUSED';
@@ -356,6 +355,51 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
 }
 
 // -------------------------------------------------------------
+// SELF-AWARE MULTI-DIMENSIONAL ORDER FLOW & EXHAUSTION SENSOR
+// -------------------------------------------------------------
+async function checkSelfAwareOrderFlow(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=5m&limit=5`;
+    const klines = await safeFetch(url, 2500);
+
+    if (!Array.isArray(klines) || klines.length < 3) {
+      return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50, upperWickRatio: 0 };
+    }
+
+    const curBar = klines[klines.length - 1];
+    const open = parseFloat(curBar[1]);
+    const high = parseFloat(curBar[2]);
+    const low = parseFloat(curBar[3]);
+    const close = parseFloat(curBar[4]);
+    const vol = parseFloat(curBar[5]);
+    const takerBuyVol = parseFloat(curBar[9]);
+
+    const takerBuyRatio = vol > 0 ? (takerBuyVol / vol) * 100 : 50;
+    const range = high - low;
+    const clv = range > 0 ? (close - low) / range : 0.5;
+    const upperWickRatio = range > 0 ? (high - Math.max(open, close)) / range : 0;
+
+    // Apex exhaustion: buyer momentum fades near peak with heavy upper rejection shadow
+    const isApexExhausted = (takerBuyRatio < 42.0 && upperWickRatio >= 0.35) || (clv < 0.30 && range > 0);
+
+    // Upside dead: persistent taker selling and weak close on retrace
+    const isUpsideDead = (takerBuyRatio < 40.0 && close < open && clv < 0.35);
+
+    return {
+      isApexExhausted,
+      isUpsideDead,
+      takerBuyRatio: Number(takerBuyRatio.toFixed(1)),
+      clv: Number(clv.toFixed(2)),
+      upperWickRatio: Number(upperWickRatio.toFixed(2))
+    };
+  } catch (err) {
+    return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50, upperWickRatio: 0 };
+  }
+}
+
+// -------------------------------------------------------------
 // MICROSTRUCTURE MOMENTUM & 15M VWAP GATE
 // -------------------------------------------------------------
 async function checkMicrostructureMomentumAndVwap(symbol) {
@@ -411,7 +455,6 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       return { passed: false, reason: `Price below 15m VWAP ($${curClose.toFixed(4)} < $${vwap4h.toFixed(4)})` };
     }
 
-    // Classic Dual-Track Momentum Qualification
     const isTrackA = (change15mPct >= 0.50 && rvol >= 1.10 && distFrom4hHighPct <= 3.50);
     const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 4.00 && (change1hPct >= 0.80 || curChange15m >= 0.30));
 
@@ -626,7 +669,6 @@ async function evaluateAutopilotEntries() {
   const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 5;
   if (currentCount >= maxSlots) return;
 
-  // Gate 1: Check Bitcoin Macro Weather Shield
   const isBtcHealthy = await checkBtcMacroWeatherShield();
   if (!isBtcHealthy) return;
 
@@ -664,19 +706,15 @@ async function evaluateAutopilotEntries() {
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
       if (posInRange < 0.45) continue;
 
-      // Gate 2: Wyckoff Order Flow & Taker CVD
       const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
       if (!orderFlow.passed) continue;
 
-      // Gate 3: Microstructure Momentum & 15m VWAP
       const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
       if (!microMom.passed) continue;
 
-      // Gate 4: 1h 20-EMA Macro Trend Alignment
       const trend1h = await check1hTrendAlignment(pairKey);
       if (!trend1h.passed) continue;
 
-      // Gate 5: 20-Level Real Order Book Depth Gate
       let book = await fetchRealOrderBookDepth(pairKey);
       if (!book) {
         book = {
@@ -709,7 +747,7 @@ async function runPredictiveSentry() {
   const activeKeys = Object.keys(State.activePositions || {});
   const bagKeys = Object.keys(State.recoveryBags || {});
 
-  // PART 1: ACTIVE BREAKOUT POSITIONS
+  // PART 1: ACTIVE BREAKOUT POSITIONS (NEVER CLOSE BELOW +0.35%)
   for (const k of activeKeys) {
     const pos = State.activePositions[k];
     if (!pos) continue;
@@ -724,25 +762,57 @@ async function runPredictiveSentry() {
     pos.peakHighPrice = Math.max(pos.peakHighPrice || entryPrice, livePrice);
     const peakGain = pos.peakGainPct;
 
-    // Ratchet 1: Breakeven lock at +0.30%
-    if (peakGain >= 0.30 && (pos.ratchetStage === 'INITIAL' || !pos.ratchetStage)) {
+    // Minimum Floor Constraint: Stop loss can NEVER be set below entry * 1.0035 (+0.35%)
+    const minExitPriceFloor = Number((entryPrice * 1.0035).toFixed(6));
+
+    // Ratchet 1: Breakeven / Min-Floor lock at +0.35%
+    if (peakGain >= 0.35 && (pos.ratchetStage === 'INITIAL' || !pos.ratchetStage)) {
       pos.ratchetStage = 'BREAKEVEN_LOCKED';
-      pos.sl = Number((entryPrice * 1.0030).toFixed(6)); // +0.30% locked
-      logOperation('SENTRY', `${pos.pair}: Breakeven locked (+0.30%). Peak: +${peakGain.toFixed(2)}%`, 'success');
+      pos.sl = minExitPriceFloor; // Strictly locked at >= +0.35%
+      logOperation('SENTRY', `${pos.pair}: Breakeven locked (+0.35% minimum floor). Peak: +${peakGain.toFixed(2)}%`, 'success');
     }
 
     // Ratchet 2: Profit lock at +0.70%
     if (peakGain >= 0.70 && pos.ratchetStage !== 'PROFIT_LOCKED' && pos.ratchetStage !== 'DYNAMIC_TRAIL' && pos.ratchetStage !== 'RUNNER_TRAIL') {
       pos.ratchetStage = 'PROFIT_LOCKED';
-      pos.sl = Number((entryPrice * 1.0035).toFixed(6)); // +0.35% profit secured
-      logOperation('SENTRY', `${pos.pair}: Profit lock engaged (+0.35% secured).`, 'success');
+      pos.sl = Math.max(minExitPriceFloor, Number((entryPrice * 1.0050).toFixed(6))); // +0.50% profit secured
+      logOperation('SENTRY', `${pos.pair}: Profit lock engaged (+0.50% secured).`, 'success');
     }
 
-    // Ratchet 3: Dynamic apex trailing at +1.20%
-    if (peakGain >= 1.20 && peakGain < 1.80) {
+    // Ratchet 3: Dynamic apex trailing at +1.00%
+    if (peakGain >= 1.00 && peakGain < 1.80) {
       pos.ratchetStage = 'DYNAMIC_TRAIL';
       const trailFloor = Number((pos.peakHighPrice * 0.9965).toFixed(6)); // Trails 0.35% below peak
-      if (!pos.sl || trailFloor > pos.sl) pos.sl = trailFloor;
+      pos.sl = Math.max(minExitPriceFloor, pos.sl || 0, trailFloor);
+    }
+
+    // Self-Aware Trailing: Apex Harvest at Peak (Strictly >= +0.35%)
+    if (gainPct >= 0.35) {
+      const selfAware = await checkSelfAwareOrderFlow(k);
+      if (selfAware.isApexExhausted && livePrice >= minExitPriceFloor) {
+        logOperation('SENTRY_EXIT', `Self-Aware Peak Harvest on ${pos.pair}: Taker Buy ${selfAware.takerBuyRatio}% / Upper Wick ${Math.round(selfAware.upperWickRatio * 100)}% signaled apex. Banked at +${gainPct.toFixed(2)}% ($${livePrice.toFixed(4)}).`, 'success');
+        
+        const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
+        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+        const tradePayload = {
+          id: Date.now(),
+          pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
+          type: 'SELF-AWARE PEAK HARVEST',
+          entryPriceUSDT: entryPrice,
+          exitPriceUSDT: livePrice,
+          notionalUSDT: exitNotional,
+          pnlUSDT: realizedGain,
+          reason: `Self-aware peak harvest (+${gainPct.toFixed(2)}% >= +0.35% floor)`
+        };
+
+        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
+        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+        delete State.activePositions[k];
+        saveDiskState();
+        broadcastStateUpdate();
+        recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
+        continue;
+      }
     }
 
     // Take Profit 1 (+1.80%): Bank 50%, runner trails
@@ -750,7 +820,7 @@ async function runPredictiveSentry() {
       pos.tp1Secured = true;
       pos.tp1Price = livePrice;
       pos.ratchetStage = 'RUNNER_TRAIL';
-      pos.sl = Number((pos.peakHighPrice * 0.9950).toFixed(6)); // Trails 0.50% below peak
+      pos.sl = Math.max(minExitPriceFloor, Number((pos.peakHighPrice * 0.9950).toFixed(6))); // Trails 0.50% below peak
       logOperation('SENTRY_EXIT', `TP1 BANKED on ${pos.pair}: 50% sold at +${gainPct.toFixed(2)}% ($${livePrice.toFixed(4)}). Runner trailing.`, 'success');
       await recordTradeToCloudLedger({
         id: Date.now(),
@@ -764,58 +834,38 @@ async function runPredictiveSentry() {
       });
     }
 
-    // Trailing Stop Execution
+    // Trailing Stop Execution (Strictly >= +0.35%)
     if (pos.sl && livePrice <= pos.sl && pos.ratchetStage !== 'INITIAL') {
-      const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-      
-      logOperation('SENTRY_EXIT', `Trailing stop executed on ${pos.pair} at $${livePrice.toFixed(4)} (${realizedGain >= 0 ? '+' : ''}$${realizedGain.toFixed(2)} USDT).`, realizedGain >= 0 ? 'success' : 'warning');
+      if (gainPct >= 0.35 && livePrice >= minExitPriceFloor) {
+        const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
+        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+        
+        logOperation('SENTRY_EXIT', `Trailing stop executed on ${pos.pair} at $${livePrice.toFixed(4)} (+${gainPct.toFixed(2)}% >= +0.35%). Realized: +$${realizedGain.toFixed(2)} USDT.`, 'success');
 
-      const tradePayload = {
-        id: Date.now(),
-        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: pos.tp1Secured ? 'RUNNER EXIT' : (realizedGain >= 0 ? 'TRAILING PROFIT LOCK' : 'BREAKEVEN EXIT'),
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: exitNotional,
-        pnlUSDT: realizedGain,
-        reason: `Trailing stop triggered at $${livePrice.toFixed(4)} (Peak: +${peakGain.toFixed(2)}%)`
-      };
+        const tradePayload = {
+          id: Date.now(),
+          pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
+          type: pos.tp1Secured ? 'RUNNER EXIT' : 'TRAILING PROFIT LOCK (+0.35%+)',
+          entryPriceUSDT: entryPrice,
+          exitPriceUSDT: livePrice,
+          notionalUSDT: exitNotional,
+          pnlUSDT: realizedGain,
+          reason: `Trailing stop triggered at $${livePrice.toFixed(4)} (Peak: +${peakGain.toFixed(2)}%)`
+        };
 
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.activePositions[k];
-      saveDiskState();
-      broadcastStateUpdate();
+        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
+        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+        delete State.activePositions[k];
+        saveDiskState();
+        broadcastStateUpdate();
 
-      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-      continue;
+        recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
+        continue;
+      }
     }
 
-    // Demote to Spot Recovery Bag at -2.80%
-    if (!pos.tp1Secured && gainPct <= -2.80) {
-      logOperation('SENTRY_DEMOTE', `Breakout pullback on ${pos.pair} (${gainPct.toFixed(2)}%). Transferred to Spot Recovery Bag (Target: +0.30% Breakeven).`, 'warning');
-
-      State.recoveryBags[k] = {
-        pair: pos.pair,
-        pairSymbol: pos.pairSymbol,
-        openedAt: pos.openedAt,
-        movedAt: Date.now(),
-        entryPriceUSDT: entryPrice,
-        livePriceUSDT: livePrice,
-        notionalUSDT: pos.notionalUSDT,
-        qty: pos.qty,
-        targetStep: 'STEP 1 (+0.30%)',
-        targetExitPriceUSDT: Number((entryPrice * 1.0030).toFixed(6))
-      };
-
-      delete State.activePositions[k];
-      broadcastStateUpdate();
-      continue;
-    }
-
-    // 45-Minute Alpha Velocity Scratch
-    if (holdMinutes >= 45 && gainPct >= 0.08) {
+    // 45-Minute Alpha Velocity Scratch (Only if >= +0.35%)
+    if (holdMinutes >= 45 && gainPct >= 0.35) {
       const exitNotional = pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
 
@@ -827,7 +877,7 @@ async function runPredictiveSentry() {
         exitPriceUSDT: livePrice,
         notionalUSDT: exitNotional,
         pnlUSDT: realizedGain,
-        reason: `45m Velocity Scratch: Cleared stalled breakout at +${gainPct.toFixed(2)}%`
+        reason: `45m Velocity Scratch: Cleared stalled breakout at +${gainPct.toFixed(2)}% (>= +0.35%)`
       });
 
       State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
@@ -835,9 +885,45 @@ async function runPredictiveSentry() {
       delete State.activePositions[k];
       continue;
     }
+
+    // Demote to Spot Recovery Bag: NEVER CLOSE BELOW +0.35% IN BREAKOUT SLOT
+    // If momentum fails or price pulls back, transfer safely to Recovery Bag
+    if (!pos.tp1Secured && gainPct < 0.35) {
+      let shouldDemote = (gainPct <= -2.80);
+
+      if (!shouldDemote && holdMinutes >= 20 && gainPct <= -0.50) {
+        const selfAwareCheck = await checkSelfAwareOrderFlow(k);
+        if (selfAwareCheck.isUpsideDead) {
+          shouldDemote = true;
+        }
+      }
+
+      if (shouldDemote) {
+        logOperation('SENTRY_DEMOTE', `${pos.pair}: Upside exhausted / retrace (${gainPct.toFixed(2)}%). Transferred to Spot Recovery Bag (Never closed below +0.35%).`, 'warning');
+
+        State.recoveryBags[k] = {
+          pair: pos.pair,
+          pairSymbol: pos.pairSymbol,
+          openedAt: pos.openedAt,
+          movedAt: Date.now(),
+          entryPriceUSDT: entryPrice,
+          livePriceUSDT: livePrice,
+          notionalUSDT: pos.notionalUSDT,
+          qty: pos.qty,
+          targetStep: 'STEP 1 (+0.30%)',
+          targetExitPriceUSDT: Number((entryPrice * 1.0030).toFixed(6)),
+          troughPrice: livePrice,
+          bouncePeakPrice: livePrice
+        };
+
+        delete State.activePositions[k];
+        broadcastStateUpdate();
+        continue;
+      }
+    }
   }
 
-  // PART 2: SPOT RECOVERY BAGS
+  // PART 2: SPOT RECOVERY BAGS (WITH SELF-AWARE TRAILING AFTER 3 HOURS)
   for (const k of bagKeys) {
     const bag = State.recoveryBags[k];
     if (!bag) continue;
@@ -848,8 +934,10 @@ async function runPredictiveSentry() {
     const holdHours = (Date.now() - (bag.movedAt || Date.now())) / 3600000;
 
     bag.livePriceUSDT = livePrice;
+    bag.troughPrice = Math.min(bag.troughPrice || livePrice, livePrice);
+    bag.bouncePeakPrice = Math.max(bag.bouncePeakPrice || livePrice, livePrice);
 
-    // Target Step 1: +0.30% Breakeven Target
+    // Target Step 1: Standard +0.30% Breakeven Target
     const targetPrice = bag.targetExitPriceUSDT || (entryPrice * 1.0030);
     if (livePrice >= targetPrice) {
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
@@ -873,7 +961,56 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // 15m VWAP Technical Bounce Exit after 90 mins
+    // -------------------------------------------------------------
+    // SELF-AWARE RELIEF TRAILING FOR BAGS HELD > 3 HOURS
+    // -------------------------------------------------------------
+    if (holdHours >= 3.0) {
+      bag.selfAwareActive = true;
+      const selfAware = await checkSelfAwareOrderFlow(k);
+      const bounceFromTroughPct = bag.troughPrice > 0 ? (((livePrice - bag.troughPrice) / bag.troughPrice) * 100) : 0;
+
+      // Trailing floor 0.30% beneath the bounce peak
+      const reliefTrailFloor = Number((bag.bouncePeakPrice * 0.9970).toFixed(6));
+      bag.recoverySl = Math.max(bag.recoverySl || 0, reliefTrailFloor);
+
+      // Exit trigger 1: Bounce crest rolls over into trailing floor
+      const isTrailHit = (bag.recoverySl && livePrice <= bag.recoverySl && bounceFromTroughPct >= 0.40);
+      
+      // Exit trigger 2: Order-flow exhaustion on relief bounce (Taker buy collapses or heavy upper wick)
+      const isReliefExhausted = (selfAware.isApexExhausted && bounceFromTroughPct >= 0.45);
+
+      // Exit trigger 3: Near-breakeven relief (gainPct >= -0.10%)
+      const isNearBreakeven = (gainPct >= -0.10);
+
+      if (isTrailHit || isReliefExhausted || isNearBreakeven) {
+        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
+        const exitReason = isNearBreakeven 
+          ? `Self-Aware >3h: Near-breakeven relief exit at $${livePrice.toFixed(4)}`
+          : `Self-Aware >3h Trailing Exit: Captured bounce peak $${bag.bouncePeakPrice.toFixed(4)} at $${livePrice.toFixed(4)}`;
+
+        logOperation('RECOVERY', `Self-Aware Trailing Exit executed on ${bag.pair} held ${holdHours.toFixed(1)}h at $${livePrice.toFixed(4)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%). Best price secured.`, gainPct >= 0 ? 'success' : 'info');
+
+        await recordTradeToCloudLedger({
+          id: Date.now(),
+          pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
+          type: gainPct >= 0 ? 'RECOVERY SELF-AWARE WIN' : 'RECOVERY SELF-AWARE TRAIL',
+          entryPriceUSDT: entryPrice,
+          exitPriceUSDT: livePrice,
+          notionalUSDT: bag.notionalUSDT,
+          pnlUSDT: realizedGain,
+          reason: exitReason
+        });
+
+        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
+        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+        delete State.recoveryBags[k];
+        saveDiskState();
+        broadcastStateUpdate();
+        continue;
+      }
+    }
+
+    // 15m VWAP Technical Bounce Exit after 90 mins (if gain >= -0.15%)
     if (holdHours >= 1.5 && gainPct >= -0.15) {
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
       logOperation('RECOVERY', `VWAP relief exit on ${bag.pair} at $${livePrice.toFixed(4)}. Capital recycled.`, 'info');
@@ -1105,7 +1242,6 @@ async function recordTradeToCloudLedger(trade) {
 
   const targetUrl = (trade.targetUrl || State.masterLedgerUrl || '').trim();
   let success = false;
-  let lastError = null;
 
   try {
     console.log(`[Cloud Ledger] Dispatching trade ${record.pair} (${record.type}) strictly to Sisir_Quant_Trade_Ledger...`);
@@ -1115,7 +1251,6 @@ async function recordTradeToCloudLedger(trade) {
       success = true;
     }
   } catch (err) {
-    lastError = err;
     console.error(`[Cloud Ledger POST Error] ${err.message}. Retrying via GET fallback...`);
   }
 
@@ -1130,7 +1265,7 @@ async function recordTradeToCloudLedger(trade) {
         success = true;
       }
     } catch (err2) {
-      lastError = err2;
+      console.warn(`[Cloud Ledger GET Fallback Notice]`, err2.message);
     }
   }
 
