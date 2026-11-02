@@ -82,21 +82,20 @@ const State = {
   cooldowns: {},
   futuresFundingMap: {}, // Background zero-latency funding cache
   subsystems: {
-    timeMachine: { status: 'ONLINE', replaysCompleted: 0, lastEvaluatedSymbol: '--', lastWinOddsPct: 55, minOddsFloorPct: 45, recentReplays: [] },
     liveFeed: [], // Real-time streaming operational event log
     pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
     divergenceSentry: { status: 'ARMED', exitsExecuted: 0, lastTriggeredSymbol: '--', activeWatch: 'Self-Aware Price / CVD / OI / Order-Flow' },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 12, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
-    regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 70, liveObiGatePct: 45 },
+    regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 75, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Self-Aware Trailing (Price+CVD+OI) • Upside Exhaustion Bag Route' },
     recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Breakeven +0.30% Target / Adaptive Relief Trail (<-2.50%)', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Drive Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
   marketRegime: 'BALANCED',
-  activeThresholds: { regime: 'BALANCED', scoreThreshold: 70, obiThreshold: 0.45, maxSpread: 0.20, marketAvgRange: 4.5 },
+  activeThresholds: { regime: 'BALANCED', scoreThreshold: 75, obiThreshold: 0.45, maxSpread: 0.20, marketAvgRange: 4.5 },
   tradeFrequencyController: {
     dynamicGovernorEnabled: true,
     quotaBypassEnabled: false,
@@ -542,14 +541,14 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       return { passed: false, reason: `15m Bearish Divergence: RSI falling during price high` };
     }
 
-    // Calibrated momentum tracks: Preserves safeguards while allowing clean intraday pullbacks
-    const isTrackA = (change15mPct >= 0.40 && rvol >= 1.05 && distFrom4hHighPct <= 4.50);
-    const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 5.00 && (change1hPct >= 0.60 || curChange15m >= 0.25));
+    // Classic Pre-Time Machine Dual-Track Momentum
+    const isTrackA = (change15mPct >= 0.50 && rvol >= 1.10 && distFrom4hHighPct <= 3.50);
+    const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 4.00 && (change1hPct >= 0.80 || curChange15m >= 0.30));
 
     if (!isTrackA && !isTrackB) {
       return { 
         passed: false, 
-        reason: `Failed Dual-Track Momentum (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%, HighDist: ${distFrom4hHighPct.toFixed(2)}%)` 
+        reason: `Failed Momentum Qualification (15m: ${change15mPct.toFixed(2)}%, RVOL: ${rvol.toFixed(2)}x, 1h: ${change1hPct.toFixed(2)}%, HighDist: ${distFrom4hHighPct.toFixed(2)}%)` 
       };
     }
 
@@ -606,89 +605,6 @@ async function check1hTrendAlignment(symbol) {
     return { passed: true, price: curClose, ema20: ema };
   } catch (err) {
     return { passed: true, reason: 'Trend check fallback' };
-  }
-}
-
-// -------------------------------------------------------------
-// TIME MACHINE 48-CANDLE HISTORICAL REPLAY ODDS ENGINE (WITH MEMORY CACHE)
-// -------------------------------------------------------------
-const timeMachineCache = new Map();
-
-async function evaluateTimeMachineBreakoutOdds(symbol) {
-  try {
-    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-
-    // Efficiency Optimization: Return cached result if evaluated within 3 minutes
-    const cached = timeMachineCache.get(pairSym);
-    if (cached && (Date.now() - cached.timestamp < 180000)) {
-      return cached.result;
-    }
-
-    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=15m&limit=48`;
-    const klines = await safeFetch(url, 3500);
-
-    if (!Array.isArray(klines) || klines.length < 24) {
-      const fallbackRes = { passed: true, oddsPct: 55, setupsDetected: 0, minOddsRequired: 45 };
-      timeMachineCache.set(pairSym, { timestamp: Date.now(), result: fallbackRes });
-      return fallbackRes;
-    }
-
-    let setupsDetected = 0;
-    let continuationWins = 0;
-
-    for (let i = 2; i < klines.length - 2; i++) {
-      const open = parseFloat(klines[i][1]);
-      const close = parseFloat(klines[i][4]);
-      const barGain = open > 0 ? ((close - open) / open) * 100 : 0;
-
-      if (barGain >= 0.80) {
-        setupsDetected++;
-        const nextHigh1 = parseFloat(klines[i + 1][2]);
-        const nextHigh2 = (i + 2 < klines.length) ? parseFloat(klines[i + 2][2]) : nextHigh1;
-        const maxContinuation = Math.max(nextHigh1, nextHigh2);
-        const continuationPct = close > 0 ? ((maxContinuation - close) / close) * 100 : 0;
-
-        if (continuationPct >= 0.80) {
-          continuationWins++;
-        }
-      }
-    }
-
-    const oddsPct = setupsDetected >= 2 ? Math.round((continuationWins / setupsDetected) * 100) : 55;
-    const minOddsRequired = (learningEngine?.state?.dynamicHurdles?.minOddsRequired) || 45;
-    const passed = oddsPct >= minOddsRequired;
-    const shortSym = cleanSym.replace('USDT', '');
-
-    if (State.subsystems && State.subsystems.timeMachine) {
-      State.subsystems.timeMachine.replaysCompleted = (State.subsystems.timeMachine.replaysCompleted || 0) + 1;
-      State.subsystems.timeMachine.lastEvaluatedSymbol = shortSym;
-      State.subsystems.timeMachine.lastWinOddsPct = oddsPct;
-      State.subsystems.timeMachine.minOddsFloorPct = minOddsRequired;
-      State.subsystems.timeMachine.status = 'ACTIVE';
-
-      // Keep recent multi-token replays list updated
-      if (!State.subsystems.timeMachine.recentReplays) State.subsystems.timeMachine.recentReplays = [];
-      State.subsystems.timeMachine.recentReplays = [
-        { symbol: shortSym, odds: oddsPct, passed, time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) },
-        ...State.subsystems.timeMachine.recentReplays.filter(r => r.symbol !== shortSym)
-      ].slice(0, 5);
-    }
-
-    const result = {
-      passed,
-      oddsPct,
-      setupsDetected,
-      minOddsRequired,
-      reason: passed ? 'Optimal continuation probability' : `Low continuation odds (${oddsPct}% < ${minOddsRequired}%)`
-    };
-
-    timeMachineCache.set(pairSym, { timestamp: Date.now(), result });
-    logOperation('TIME_MACHINE', `Replayed 48 bars on ${shortSym}/USDT: ${oddsPct}% odds (${setupsDetected} past spikes). ${passed ? 'PASSED' : 'REJECTED'}`, passed ? 'success' : 'warning');
-
-    return result;
-  } catch (err) {
-    return { passed: true, oddsPct: 55, setupsDetected: 0, minOddsRequired: 45 };
   }
 }
 
@@ -784,19 +700,9 @@ async function runDynamicScreener() {
 
     State.universe = universe;
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
-    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 70 && !c.isPumpAndDump).length;
+    State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75 && !c.isPumpAndDump).length;
 
-    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 70).`, 'info');
-
-    // Multi-candidate Time Machine pre-replays: Proactively test top 5 candidates
-    const topCandidates = Object.keys(universe)
-      .filter(sym => !universe[sym]?.isPumpAndDump)
-      .sort((a, b) => (universe[b]?.score || 0) - (universe[a]?.score || 0))
-      .slice(0, 5);
-
-    for (const sym of topCandidates) {
-      await evaluateTimeMachineBreakoutOdds(sym).catch(() => {});
-    }
+    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 75).`, 'info');
     broadcastStateUpdate();
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
@@ -874,7 +780,7 @@ async function evaluateAutopilotEntries() {
   const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
   learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
 
-  const minScore = State.activeThresholds?.scoreThreshold || 70;
+  const minScore = State.activeThresholds?.scoreThreshold || 75;
   const keys = Object.keys(State.universe || {});
   if (keys.length === 0) return;
 
@@ -897,23 +803,23 @@ async function evaluateAutopilotEntries() {
 
       if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > Date.now()) continue;
 
-      if (++evaluatedCount > 25) break;
+      if (++evaluatedCount > 30) break;
 
       const change24h = Number(coin.priceChangePct || coin.change24h || 0);
       const rangePct = Number(coin.intradayRangePct || 0);
       if (change24h < 0.20 && rangePct < 3.0) continue;
 
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
-      if (posInRange < 0.40) continue;
+      if (posInRange < 0.45) continue;
 
-      // Check 1: Binance Futures Funding Rate Overcrowded Long Veto (< +0.05%)
+      // Gate 1: Binance Futures Funding Rate Overcrowded Long Veto (< +0.05%)
       const fundingRate = State.futuresFundingMap[pairKey];
       if (fundingRate !== undefined && fundingRate > 0.05) {
         logOperation('FUTURES_GUARD', `Blocked ${pairKey}: Funding rate is +${fundingRate}%/8h (Crowded long squeeze risk).`, 'warning');
         continue;
       }
 
-      // Check 2: Custom Dormant Pump & Dump Trap (<$70M quote volume)
+      // Gate 2: Custom Dormant Pump & Dump Trap (<$70M quote volume)
       const volQuote = (coin.volumeM || 0) * 1000000;
       if (volQuote < 70000000 && (change24h >= 7.5 || rangePct >= 9.0)) {
         const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
@@ -923,28 +829,19 @@ async function evaluateAutopilotEntries() {
         }
       }
 
-      // Check 3: Wyckoff Order Flow & Taker Buy CVD
+      // Gate 3: Wyckoff Order Flow & Taker Buy CVD (Taker Buy >= 48%, Net Delta >= 0, CLV >= 0.35)
       const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
       if (!orderFlow.passed) continue;
 
-      // Check 4: Microstructure Momentum & 15m VWAP
+      // Gate 4: Microstructure Momentum & 15m VWAP
       const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
       if (!microMom.passed) continue;
 
-      // Check 5: 1h 20-EMA Macro Trend Alignment
+      // Gate 5: 1h 20-EMA Macro Trend Alignment & Climax Filter
       const trend1h = await check1hTrendAlignment(pairKey);
       if (!trend1h.passed) continue;
 
-      // Check 6: Time Machine 48-Candle Replay Odds Gate
-      const timeMachine = await evaluateTimeMachineBreakoutOdds(pairKey);
-      if (!timeMachine.passed) {
-        logOperation('TM_REJECT', `${pairKey} halted: TM odds ${timeMachine.oddsPct}% < ${timeMachine.minOddsRequired}% required continuation proof.`, 'warning');
-        continue;
-      }
-
-      logOperation('TM_PASSED', `${pairKey} PASSED Time Machine (${timeMachine.oddsPct}% odds). Inspecting live 20-depth Order Book...`, 'info');
-
-      // Check 7: 20-Level Real Order Book Liquidity & Spread Gate
+      // Gate 6: 20-Level Real Order Book Liquidity & Spread Gate
       let book = await fetchRealOrderBookDepth(pairKey);
       if (!book) {
         book = {
@@ -955,14 +852,14 @@ async function evaluateAutopilotEntries() {
         };
       }
 
-      if (book.obi < 0.40 || book.spreadPct > 0.25) {
-        logOperation('BOOK_VETO', `${pairKey} halted post-TM: OBI ${Math.round(book.obi * 100)}% (req >= 40%) or Spread ${book.spreadPct.toFixed(2)}% (req <= 0.25%).`, 'warning');
+      if (book.obi < 0.45 || book.spreadPct > 0.20) {
+        logOperation('BOOK_VETO', `${pairKey} halted: OBI ${Math.round(book.obi * 100)}% (req >= 45%) or Spread ${book.spreadPct.toFixed(2)}% (req <= 0.20%).`, 'warning');
         continue;
       }
 
       logOperation('BOOK_CLEAR', `${pairKey} Order Book verified: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%. Deploying capital...`, 'success');
 
-      console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, TM Odds ${timeMachine.oddsPct}%, 15m ${microMom.change15mPct}%`);
+      console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, 15m ${microMom.change15mPct}%`);
       await executeSpotBuy(pairKey, coin, book, microMom);
     }
   } finally {
