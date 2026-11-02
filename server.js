@@ -82,7 +82,8 @@ const State = {
   cooldowns: {},
   futuresFundingMap: {}, // Background zero-latency funding cache
   subsystems: {
-    timeMachine: { status: 'ONLINE', replaysCompleted: 0, lastEvaluatedSymbol: '--', lastWinOddsPct: 55, minOddsFloorPct: 45 },
+    timeMachine: { status: 'ONLINE', replaysCompleted: 0, lastEvaluatedSymbol: '--', lastWinOddsPct: 55, minOddsFloorPct: 45, recentReplays: [] },
+    liveFeed: [], // Real-time streaming operational event log
     pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
     divergenceSentry: { status: 'ARMED', exitsExecuted: 0, lastTriggeredSymbol: '--', activeWatch: 'RSI / CVD / Bid Vaporization' },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 12, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M-$12M)' },
@@ -297,6 +298,26 @@ function checkBearishDivergence(klines, period = 14) {
     prevRsi,
     takerRatio: Number(curTakerRatio.toFixed(1))
   };
+}
+
+// -------------------------------------------------------------
+// LIVE OPERATIONAL EVENT STREAM LOGGER
+// -------------------------------------------------------------
+function logOperation(category, message, level = 'info') {
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+  const entry = {
+    id: Date.now() + Math.random(),
+    time: timeStr,
+    category,
+    message,
+    level // 'info', 'success', 'warning', 'danger'
+  };
+  if (!State.subsystems.liveFeed) State.subsystems.liveFeed = [];
+  State.subsystems.liveFeed.unshift(entry);
+  if (State.subsystems.liveFeed.length > 30) {
+    State.subsystems.liveFeed.pop();
+  }
 }
 
 // -------------------------------------------------------------
@@ -584,17 +605,28 @@ async function check1hTrendAlignment(symbol) {
 }
 
 // -------------------------------------------------------------
-// TIME MACHINE 48-CANDLE HISTORICAL REPLAY ODDS ENGINE
+// TIME MACHINE 48-CANDLE HISTORICAL REPLAY ODDS ENGINE (WITH MEMORY CACHE)
 // -------------------------------------------------------------
+const timeMachineCache = new Map();
+
 async function evaluateTimeMachineBreakoutOdds(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+
+    // Efficiency Optimization: Return cached result if evaluated within 3 minutes
+    const cached = timeMachineCache.get(pairSym);
+    if (cached && (Date.now() - cached.timestamp < 180000)) {
+      return cached.result;
+    }
+
     const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=15m&limit=48`;
     const klines = await safeFetch(url, 3500);
 
     if (!Array.isArray(klines) || klines.length < 24) {
-      return { passed: true, oddsPct: 55, setupsDetected: 0, minOddsRequired: 45 };
+      const fallbackRes = { passed: true, oddsPct: 55, setupsDetected: 0, minOddsRequired: 45 };
+      timeMachineCache.set(pairSym, { timestamp: Date.now(), result: fallbackRes });
+      return fallbackRes;
     }
 
     let setupsDetected = 0;
@@ -621,22 +653,35 @@ async function evaluateTimeMachineBreakoutOdds(symbol) {
     const oddsPct = setupsDetected >= 2 ? Math.round((continuationWins / setupsDetected) * 100) : 55;
     const minOddsRequired = (learningEngine?.state?.dynamicHurdles?.minOddsRequired) || 45;
     const passed = oddsPct >= minOddsRequired;
+    const shortSym = cleanSym.replace('USDT', '');
 
     if (State.subsystems && State.subsystems.timeMachine) {
       State.subsystems.timeMachine.replaysCompleted = (State.subsystems.timeMachine.replaysCompleted || 0) + 1;
-      State.subsystems.timeMachine.lastEvaluatedSymbol = pairSym.replace('USDT', '');
+      State.subsystems.timeMachine.lastEvaluatedSymbol = shortSym;
       State.subsystems.timeMachine.lastWinOddsPct = oddsPct;
       State.subsystems.timeMachine.minOddsFloorPct = minOddsRequired;
       State.subsystems.timeMachine.status = 'ACTIVE';
+
+      // Keep recent multi-token replays list updated
+      if (!State.subsystems.timeMachine.recentReplays) State.subsystems.timeMachine.recentReplays = [];
+      State.subsystems.timeMachine.recentReplays = [
+        { symbol: shortSym, odds: oddsPct, passed, time: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) },
+        ...State.subsystems.timeMachine.recentReplays.filter(r => r.symbol !== shortSym)
+      ].slice(0, 5);
     }
 
-    return {
+    const result = {
       passed,
       oddsPct,
       setupsDetected,
       minOddsRequired,
       reason: passed ? 'Optimal continuation probability' : `Low continuation odds (${oddsPct}% < ${minOddsRequired}%)`
     };
+
+    timeMachineCache.set(pairSym, { timestamp: Date.now(), result });
+    logOperation('TIME_MACHINE', `Replayed 48 bars on ${shortSym}/USDT: ${oddsPct}% odds (${setupsDetected} past spikes). ${passed ? 'PASSED' : 'REJECTED'}`, passed ? 'success' : 'warning');
+
+    return result;
   } catch (err) {
     return { passed: true, oddsPct: 55, setupsDetected: 0, minOddsRequired: 45 };
   }
@@ -738,12 +783,18 @@ async function runDynamicScreener() {
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
     State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 75 && !c.isPumpAndDump).length;
 
-    const topCandidates = Object.keys(universe).sort((a, b) => (universe[b]?.score || 0) - (universe[a]?.score || 0));
-    if (topCandidates.length > 0) {
-      evaluateTimeMachineBreakoutOdds(topCandidates[0]).then(() => {
-        broadcastStateUpdate();
-      }).catch(() => {});
+    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 75).`, 'info');
+
+    // Multi-candidate Time Machine pre-replays: Proactively test top 5 candidates
+    const topCandidates = Object.keys(universe)
+      .filter(sym => !universe[sym]?.isPumpAndDump)
+      .sort((a, b) => (universe[b]?.score || 0) - (universe[a]?.score || 0))
+      .slice(0, 5);
+
+    for (const sym of topCandidates) {
+      await evaluateTimeMachineBreakoutOdds(sym).catch(() => {});
     }
+    broadcastStateUpdate();
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
   }
@@ -791,6 +842,7 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
   };
 
   console.log(`[Order Execution] BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT)`);
+  logOperation('EXECUTION', `BOUGHT ${sym}/USDT at $${livePrice} ($${notional.toFixed(2)} USDT). Slot occupied.`, 'success');
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
 }
@@ -840,6 +892,7 @@ async function evaluateAutopilotEntries() {
     const fundingRate = State.futuresFundingMap[pairKey];
     if (fundingRate !== undefined && fundingRate > 0.05) {
       console.log(`[Futures Long Squeeze Veto] Blocked ${pairKey}: Funding rate is +${fundingRate}% per 8h`);
+      logOperation('FUTURES_GUARD', `Blocked ${pairKey}: Funding rate is +${fundingRate}%/8h (Crowded long squeeze risk).`, 'warning');
       continue;
     }
 
@@ -850,6 +903,7 @@ async function evaluateAutopilotEntries() {
       const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
       if (pdCheck.isTrap) {
         console.log(`[PUMP & DUMP AVOIDED] Blocked entry on ${pairKey}: ${pdCheck.reason}`);
+        logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pdCheck.reason}`, 'danger');
         continue;
       }
     }
@@ -912,18 +966,21 @@ async function runPredictiveSentry() {
     if (peakGain >= 0.20 && pos.ratchetStage === 'INITIAL') {
       pos.ratchetStage = 'MICRO_SCRATCH_LOCKED';
       pos.sl = Number((entryPrice * 0.9980).toFixed(6)); // -0.20% maximum risk
+      logOperation('SENTRY', `${pos.pair}: Micro-scratch stop locked at -0.20% (Peak: +${peakGain.toFixed(2)}%)`, 'info');
     }
 
     // --- ASYMMETRIC MICRO-TRAIL LEVEL 2: PEAK >= +0.30% (PURE BREAKEVEN + FEES) ---
     if (peakGain >= 0.30 && (pos.ratchetStage === 'INITIAL' || pos.ratchetStage === 'MICRO_SCRATCH_LOCKED')) {
       pos.ratchetStage = 'BREAKEVEN_LOCKED';
       pos.sl = Number((entryPrice * 1.0008).toFixed(6)); // +0.08% covers all fees
+      logOperation('SENTRY', `${pos.pair}: Breakeven locked (+0.08% covers fees). Peak: +${peakGain.toFixed(2)}%`, 'success');
     }
 
     // --- ASYMMETRIC MICRO-TRAIL LEVEL 3: PEAK >= +0.50% (PROFIT LOCK) ---
     if (peakGain >= 0.50 && pos.ratchetStage !== 'PROFIT_LOCKED' && pos.ratchetStage !== 'DYNAMIC_TRAIL' && pos.ratchetStage !== 'RUNNER_TRAIL') {
       pos.ratchetStage = 'PROFIT_LOCKED';
       pos.sl = Number((entryPrice * 1.0025).toFixed(6)); // +0.25% in the bank
+      logOperation('SENTRY', `${pos.pair}: Profit lock engaged (+0.25% secured).`, 'success');
     }
 
     // --- ASYMMETRIC MICRO-TRAIL LEVEL 4: PEAK >= +0.80% (APEX TRAIL) ---
@@ -939,6 +996,7 @@ async function runPredictiveSentry() {
       pos.tp1Price = livePrice;
       pos.ratchetStage = 'RUNNER_TRAIL';
       pos.sl = Number((pos.peakHighPrice * 0.9965).toFixed(6));
+      logOperation('SENTRY_EXIT', `TP1 BANKED on ${pos.pair}: 50% sold at +${gainPct.toFixed(2)}% ($${livePrice.toFixed(4)}).`, 'success');
       await recordTradeToCloudLedger({
         id: Date.now(),
         pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
@@ -956,6 +1014,8 @@ async function runPredictiveSentry() {
       const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
       
+      logOperation('SENTRY_EXIT', `Trailing stop executed on ${pos.pair} at $${livePrice.toFixed(4)} (${realizedGain >= 0 ? '+' : ''}$${realizedGain.toFixed(2)} USDT).`, realizedGain >= 0 ? 'success' : 'warning');
+
       await recordTradeToCloudLedger({
         id: Date.now(),
         pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
@@ -974,12 +1034,13 @@ async function runPredictiveSentry() {
     }
 
     // --- EARLY ORDER-FLOW / BID VAPORIZATION KILL-SWITCH (2 to 10 Minutes) ---
-    // If trade is in minor deficit (-0.40% to -0.90%) and buyers pull bids, scratch early!
     if (holdMinutes >= 2.0 && holdMinutes <= 12.0 && gainPct <= -0.40 && !pos.tp1Secured) {
       const quickDepth = await fetchRealOrderBookDepth(k);
       if (quickDepth && quickDepth.obi < 0.36) {
         const exitNotional = pos.notionalUSDT;
         const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+
+        logOperation('SENTRY_EXIT', `Order-flow scratch on ${pos.pair}: OBI dropped to ${Math.round(quickDepth.obi * 100)}%. Scratched early at ${gainPct.toFixed(2)}%.`, 'warning');
 
         await recordTradeToCloudLedger({
           id: Date.now(),
@@ -1011,6 +1072,8 @@ async function runPredictiveSentry() {
         const exitNotional = pos.notionalUSDT;
         const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
 
+        logOperation('SENTRY_EXIT', `Divergence apex harvest on ${pos.pair}: Banked +${gainPct.toFixed(2)}% on order book exhaustion.`, 'success');
+
         await recordTradeToCloudLedger({
           id: Date.now(),
           pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
@@ -1033,6 +1096,8 @@ async function runPredictiveSentry() {
     if (gainPct <= -1.35) {
       const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+
+      logOperation('SENTRY_EXIT', `Breakout invalidation stop cut on ${pos.pair} at -1.35%. Preserved 98.6% capital.`, 'danger');
 
       await recordTradeToCloudLedger({
         id: Date.now(),
