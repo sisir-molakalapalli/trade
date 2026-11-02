@@ -62,7 +62,7 @@ const State = {
     bagSubsidyPoolUSDT: 0.00,
     sizingMode: 'PERCENTAGE',
     allocationPct: 15.0,
-    fixedNotionalUSDT: 50.00
+    fixedNotionalUSDT: 10.50
   },
   activePositions: {},
   recoveryBags: {},
@@ -1244,13 +1244,34 @@ function sanitizeAndAuditTradeHistory(logs) {
     const pair = rawPair.includes('/') ? rawPair : `${rawPair.replace('USDT', '')}/USDT`;
     const entry = Number(t.entryPriceUSDT || t['Entry Price (USDT)'] || t['Entry (USDT)'] || t.entryPrice || t.entry || t.Entry || 1);
     const exit = Number(t.exitPriceUSDT || t['Exit Price (USDT)'] || t['Exit (USDT)'] || t.exitPrice || t.exit || t.Exit || entry);
-    let pnlUSDT = Number(t.pnlUSDT !== undefined ? t.pnlUSDT : (t['PnL (USDT)'] !== undefined ? t['PnL (USDT)'] : t.pnl));
-    if (isNaN(pnlUSDT)) {
-      pnlUSDT = (exit - entry) * (50 / entry);
-    }
-    const tradeId = Number(t.id) || Date.now();
+    const tradeId = Number(t.id || t.ID || t.Id) || Date.now();
     const cleanDate = normalizeDateToIndianFormat(t.date, tradeId, t.time);
     const cleanTime = String(t.time || '').trim() || '00:00:00';
+
+    // 1. Preserve real in-memory notional if trade was executed in this session
+    const existingLocal = (State.tradeLogs || []).find(x => x.id === tradeId || (x.pair === pair && x.date === cleanDate && Math.abs(Number(x.entryPriceUSDT || 0) - entry) < 0.0001));
+    let notional = existingLocal && existingLocal.notionalUSDT && existingLocal.notionalUSDT !== 50
+      ? Number(existingLocal.notionalUSDT)
+      : Number(t.notionalUSDT || t['Notional (USDT)'] || t.notional || 0);
+
+    let pnlUSDT = Number(t.pnlUSDT !== undefined ? t.pnlUSDT : (t['PnL (USDT)'] !== undefined ? t['PnL (USDT)'] : t.pnl));
+
+    // 2. Derive true allocated notional if missing or defaulted to 50
+    const priceGainRatio = (entry > 0 && exit > 0) ? Math.abs((exit - entry) / entry) : 0;
+    if ((!notional || notional === 50) && !isNaN(pnlUSDT) && Math.abs(pnlUSDT) > 0.0001 && priceGainRatio > 0.0005) {
+      const derivedNotional = Math.abs(pnlUSDT) / priceGainRatio;
+      if (derivedNotional >= 5.0 && derivedNotional <= 5000.0) {
+        notional = Number(derivedNotional.toFixed(2));
+      }
+    }
+
+    if (!notional || notional === 50) {
+      notional = existingLocal?.notionalUSDT ? Number(existingLocal.notionalUSDT) : (Number(State.portfolio.fixedNotionalUSDT) || 10.50);
+    }
+
+    if (isNaN(pnlUSDT)) {
+      pnlUSDT = (exit - entry) * (notional / entry);
+    }
 
     return {
       ...t,
@@ -1261,7 +1282,7 @@ function sanitizeAndAuditTradeHistory(logs) {
       type: String(t.type || t.Type || 'EXIT').trim().toUpperCase(),
       entryPriceUSDT: entry,
       exitPriceUSDT: exit,
-      notionalUSDT: Number(t.notionalUSDT || t['Notional (USDT)'] || 50),
+      notionalUSDT: Number(notional.toFixed(2)),
       pnlUSDT: Number(pnlUSDT.toFixed(4)),
       pnlINR: Number((pnlUSDT * State.usdtToInrRate).toFixed(2))
     };
@@ -1288,10 +1309,17 @@ async function syncTradesFromGoogleSheets() {
     }
 
     if (fetchedTrades.length > 0) {
-      State.tradeLogs = sanitizeAndAuditTradeHistory(fetchedTrades);
+      // Merge with in-memory tradeLogs to keep accurate local notional
+      const merged = [...fetchedTrades];
+      (State.tradeLogs || []).forEach(localTrade => {
+        if (!merged.some(f => f.id === localTrade.id || (f.pair === localTrade.pair && f.date === localTrade.date && f.time === localTrade.time))) {
+          merged.push(localTrade);
+        }
+      });
+      State.tradeLogs = sanitizeAndAuditTradeHistory(merged);
       saveDiskState();
       broadcastStateUpdate();
-      console.log(`[Sync Ledger] Successfully synchronized ${State.tradeLogs.length} verified trades exclusively from Sisir_Quant_Trade_Ledger.`);
+      console.log(`[Sync Ledger] Successfully synchronized ${State.tradeLogs.length} verified trades.`);
       return State.tradeLogs;
     }
   } catch (err) {
