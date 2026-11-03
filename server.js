@@ -7,9 +7,10 @@
  * - Maximum 5 Spot Recovery Bags Limit
  * - Strict Active Position Rule: Never close below +0.35% (Demote to Bag on failure)
  * - Self-Aware Multi-Dimensional Trailing (Taker CVD, CLV, Rejection Wicks, Apex Harvest)
- * - Spot Recovery Bag Engine (Target: +0.30% Breakeven / >3h Self-Aware Relief Trailing)
- * - 90-Minute 15m VWAP Technical Bounce Relief Exit
- * - Emergency Disaster Circuit Breaker Floor (-6.50%)
+ * - Spot Recovery Bag Engine with Recovery-Protected Trailing (RPT: Min +0.30% Target Floor)
+ * - Dormant Pump & Dump Trap Shield (<$70M Liquidity Filter)
+ * - In-Memory Kline Cache (Eliminates Binance 429 Rate Limits)
+ * - Immediate Port Binding on Boot (Eliminates Render Deployment Timeouts)
  * - Dual-Transport (POST + GET) Cloud Ledger Dispatch strictly to Sisir_Quant_Trade_Ledger
  * =========================================================================
  */
@@ -78,7 +79,7 @@ const State = {
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 70, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% Floor • Self-Aware Apex Harvest' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Step 1 (+0.30% Target) / >3h Self-Aware Relief Trail', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Step 1 (+0.30% Target) / RPT Protected Trailing', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -936,7 +937,9 @@ async function runPredictiveSentry() {
           targetStep: 'STEP 1 (+0.30%)',
           targetExitPriceUSDT: Number((entryPrice * 1.0030).toFixed(6)),
           troughPrice: livePrice,
-          bouncePeakPrice: livePrice
+          bouncePeakPrice: livePrice,
+          protectedTrailingActive: false,
+          exitInProgress: false
         };
 
         delete State.activePositions[k];
@@ -946,10 +949,11 @@ async function runPredictiveSentry() {
     }
   }
 
-  // PART 2: SPOT RECOVERY BAGS (WITH SELF-AWARE TRAILING AFTER 3 HOURS)
+  // PART 2: SPOT RECOVERY BAGS (RECOVERY-PROTECTED TRAILING: NEVER CLOSE BELOW +0.30%)
   for (const k of bagKeys) {
     const bag = State.recoveryBags[k];
     if (!bag) continue;
+    if (bag.exitInProgress) continue; // Concurrency lock preventing duplicate/parallel execution
 
     const livePrice = Number(State.universe[k]?.priceUSDT || bag.livePriceUSDT || bag.entryPriceUSDT);
     const entryPrice = Number(bag.entryPriceUSDT || livePrice);
@@ -958,16 +962,101 @@ async function runPredictiveSentry() {
 
     bag.livePriceUSDT = livePrice;
     bag.troughPrice = Math.min(bag.troughPrice || livePrice, livePrice);
+
+    // Guaranteed Recovery Target (+0.30% minimum floor covers fees & ensures profit)
+    const recoveryTargetPrice = Number((entryPrice * 1.0030).toFixed(6));
+    bag.targetExitPriceUSDT = recoveryTargetPrice;
+
+    // Track bounce peak once recovery attempts begin
     bag.bouncePeakPrice = Math.max(bag.bouncePeakPrice || livePrice, livePrice);
 
-    // Target Step 1: Standard +0.30% Breakeven Target
-    const targetPrice = bag.targetExitPriceUSDT || (entryPrice * 1.0030);
-    if (livePrice >= targetPrice) {
+    // -------------------------------------------------------------
+    // RECOVERY-PROTECTED TRAILING (RPT) ENGINE
+    // -------------------------------------------------------------
+    // RPT Fundamental Law: Trailing stops & normal exits must NEVER execute below recoveryTargetPrice (+0.30%)
+    const calculatedStop = Number((bag.bouncePeakPrice * 0.9970).toFixed(6)); // 0.30% trail behind peak
+
+    // Trailing only arms when the 0.30% trailing stop actually protects the +0.30% recovery target
+    // i.e., bouncePeakPrice >= recoveryTargetPrice / 0.9970 (approx +0.602% from entry)
+    if (calculatedStop >= recoveryTargetPrice) {
+      bag.protectedTrailingActive = true;
+    }
+
+    if (bag.protectedTrailingActive) {
+      // Ratchet floor upward only - prevent stop regression
+      bag.recoverySl = Math.max(bag.recoverySl || 0, recoveryTargetPrice, calculatedStop);
+    }
+
+    // Advisory Self-Aware Exhaustion Sensor (Intelligence without destructive negative exits)
+    const selfAware = await checkSelfAwareOrderFlow(k);
+    if (selfAware.isApexExhausted) {
+      bag.exhaustionDetected = true;
+    }
+
+    // EXIT TRIGGER 1: Protected Trailing Stop Hit (Strictly at or above recoveryTargetPrice)
+    if (bag.protectedTrailingActive && bag.recoverySl && livePrice <= bag.recoverySl && livePrice >= recoveryTargetPrice) {
+      bag.exitInProgress = true;
+      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
+      
+      logOperation('RECOVERY', `Protected Trailing Exit on ${bag.pair} at $${livePrice.toFixed(4)} (+${gainPct.toFixed(2)}% >= +0.30% target). Peak was $${bag.bouncePeakPrice.toFixed(4)}. Capital recycled in profit!`, 'success');
+
+      const tradePayload = {
+        id: Date.now(),
+        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
+        type: 'RECOVERY PROTECTED TRAIL (+0.30%+)',
+        entryPriceUSDT: entryPrice,
+        exitPriceUSDT: livePrice,
+        notionalUSDT: bag.notionalUSDT,
+        pnlUSDT: realizedGain,
+        reason: `RPT Protected Trailing Exit at $${livePrice.toFixed(4)} (Peak: $${bag.bouncePeakPrice.toFixed(4)})`
+      };
+
+      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
+      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+      delete State.recoveryBags[k];
+      saveDiskState();
+      broadcastStateUpdate();
+      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
+      continue;
+    }
+
+    // EXIT TRIGGER 2: Self-Aware Apex Harvest at or above Recovery Target
+    // If price has crossed recoveryTargetPrice and order-flow exhausts, harvest profit immediately
+    if (livePrice >= recoveryTargetPrice && selfAware.isApexExhausted) {
+      bag.exitInProgress = true;
+      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
+
+      logOperation('RECOVERY', `Recovery Apex Harvest on ${bag.pair}: Order flow exhausted at $${livePrice.toFixed(4)} (+${gainPct.toFixed(2)}% >= +0.30%). 100% capital + profit banked.`, 'success');
+
+      const tradePayload = {
+        id: Date.now(),
+        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
+        type: 'RECOVERY APEX HARVEST',
+        entryPriceUSDT: entryPrice,
+        exitPriceUSDT: livePrice,
+        notionalUSDT: bag.notionalUSDT,
+        pnlUSDT: realizedGain,
+        reason: `Recovery Apex Harvest at $${livePrice.toFixed(4)} (Taker Buy ${selfAware.takerBuyRatio}%)`
+      };
+
+      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
+      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+      delete State.recoveryBags[k];
+      saveDiskState();
+      broadcastStateUpdate();
+      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
+      continue;
+    }
+
+    // EXIT TRIGGER 3: Standard Direct Recovery Target Fill (+0.30%)
+    // If protected trailing has not armed yet (price between +0.30% and +0.60%) and price reaches target without extended runner
+    if (livePrice >= recoveryTargetPrice && !bag.protectedTrailingActive) {
+      bag.exitInProgress = true;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
       
       logOperation('RECOVERY', `Breakeven relief target (+0.30%) filled on ${bag.pair} at $${livePrice.toFixed(4)}! 100% capital recycled.`, 'success');
 
-      await recordTradeToCloudLedger({
+      const tradePayload = {
         id: Date.now(),
         pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
         type: 'RECOVERY BREAKEVEN (+0.30%)',
@@ -976,92 +1065,26 @@ async function runPredictiveSentry() {
         notionalUSDT: bag.notionalUSDT,
         pnlUSDT: realizedGain,
         reason: `Recovery filled on relief bounce (+0.30% Breakeven Target)`
-      });
+      };
 
       State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
       State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
       delete State.recoveryBags[k];
+      saveDiskState();
+      broadcastStateUpdate();
+      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
       continue;
     }
 
-    // -------------------------------------------------------------
-    // SELF-AWARE RELIEF TRAILING FOR BAGS HELD > 3 HOURS
-    // -------------------------------------------------------------
-    if (holdHours >= 3.0) {
-      bag.selfAwareActive = true;
-      const selfAware = await checkSelfAwareOrderFlow(k);
-      const bounceFromTroughPct = bag.troughPrice > 0 ? (((livePrice - bag.troughPrice) / bag.troughPrice) * 100) : 0;
-
-      // Trailing floor 0.30% beneath the bounce peak
-      const reliefTrailFloor = Number((bag.bouncePeakPrice * 0.9970).toFixed(6));
-      bag.recoverySl = Math.max(bag.recoverySl || 0, reliefTrailFloor);
-
-      // Exit trigger 1: Bounce crest rolls over into trailing floor
-      const isTrailHit = (bag.recoverySl && livePrice <= bag.recoverySl && bounceFromTroughPct >= 0.40);
-      
-      // Exit trigger 2: Order-flow exhaustion on relief bounce (Taker buy collapses or heavy upper wick)
-      const isReliefExhausted = (selfAware.isApexExhausted && bounceFromTroughPct >= 0.45);
-
-      // Exit trigger 3: Near-breakeven relief (gainPct >= -0.10%)
-      const isNearBreakeven = (gainPct >= -0.10);
-
-      if (isTrailHit || isReliefExhausted || isNearBreakeven) {
-        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-        const exitReason = isNearBreakeven 
-          ? `Self-Aware >3h: Near-breakeven relief exit at $${livePrice.toFixed(4)}`
-          : `Self-Aware >3h Trailing Exit: Captured bounce peak $${bag.bouncePeakPrice.toFixed(4)} at $${livePrice.toFixed(4)}`;
-
-        logOperation('RECOVERY', `Self-Aware Trailing Exit executed on ${bag.pair} held ${holdHours.toFixed(1)}h at $${livePrice.toFixed(4)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%). Best price secured.`, gainPct >= 0 ? 'success' : 'info');
-
-        await recordTradeToCloudLedger({
-          id: Date.now(),
-          pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-          type: gainPct >= 0 ? 'RECOVERY SELF-AWARE WIN' : 'RECOVERY SELF-AWARE TRAIL',
-          entryPriceUSDT: entryPrice,
-          exitPriceUSDT: livePrice,
-          notionalUSDT: bag.notionalUSDT,
-          pnlUSDT: realizedGain,
-          reason: exitReason
-        });
-
-        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-        delete State.recoveryBags[k];
-        saveDiskState();
-        broadcastStateUpdate();
-        continue;
-      }
-    }
-
-    // 15m VWAP Technical Bounce Exit after 90 mins (if gain >= -0.15%)
-    if (holdHours >= 1.5 && gainPct >= -0.15) {
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-      logOperation('RECOVERY', `VWAP relief exit on ${bag.pair} at $${livePrice.toFixed(4)}. Capital recycled.`, 'info');
-
-      await recordTradeToCloudLedger({
-        id: Date.now(),
-        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'VWAP RELIEF RECOVERY',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: realizedGain,
-        reason: 'VWAP technical bounce exit: capital recycled in 90m'
-      });
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.recoveryBags[k];
-      continue;
-    }
-
-    // Hard Disaster Floor Cut (-6.50%)
+    // EXIT TRIGGER 4: Emergency Disaster Floor Cut (-6.50% ONLY)
+    // The only authorized exit below the recovery target - extreme disaster circuit breaker
     if (gainPct <= -6.50) {
+      bag.exitInProgress = true;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
 
       logOperation('SENTRY_EXIT', `Hard disaster cut triggered on ${bag.pair} at -6.50%. Preserved cash capital.`, 'danger');
 
-      await recordTradeToCloudLedger({
+      const tradePayload = {
         id: Date.now(),
         pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
         type: 'HARD DISASTER CUT (-6.50%)',
@@ -1070,11 +1093,14 @@ async function runPredictiveSentry() {
         notionalUSDT: bag.notionalUSDT,
         pnlUSDT: realizedGain,
         reason: 'Hard disaster floor (-6.50%): Capital preserved'
-      });
+      };
 
       State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
       State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
       delete State.recoveryBags[k];
+      saveDiskState();
+      broadcastStateUpdate();
+      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
       continue;
     }
   }
