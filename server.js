@@ -9,7 +9,9 @@
  * - Self-Aware Multi-Dimensional Trailing (Taker CVD, CLV, Rejection Wicks, Apex Harvest)
  * - bStocks & 3X Leveraged ETF Exclusion Shield (Blocks SOXLB, SNDKB, TSLAB, etc.)
  * - Spot Recovery Bag Engine with Time-Decay Stepping (+0.30% -> +0.10% -> 0.00% BE)
- * - Near-Miss Relief Harvesting & Trough Crest Trailing
+ * - Option 2 & 3 Enhanced Near-Miss Relief Harvest:
+ *     * Option 3: 15m Macro VWAP Trajectory Shield (Inhibits harvest if price >= VWAP)
+ *     * Option 2: 15m & Two-Bar 5m Confirmed Exhaustion (Eliminates single 5m wick noise)
  * - Asymmetric Tail-Risk Circuit Breaker (-3.80% Hard Cap)
  * - Unrounded High-Precision Price Display for All Altcoins
  * - Dormant Pump & Dump Trap Shield (<$70M Liquidity Filter)
@@ -84,7 +86,7 @@ const State = {
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 70, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% Floor • Self-Aware Apex Harvest • -3.80% Cap' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Time-Decay (+0.30% -> +0.10% -> 0.00% BE) / -3.80% Tail Cap', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Time-Decay (+0.30% -> +0.10% -> 0.00% BE) / 15m VWAP Shield', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -392,6 +394,99 @@ async function checkSelfAwareOrderFlow(symbol) {
   }
 }
 
+// -------------------------------------------------------------
+// OPTION 2 & 3: RECOVERY RELIEF EXHAUSTION & MACRO VWAP SHIELD
+// -------------------------------------------------------------
+async function checkRecoveryReliefExhaustion(symbol, livePrice) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+
+    // 1. Fetch 15m klines for VWAP trajectory & 15m candle structure
+    const klines15m = await getCachedKlines(pairSym, '15m', 16, 3000);
+    // 2. Fetch 5m klines for consecutive bar confirmation
+    const klines5m = await getCachedKlines(pairSym, '5m', 6, 2500);
+
+    if (!Array.isArray(klines15m) || klines15m.length < 5) {
+      return { isConfirmedExhausted: false, isAboveVwap: true, vwap15m: livePrice };
+    }
+
+    // Calculate rolling 15m VWAP (last 12 bars)
+    let sumTypicalPriceVol = 0;
+    let sumVol = 0;
+    for (let i = Math.max(0, klines15m.length - 12); i < klines15m.length; i++) {
+      const h = parseFloat(klines15m[i][2]);
+      const l = parseFloat(klines15m[i][3]);
+      const c = parseFloat(klines15m[i][4]);
+      const v = parseFloat(klines15m[i][5]);
+      const typical = (h + l + c) / 3;
+      sumTypicalPriceVol += (typical * v);
+      sumVol += v;
+    }
+    const vwap15m = sumVol > 0 ? (sumTypicalPriceVol / sumVol) : livePrice;
+
+    // OPTION 3: Macro 15m VWAP Trajectory Shield
+    // If live price is firmly at or above 15m VWAP, the recovery bounce is healthy and intact!
+    const isAboveVwap = livePrice >= (vwap15m * 0.9995);
+
+    // OPTION 2: Multi-Bar 15m & Consecutive 5m Exhaustion Confirmation
+    // (A single 5m pause will NEVER trigger exhaustion)
+    let is15mExhausted = false;
+    const cur15m = klines15m[klines15m.length - 1];
+    const open15 = parseFloat(cur15m[1]);
+    const high15 = parseFloat(cur15m[2]);
+    const low15 = parseFloat(cur15m[3]);
+    const close15 = parseFloat(cur15m[4]);
+    const vol15 = parseFloat(cur15m[5]);
+    const taker15 = parseFloat(cur15m[9]);
+    const takerRatio15 = vol15 > 0 ? (taker15 / vol15) * 100 : 50;
+    const range15 = high15 - low15;
+    const upperWick15 = range15 > 0 ? (high15 - Math.max(open15, close15)) / range15 : 0;
+    const clv15 = range15 > 0 ? (close15 - low15) / range15 : 0.5;
+
+    // 15m level exhaustion: 15m candle shows real seller rejection
+    if ((takerRatio15 < 40.0 && upperWick15 >= 0.38) || (clv15 < 0.28 && range15 > 0 && close15 < open15)) {
+      is15mExhausted = true;
+    }
+
+    // 5m consecutive check: Must have TWO consecutive 5m candles showing rejection
+    let areTwo5mExhausted = false;
+    if (Array.isArray(klines5m) && klines5m.length >= 3) {
+      const bar1 = klines5m[klines5m.length - 1];
+      const bar2 = klines5m[klines5m.length - 2];
+
+      const v1 = parseFloat(bar1[5]);
+      const t1 = parseFloat(bar1[9]);
+      const r1 = v1 > 0 ? (t1 / v1) * 100 : 50;
+      const range1 = parseFloat(bar1[2]) - parseFloat(bar1[3]);
+      const wick1 = range1 > 0 ? (parseFloat(bar1[2]) - Math.max(parseFloat(bar1[1]), parseFloat(bar1[4]))) / range1 : 0;
+
+      const v2 = parseFloat(bar2[5]);
+      const t2 = parseFloat(bar2[9]);
+      const r2 = v2 > 0 ? (t2 / v2) * 100 : 50;
+      const range2 = parseFloat(bar2[2]) - parseFloat(bar2[3]);
+      const wick2 = range2 > 0 ? (parseFloat(bar2[2]) - Math.max(parseFloat(bar2[1]), parseFloat(bar2[4]))) / range2 : 0;
+
+      if (r1 < 42.0 && r2 < 44.0 && (wick1 >= 0.30 || wick2 >= 0.30 || parseFloat(bar1[4]) < parseFloat(bar1[1]))) {
+        areTwo5mExhausted = true;
+      }
+    }
+
+    const isConfirmedExhausted = (is15mExhausted || areTwo5mExhausted);
+
+    return {
+      isConfirmedExhausted,
+      isAboveVwap,
+      vwap15m: Number(vwap15m.toFixed(8)),
+      reason: isAboveVwap
+        ? `Protected by 15m VWAP ($${formatPrecisePrice(livePrice)} >= $${formatPrecisePrice(vwap15m)})`
+        : (isConfirmedExhausted ? 'Confirmed 15m/multi-5m exhaustion below VWAP' : 'Momentum consolidating, not exhausted')
+    };
+  } catch (err) {
+    return { isConfirmedExhausted: false, isAboveVwap: true, vwap15m: livePrice };
+  }
+}
+
 async function checkMicrostructureMomentumAndVwap(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -595,7 +690,6 @@ async function runDynamicScreener() {
       if (['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'EURUSDT'].includes(sym)) continue;
 
       // 2. PILLAR 1: Dedicated bStocks & Tokenized ETF Derivative Exclusion
-      // Blocks 3x leveraged ETFs and tokenized equity instruments (SOXLB, SNDKB, TSLAB, NVDB, etc.)
       const blockedDerivatives = [
         'SOXLB', 'SNDKB', 'TSLAB', 'AAPLB', 'NVDB', 'MSFTB', 'AMZNB', 
         'SPYB', 'QQQB', 'GOOGB', 'METAB', 'COINB', 'MSTRB', 'BABAB'
@@ -605,7 +699,6 @@ async function runDynamicScreener() {
       const last = parseFloat(t.lastPrice);
 
       // 3. PILLAR 2: Unit price ceiling for breakout scalping
-      // Excludes $350+ equities with thin off-hours book depth (retains BTC and ETH)
       if (last > 350.0 && !['BTCUSDT', 'ETHUSDT', 'PAXGUSDT'].includes(sym)) continue;
 
       const volQuote = parseFloat(t.quoteVolume);
@@ -723,26 +816,21 @@ async function evaluateAutopilotEntries() {
       const coin = State.universe[k];
       if (!coin || !coin.symbol) continue;
 
-      // Gate 1: Reject flagged pump-and-dump spikes
       if (coin.isPumpAndDump) continue;
-
       if ((coin.score || 0) < minScore) break;
 
       const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
       const pairKey = `${baseSym}USDT`;
 
-      // Gate 2: Pre-flight bStocks and derivative exclusion
       const blockedDerivatives = ['SOXLB', 'SNDKB', 'TSLAB', 'AAPLB', 'NVDB', 'MSFTB', 'AMZNB', 'SPYB', 'QQQB'];
       if (blockedDerivatives.some(d => pairKey.startsWith(d))) continue;
 
-      // Gate 3: Unit price ceiling guard ($350+)
       if (Number(coin.priceUSDT || 0) > 350.0 && !['BTCUSDT', 'ETHUSDT'].includes(pairKey)) continue;
 
       if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
 
       if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > now) continue;
 
-      // Candidate Cooldown Memo: Skip pairs tested in the last 25 seconds to advance down the list
       const nextAllowed = candidateCooldownMemo.get(pairKey) || 0;
       if (nextAllowed > now) continue;
 
@@ -755,7 +843,6 @@ async function evaluateAutopilotEntries() {
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
       if (posInRange < 0.40) continue;
 
-      // Secondary Pre-Flight Pump & Dump Trap Veto
       const volQuote = (coin.volumeM || 0) * 1000000;
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
         const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
@@ -1129,36 +1216,42 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // EXIT TRIGGER 4: Near-Miss Relief Harvest (Pillar 1)
-    // If trade has been in bag > 1h, reached within -0.15% to 0.00% of entry, and order flow exhausts
-    if (holdHours >= 1.0 && gainPct >= -0.15 && selfAware.isApexExhausted) {
-      bag.exitInProgress = true;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
+    // EXIT TRIGGER 4: Near-Miss Relief Harvest (Option 2 & Option 3 Protected)
+    // 1. Held in bag >= 1.0h and near entry (gainPct >= -0.15%)
+    // 2. Option 3 (Macro VWAP Shield): If price is >= 15m VWAP, DO NOT exit! Allow it to hit +0.30%
+    // 3. Option 2 (15m Multi-Bar Confirmation): Requires 15m bar rejection or 2 consecutive 5m exhaustion bars, NOT a single 5m tick!
+    if (holdHours >= 1.0 && gainPct >= -0.15) {
+      const reliefCheck = await checkRecoveryReliefExhaustion(k, livePrice);
 
-      logOperation('RECOVERY', `Near-Miss Relief Harvest on ${bag.pair} at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%). 99.85%+ capital recycled on exhaustion.`, 'info');
+      // If price is above VWAP, the recovery bounce is healthy! Do not harvest early.
+      if (!reliefCheck.isAboveVwap && reliefCheck.isConfirmedExhausted) {
+        bag.exitInProgress = true;
+        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
 
-      const tradePayload = {
-        id: Date.now(),
-        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'RECOVERY NEAR-MISS HARVEST',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: realizedGain,
-        reason: `Near-miss relief harvest: Capital recycled at $${formatPrecisePrice(livePrice)} (${gainPct.toFixed(2)}%)`
-      };
+        logOperation('RECOVERY', `Near-Miss Relief Harvest on ${bag.pair} at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%). Confirmed below 15m VWAP ($${formatPrecisePrice(reliefCheck.vwap15m)}) with multi-bar exhaustion. Capital recycled.`, 'info');
 
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.recoveryBags[k];
-      saveDiskState();
-      broadcastStateUpdate();
-      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-      continue;
+        const tradePayload = {
+          id: Date.now(),
+          pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
+          type: 'RECOVERY NEAR-MISS HARVEST',
+          entryPriceUSDT: entryPrice,
+          exitPriceUSDT: livePrice,
+          notionalUSDT: bag.notionalUSDT,
+          pnlUSDT: realizedGain,
+          reason: `Near-miss relief harvest: Below 15m VWAP ($${formatPrecisePrice(reliefCheck.vwap15m)}) with confirmed exhaustion`
+        };
+
+        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
+        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+        delete State.recoveryBags[k];
+        saveDiskState();
+        broadcastStateUpdate();
+        recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
+        continue;
+      }
     }
 
     // EXIT TRIGGER 5: Dynamic Local Trough Crest Trailing (Deep Drop Protection)
-    // If price dropped past -2.50% and staged a >= +0.80% bounce off the trough, but rolls over
     const bounceFromTroughPct = bag.troughPrice > 0 ? (((livePrice - bag.troughPrice) / bag.troughPrice) * 100) : 0;
     if (bag.troughPrice <= (entryPrice * 0.975) && bounceFromTroughPct >= 0.80) {
       const troughTrailFloor = Number((bag.bouncePeakPrice * 0.9965).toFixed(8));
@@ -1190,7 +1283,6 @@ async function runPredictiveSentry() {
     }
 
     // EXIT TRIGGER 6: Hard Disaster Floor Cut (-3.80% Asymmetric Tail Risk Cap)
-    // Replaced -6.50% wide slide with -3.80% hard cap, cutting loss in half while leaving normal altcoin breathing room
     if (gainPct <= -3.80) {
       bag.exitInProgress = true;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
@@ -1911,6 +2003,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`bStocks Shield Active (SOXLB, SNDKB, etc. Excluded)`);
   console.log(`Time-Decay Recovery (+0.30% -> +0.10% -> 0.00% BE)`);
   console.log(`Disaster Tail Risk Floor Calibrated to -3.80%`);
+  console.log(`Option 2 & 3 Enhanced Near-Miss 15m VWAP Shield Active`);
   console.log(`====================================================`);
 
   runDynamicScreener().then(() => {
