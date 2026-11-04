@@ -9,6 +9,8 @@
  * - Self-Aware Multi-Dimensional Trailing (Taker CVD, CLV, Rejection Wicks, Apex Harvest)
  * - bStocks & 3X Leveraged ETF Exclusion Shield (Blocks SOXLB, SNDKB, TSLAB, etc.)
  * - Spot Recovery Bag Engine with Time-Decay Stepping (+0.30% -> +0.10% -> 0.00% BE)
+ * - Solution 1 Implemented: Removed Trough Crest Trailing (Trigger 5) to eliminate
+ *   premature -2.0% shakeouts on normal higher-low consolidation pullbacks
  * - Option 2 & 3 Enhanced Near-Miss Relief Harvest:
  *     * Option 3: 15m Macro VWAP Trajectory Shield (Inhibits harvest if price >= VWAP)
  *     * Option 2: 15m & Two-Bar 5m Confirmed Exhaustion (Eliminates single 5m wick noise)
@@ -86,7 +88,7 @@ const State = {
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 70, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% Floor • Self-Aware Apex Harvest • -3.80% Cap' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Time-Decay (+0.30% -> +0.10% -> 0.00% BE) / 15m VWAP Shield', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Time-Decay (+0.30% -> +0.10% -> 0.00% BE) / Pure Stepped Recovery', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -402,16 +404,13 @@ async function checkRecoveryReliefExhaustion(symbol, livePrice) {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
 
-    // 1. Fetch 15m klines for VWAP trajectory & 15m candle structure
     const klines15m = await getCachedKlines(pairSym, '15m', 16, 3000);
-    // 2. Fetch 5m klines for consecutive bar confirmation
     const klines5m = await getCachedKlines(pairSym, '5m', 6, 2500);
 
     if (!Array.isArray(klines15m) || klines15m.length < 5) {
       return { isConfirmedExhausted: false, isAboveVwap: true, vwap15m: livePrice };
     }
 
-    // Calculate rolling 15m VWAP (last 12 bars)
     let sumTypicalPriceVol = 0;
     let sumVol = 0;
     for (let i = Math.max(0, klines15m.length - 12); i < klines15m.length; i++) {
@@ -426,11 +425,9 @@ async function checkRecoveryReliefExhaustion(symbol, livePrice) {
     const vwap15m = sumVol > 0 ? (sumTypicalPriceVol / sumVol) : livePrice;
 
     // OPTION 3: Macro 15m VWAP Trajectory Shield
-    // If live price is firmly at or above 15m VWAP, the recovery bounce is healthy and intact!
     const isAboveVwap = livePrice >= (vwap15m * 0.9995);
 
     // OPTION 2: Multi-Bar 15m & Consecutive 5m Exhaustion Confirmation
-    // (A single 5m pause will NEVER trigger exhaustion)
     let is15mExhausted = false;
     const cur15m = klines15m[klines15m.length - 1];
     const open15 = parseFloat(cur15m[1]);
@@ -444,12 +441,10 @@ async function checkRecoveryReliefExhaustion(symbol, livePrice) {
     const upperWick15 = range15 > 0 ? (high15 - Math.max(open15, close15)) / range15 : 0;
     const clv15 = range15 > 0 ? (close15 - low15) / range15 : 0.5;
 
-    // 15m level exhaustion: 15m candle shows real seller rejection
     if ((takerRatio15 < 40.0 && upperWick15 >= 0.38) || (clv15 < 0.28 && range15 > 0 && close15 < open15)) {
       is15mExhausted = true;
     }
 
-    // 5m consecutive check: Must have TWO consecutive 5m candles showing rejection
     let areTwo5mExhausted = false;
     if (Array.isArray(klines5m) && klines5m.length >= 3) {
       const bar1 = klines5m[klines5m.length - 1];
@@ -685,11 +680,9 @@ async function runDynamicScreener() {
       const sym = t.symbol;
       if (!sym.endsWith('USDT')) continue;
 
-      // 1. Exclude leveraged tokens and synthetic wrappers
       if (sym.includes('UP') || sym.includes('DOWN') || sym.includes('BULL') || sym.includes('BEAR')) continue;
       if (['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'EURUSDT'].includes(sym)) continue;
 
-      // 2. PILLAR 1: Dedicated bStocks & Tokenized ETF Derivative Exclusion
       const blockedDerivatives = [
         'SOXLB', 'SNDKB', 'TSLAB', 'AAPLB', 'NVDB', 'MSFTB', 'AMZNB', 
         'SPYB', 'QQQB', 'GOOGB', 'METAB', 'COINB', 'MSTRB', 'BABAB'
@@ -697,8 +690,6 @@ async function runDynamicScreener() {
       if (blockedDerivatives.some(d => sym.startsWith(d))) continue;
 
       const last = parseFloat(t.lastPrice);
-
-      // 3. PILLAR 2: Unit price ceiling for breakout scalping
       if (last > 350.0 && !['BTCUSDT', 'ETHUSDT', 'PAXGUSDT'].includes(sym)) continue;
 
       const volQuote = parseFloat(t.quoteVolume);
@@ -1085,6 +1076,7 @@ async function runPredictiveSentry() {
   }
 
   // PART 2: SPOT RECOVERY BAGS (TIME-DECAY RECOVERY STEPPING & -3.80% TAIL RISK CAP)
+  // Solution 1: Removed Trigger 5 (Trough Crest Trailing) to eliminate premature -2.0% shakeouts
   for (const k of bagKeys) {
     const bag = State.recoveryBags[k];
     if (!bag) continue;
@@ -1251,38 +1243,7 @@ async function runPredictiveSentry() {
       }
     }
 
-    // EXIT TRIGGER 5: Dynamic Local Trough Crest Trailing (Deep Drop Protection)
-    const bounceFromTroughPct = bag.troughPrice > 0 ? (((livePrice - bag.troughPrice) / bag.troughPrice) * 100) : 0;
-    if (bag.troughPrice <= (entryPrice * 0.975) && bounceFromTroughPct >= 0.80) {
-      const troughTrailFloor = Number((bag.bouncePeakPrice * 0.9965).toFixed(8));
-      if (livePrice <= troughTrailFloor && gainPct <= -1.80) {
-        bag.exitInProgress = true;
-        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-
-        logOperation('RECOVERY', `Trough Crest Trailing Exit on ${bag.pair} at $${formatPrecisePrice(livePrice)} (${gainPct.toFixed(2)}%). Exited at crest of relief bounce.`, 'warning');
-
-        const tradePayload = {
-          id: Date.now(),
-          pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-          type: 'RECOVERY TROUGH CREST TRAIL',
-          entryPriceUSDT: entryPrice,
-          exitPriceUSDT: livePrice,
-          notionalUSDT: bag.notionalUSDT,
-          pnlUSDT: realizedGain,
-          reason: `Trough crest exit: Captured relief bounce peak $${formatPrecisePrice(bag.bouncePeakPrice)}`
-        };
-
-        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-        delete State.recoveryBags[k];
-        saveDiskState();
-        broadcastStateUpdate();
-        recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-        continue;
-      }
-    }
-
-    // EXIT TRIGGER 6: Hard Disaster Floor Cut (-3.80% Asymmetric Tail Risk Cap)
+    // EXIT TRIGGER 5: Hard Disaster Floor Cut (-3.80% Asymmetric Tail Risk Cap)
     if (gainPct <= -3.80) {
       bag.exitInProgress = true;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
@@ -2003,7 +1964,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`bStocks Shield Active (SOXLB, SNDKB, etc. Excluded)`);
   console.log(`Time-Decay Recovery (+0.30% -> +0.10% -> 0.00% BE)`);
   console.log(`Disaster Tail Risk Floor Calibrated to -3.80%`);
-  console.log(`Option 2 & 3 Enhanced Near-Miss 15m VWAP Shield Active`);
+  console.log(`Solution 1 Active: Trigger 5 Removed (Pure Stepped Recovery)`);
   console.log(`====================================================`);
 
   runDynamicScreener().then(() => {
