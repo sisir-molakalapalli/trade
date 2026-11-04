@@ -9,6 +9,11 @@
  * - Self-Aware Multi-Dimensional Trailing (Taker CVD, CLV, Rejection Wicks, Apex Harvest)
  * - bStocks & 3X Leveraged ETF Exclusion Shield (Blocks SOXLB, SNDKB, TSLAB, etc.)
  * - Spot Recovery Bag Engine with Time-Decay Stepping (+0.30% -> +0.10% -> 0.00% BE)
+ * - Breakthrough Trailing Runner: Locks recovery floor at stepped target and trails runners
+ * - 1h 20-EMA Extension Shield (<= 5.50% above EMA) to prevent second-leg FOMO traps
+ * - 15m Upper Rejection Wick Ceiling (<= 35%) to reject buying into distribution shadows
+ * - Risk-Parity Notional Sizing: Caps maximum dollar risk at ~$0.80 USDT (~₹76)
+ * - Zero Post-Bag Cooldown: Preserves 100% unrestricted entry velocity
  * - Solution 1 Implemented: Removed Trough Crest Trailing (Trigger 5) to eliminate
  *   premature -2.0% shakeouts on normal higher-low consolidation pullbacks
  * - Option 2 & 3 Enhanced Near-Miss Relief Harvest:
@@ -537,6 +542,18 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       return { passed: false, reason: `Price below 15m VWAP ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(vwap4h)})` };
     }
 
+    // Pre-Entry Upper Rejection Wick Gate (Rejects shooting stars & apex wick entries)
+    const curHigh = parseFloat(curBar[2]);
+    const curLow = parseFloat(curBar[3]);
+    const curRange = curHigh - curLow;
+    const curUpperWickRatio = curRange > 0 ? (curHigh - Math.max(curOpen, curClose)) / curRange : 0;
+    if (curUpperWickRatio > 0.35 && curRange > 0) {
+      return { 
+        passed: false, 
+        reason: `15m Upper rejection wick too large (${Math.round(curUpperWickRatio * 100)}% > 35%). Active selling into resistance.` 
+      };
+    }
+
     const isTrackA = (change15mPct >= 0.35 && rvol >= 1.00 && distFrom4hHighPct <= 5.50);
     const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 6.00 && (change1hPct >= 0.50 || curChange15m >= 0.20));
 
@@ -580,7 +597,17 @@ async function check1hTrendAlignment(symbol) {
     if (curClose < (ema * 0.995)) {
       return { passed: false, reason: `Price below 1h 20-EMA ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(ema)})` };
     }
-    return { passed: true, ema1h: Number(ema.toFixed(4)) };
+
+    // 1h 20-EMA Extension Shield (Prevents FOMO into overextended 2nd/3rd wave impulses)
+    const distAboveEmaPct = ema > 0 ? ((curClose - ema) / ema) * 100 : 0;
+    if (distAboveEmaPct > 5.50) {
+      return { 
+        passed: false, 
+        reason: `Overextended above 1h 20-EMA (+${distAboveEmaPct.toFixed(2)}% > 5.50%). Awaiting base consolidation.` 
+      };
+    }
+
+    return { passed: true, ema1h: Number(ema.toFixed(4)), distAboveEmaPct: Number(distAboveEmaPct.toFixed(2)) };
   } catch (err) {
     return { passed: true, reason: 'Error fallback' };
   }
@@ -633,11 +660,19 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
   }
 
   const allocPct = Number(State.portfolio.allocationPct || 15.0);
+
+  // Risk-Parity Notional Sizing: Cap max loss at ~$0.80 USDT (~₹76) so volatile alts never wipe out multiple wins
+  const maxAllowableLossUSDT = 0.80;
+  const disasterStopRatio = 0.038; // -3.80% hard disaster stop
+  const riskParityNotionalCap = Number((maxAllowableLossUSDT / disasterStopRatio).toFixed(2)); // ~$21.05 USDT
+
   let notional;
   if (freeCash <= 25.00) {
     notional = Math.min(freeCash, Math.max(10.05, Number((freeCash * 0.95).toFixed(2))));
   } else {
-    notional = Math.max(10.50, Math.min(freeCash * (allocPct / 100), freeCash));
+    // Cap by risk-parity notional ceiling while respecting minimum $10.50 Binance notional
+    const proportionalNotional = freeCash * (allocPct / 100);
+    notional = Math.max(10.50, Math.min(proportionalNotional, riskParityNotionalCap, freeCash));
   }
 
   if (freeCash < 10.00 || notional < 10.00) {
@@ -1113,12 +1148,16 @@ async function runPredictiveSentry() {
     // Trailing stop calculates 0.30% behind the relief bounce peak
     const calculatedStop = Number((bag.bouncePeakPrice * 0.9970).toFixed(8));
 
-    // Trailing arms once the calculated stop protects the active stepped recovery target
-    if (calculatedStop >= recoveryTargetPrice) {
-      bag.protectedTrailingActive = true;
+    // Breakthrough Trailing: Once price touches or exceeds recovery target, arm protected trailing immediately!
+    if (livePrice >= recoveryTargetPrice || calculatedStop >= recoveryTargetPrice) {
+      if (!bag.protectedTrailingActive) {
+        bag.protectedTrailingActive = true;
+        logOperation('RECOVERY', `${bag.pair}: Target reached ($${formatPrecisePrice(livePrice)} >= ${targetStepLabel}). Breakthrough Trailing runner armed. Floor locked at $${formatPrecisePrice(recoveryTargetPrice)}.`, 'success');
+      }
     }
 
     if (bag.protectedTrailingActive) {
+      // Floor is locked at or above recoveryTargetPrice - can NEVER exit below target!
       bag.recoverySl = Math.max(bag.recoverySl || 0, recoveryTargetPrice, calculatedStop);
     }
 
@@ -1127,8 +1166,8 @@ async function runPredictiveSentry() {
       bag.exhaustionDetected = true;
     }
 
-    // EXIT TRIGGER 1: Protected Trailing Stop Hit (Above Stepped Target)
-    if (bag.protectedTrailingActive && bag.recoverySl && livePrice <= bag.recoverySl && livePrice >= recoveryTargetPrice) {
+    // EXIT TRIGGER 1: Protected Trailing Stop Hit (At or Above Stepped Target Floor)
+    if (bag.protectedTrailingActive && bag.recoverySl && livePrice <= bag.recoverySl) {
       bag.exitInProgress = true;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
       
@@ -1181,8 +1220,8 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // EXIT TRIGGER 3: Standard Direct Recovery Target Fill
-    if (livePrice >= recoveryTargetPrice && !bag.protectedTrailingActive) {
+    // EXIT TRIGGER 3: Fallback Breakeven Fill (if trailing was not triggered)
+    if (livePrice >= recoveryTargetPrice && bag.recoverySl && livePrice <= bag.recoverySl) {
       bag.exitInProgress = true;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
       
