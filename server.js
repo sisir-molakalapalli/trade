@@ -6,7 +6,9 @@
  * - 3 Concurrent Active Breakout Slots (High-Velocity Execution)
  * - Maximum 5 Spot Recovery Bags Limit
  * - Strict Active Position Rule: Never close below +0.35% (Demote to Bag on failure)
- * - Self-Aware Multi-Dimensional Trailing (Taker CVD, CLV, Rejection Wicks, Apex Harvest)
+ * - NEW SKILL: Japanese Candlestick Pattern Sentinel (Steve Nison Model)
+ *     * Apex Peak Harvest: Shooting Star, Bearish Engulfing, Evening Star, Gravestone Doji
+ *     * Trough Support Shield: Hammer, Bullish Engulfing, Morning Star, Dragonfly Doji
  * - bStocks & 3X Leveraged ETF Exclusion Shield (Blocks SOXLB, SNDKB, TSLAB, etc.)
  * - Spot Recovery Bag Engine with Time-Decay Stepping (+0.30% -> +0.10% -> 0.00% BE)
  * - Breakthrough Trailing Runner: Locks recovery floor at stepped target and trails runners
@@ -86,13 +88,14 @@ const State = {
   cooldowns: {},
   subsystems: {
     liveFeed: [],
+    candlestickSentry: { status: 'ONLINE', patternsTracked: 'Shooting Star, Hammer, Engulfing, Evening/Morning Star', lastPatternDetected: '--' },
     pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
     bStockShield: { status: 'ACTIVE', blockedAssets: ['SOXLB', 'SNDKB', 'TSLAB', 'NVDB'], maxUnitPrice: '$350.00' },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 15, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M+)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 150, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 70, liveObiGatePct: 45 },
-    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% Floor • Self-Aware Apex Harvest • -3.80% Cap' },
+    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% Floor • Candlestick Apex Harvest • -3.80% Cap' },
     recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Time-Decay (+0.30% -> +0.10% -> 0.00% BE) / Pure Stepped Recovery', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
@@ -242,6 +245,152 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
     console.warn(`[Binance API Notice] ${pairSym} returned: ${data.msg || data.code}`);
   }
   return data;
+}
+
+// -------------------------------------------------------------
+// NEW SKILL: JAPANESE CANDLESTICK PATTERN SENTINEL (STEVE NISON MODEL)
+// -------------------------------------------------------------
+function analyzeCandlestickPattern(klines) {
+  if (!Array.isArray(klines) || klines.length < 3) {
+    return { isBearishReversal: false, isBullishReversal: false, patternName: 'NONE', confidence: 0 };
+  }
+
+  const parseBar = (bar) => {
+    const open = parseFloat(bar[1]);
+    const high = parseFloat(bar[2]);
+    const low = parseFloat(bar[3]);
+    const close = parseFloat(bar[4]);
+    const vol = parseFloat(bar[5]);
+    const takerBuy = parseFloat(bar[9]);
+    const range = high - low;
+    const body = Math.abs(close - open);
+    const upperShadow = range > 0 ? (high - Math.max(open, close)) : 0;
+    const lowerShadow = range > 0 ? (Math.min(open, close) - low) : 0;
+    const isGreen = close >= open;
+    const isRed = close < open;
+    const takerBuyRatio = vol > 0 ? (takerBuy / vol) * 100 : 50;
+
+    return { open, high, low, close, vol, takerBuy, range, body, upperShadow, lowerShadow, isGreen, isRed, takerBuyRatio };
+  };
+
+  const cur = parseBar(klines[klines.length - 1]);
+  const prev = parseBar(klines[klines.length - 2]);
+  const prev2 = parseBar(klines[klines.length - 3]);
+
+  let isBearishReversal = false;
+  let isBullishReversal = false;
+  let patternName = 'NONE';
+  let confidence = 0;
+
+  // 1. SHOOTING STAR (Nagareboshi) - Steve Nison
+  // Real body in lower 38% of range, upper shadow >= 2x body, tiny lower shadow <= 15% range
+  if (cur.range > 0 && cur.upperShadow >= (cur.body * 2.0) && cur.lowerShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
+    if (cur.high >= prev.high || cur.close > prev.open) {
+      isBearishReversal = true;
+      patternName = 'SHOOTING STAR';
+      confidence = cur.takerBuyRatio < 42 ? 95 : 85;
+    }
+  }
+
+  // 2. BEARISH ENGULFING (Tsutsumi) - Steve Nison
+  // Previous green candle engulfed by current red candle with expanding body
+  if (prev.isGreen && cur.isRed && cur.range > 0 && prev.range > 0) {
+    if (cur.open >= (prev.close * 0.9995) && cur.close <= (prev.open * 1.0005) && cur.body >= prev.body) {
+      isBearishReversal = true;
+      patternName = 'BEARISH ENGULFING';
+      confidence = cur.takerBuyRatio < 44 ? 92 : 82;
+    }
+  }
+
+  // 3. EVENING STAR (Sankei) - Steve Nison
+  // 3-bar top: strong green -> small star/doji at high -> strong red closing into first green body
+  if (prev2.isGreen && prev2.body >= (prev2.range * 0.45)) {
+    const isStar = prev.body <= (prev.range * 0.35) && prev.high >= prev2.high;
+    const isEveningRed = cur.isRed && cur.close <= (prev2.open + (prev2.body * 0.50));
+    if (isStar && isEveningRed) {
+      isBearishReversal = true;
+      patternName = 'EVENING STAR';
+      confidence = 94;
+    }
+  }
+
+  // 4. GRAVESTONE DOJI (Toba Doji) - Steve Nison
+  // Open & Close near bottom of candle with long upper shadow >= 75% range
+  if (cur.range > 0 && cur.body <= (cur.range * 0.08) && cur.upperShadow >= (cur.range * 0.75)) {
+    isBearishReversal = true;
+    patternName = 'GRAVESTONE DOJI';
+    confidence = 88;
+  }
+
+  // 5. HAMMER (Kanazuchi / Takuri) - Steve Nison
+  // Real body in upper 38% of range, lower shadow >= 2x body, tiny upper shadow <= 15% range
+  if (cur.range > 0 && cur.lowerShadow >= (cur.body * 2.0) && cur.upperShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
+    isBullishReversal = true;
+    patternName = 'HAMMER';
+    confidence = cur.takerBuyRatio > 55 ? 95 : 85;
+  }
+
+  // 6. BULLISH ENGULFING (Tsutsumi) - Steve Nison
+  // Previous red candle engulfed by current green candle
+  if (prev.isRed && cur.isGreen && cur.range > 0 && prev.range > 0) {
+    if (cur.open <= (prev.close * 1.0005) && cur.close >= (prev.open * 0.9995) && cur.body >= prev.body) {
+      isBullishReversal = true;
+      patternName = 'BULLISH ENGULFING';
+      confidence = cur.takerBuyRatio > 55 ? 92 : 82;
+    }
+  }
+
+  // 7. MORNING STAR (Sankei) - Steve Nison
+  // 3-bar bottom: strong red -> small star at low -> strong green closing above midpoint of first red
+  if (prev2.isRed && prev2.body >= (prev2.range * 0.45)) {
+    const isStar = prev.body <= (prev.range * 0.35) && prev.low <= prev2.low;
+    const isMorningGreen = cur.isGreen && cur.close >= (prev2.close + (prev2.body * 0.50));
+    if (isStar && isMorningGreen) {
+      isBullishReversal = true;
+      patternName = 'MORNING STAR';
+      confidence = 94;
+    }
+  }
+
+  // 8. DRAGONFLY DOJI (Tonbo Doji) - Steve Nison
+  // Open & Close near top with long lower shadow >= 75% range
+  if (cur.range > 0 && cur.body <= (cur.range * 0.08) && cur.lowerShadow >= (cur.range * 0.75)) {
+    isBullishReversal = true;
+    patternName = 'DRAGONFLY DOJI';
+    confidence = 88;
+  }
+
+  return { isBearishReversal, isBullishReversal, patternName, confidence, curBar: cur };
+}
+
+async function checkCandlestickSentry(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+
+    const klines5m = await getCachedKlines(pairSym, '5m', 6, 2500);
+    const klines15m = await getCachedKlines(pairSym, '15m', 6, 2500);
+
+    const pat5m = analyzeCandlestickPattern(klines5m);
+    const pat15m = analyzeCandlestickPattern(klines15m);
+
+    const isBearish = pat5m.isBearishReversal || pat15m.isBearishReversal;
+    const isBullish = pat5m.isBullishReversal || pat15m.isBullishReversal;
+    const activePattern = pat15m.patternName !== 'NONE' ? `${pat15m.patternName} (15m)` : (pat5m.patternName !== 'NONE' ? `${pat5m.patternName} (5m)` : 'NONE');
+
+    if (activePattern !== 'NONE') {
+      State.subsystems.candlestickSentry.lastPatternDetected = `${pairSym}: ${activePattern}`;
+    }
+
+    return {
+      isBearishReversal: isBearish,
+      isBullishReversal: isBullish,
+      patternName: activePattern,
+      confidence: Math.max(pat5m.confidence, pat15m.confidence)
+    };
+  } catch (e) {
+    return { isBearishReversal: false, isBullishReversal: false, patternName: 'NONE', confidence: 0 };
+  }
 }
 
 // -------------------------------------------------------------
@@ -670,7 +819,6 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
   if (freeCash <= 25.00) {
     notional = Math.min(freeCash, Math.max(10.05, Number((freeCash * 0.95).toFixed(2))));
   } else {
-    // Cap by risk-parity notional ceiling while respecting minimum $10.50 Binance notional
     const proportionalNotional = freeCash * (allocPct / 100);
     notional = Math.max(10.50, Math.min(proportionalNotional, riskParityNotionalCap, freeCash));
   }
@@ -695,7 +843,8 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
     peakGainPct: 0,
     peakHighPrice: livePrice,
     ratchetStage: 'INITIAL',
-    tp1Secured: false
+    tp1Secured: false,
+    candlestickPattern: 'MONITORING'
   };
 
   console.log(`[Order Execution] BOUGHT ${sym}/USDT at $${formatPrecisePrice(livePrice)} ($${notional.toFixed(2)} USDT)`);
@@ -928,6 +1077,7 @@ async function evaluateAutopilotEntries() {
 
 // -------------------------------------------------------------
 // PREDICTIVE SENTRY & TIME-DECAY SPOT RECOVERY BAG ENGINE
+// (INTEGRATING JAPANESE CANDLESTICK TRAILING SKILL)
 // -------------------------------------------------------------
 async function runPredictiveSentry() {
   const activeKeys = Object.keys(State.activePositions || {});
@@ -972,7 +1122,38 @@ async function runPredictiveSentry() {
       pos.sl = Math.max(minExitPriceFloor, pos.sl || 0, trailFloor);
     }
 
-    // Self-Aware Trailing: Apex Harvest at Peak (Strictly >= +0.35%)
+    // NEW SKILL EVALUATION: Japanese Candlestick Sentry (Steve Nison Model)
+    const candleCheck = await checkCandlestickSentry(k);
+    pos.candlestickPattern = candleCheck.patternName;
+
+    // CANDLESTICK APEX HARVEST (STRICTLY >= +0.35%)
+    // If in profit and an authentic Japanese reversal pattern prints (Shooting Star, Engulfing, Evening Star, Doji)
+    if (gainPct >= 0.35 && candleCheck.isBearishReversal && livePrice >= minExitPriceFloor) {
+      logOperation('SENTRY_EXIT', `Japanese Candlestick Apex Harvest on ${pos.pair}: [${candleCheck.patternName}] detected at peak. Banked at +${gainPct.toFixed(2)}% ($${formatPrecisePrice(livePrice)}).`, 'success');
+      
+      const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
+      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
+      const tradePayload = {
+        id: Date.now(),
+        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
+        type: `CANDLESTICK APEX HARVEST [${candleCheck.patternName}]`,
+        entryPriceUSDT: entryPrice,
+        exitPriceUSDT: livePrice,
+        notionalUSDT: exitNotional,
+        pnlUSDT: realizedGain,
+        reason: `Candlestick reversal [${candleCheck.patternName}] at +${gainPct.toFixed(2)}% (>= +0.35% floor)`
+      };
+
+      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
+      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
+      delete State.activePositions[k];
+      saveDiskState();
+      broadcastStateUpdate();
+      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
+      continue;
+    }
+
+    // Standard Order-Flow Self-Aware Apex Harvest (Backup check)
     if (gainPct >= 0.35) {
       const selfAware = await checkSelfAwareOrderFlow(k);
       if (selfAware.isApexExhausted && livePrice >= minExitPriceFloor) {
@@ -1100,7 +1281,8 @@ async function runPredictiveSentry() {
           troughPrice: livePrice,
           bouncePeakPrice: livePrice,
           protectedTrailingActive: false,
-          exitInProgress: false
+          exitInProgress: false,
+          candlestickPattern: 'MONITORING'
         };
 
         delete State.activePositions[k];
@@ -1110,12 +1292,11 @@ async function runPredictiveSentry() {
     }
   }
 
-  // PART 2: SPOT RECOVERY BAGS (TIME-DECAY RECOVERY STEPPING & -3.80% TAIL RISK CAP)
-  // Solution 1: Removed Trigger 5 (Trough Crest Trailing) to eliminate premature -2.0% shakeouts
+  // PART 2: SPOT RECOVERY BAGS (TIME-DECAY RECOVERY STEPPING & CANDLESTICK SUPPORT INTEGRATION)
   for (const k of bagKeys) {
     const bag = State.recoveryBags[k];
     if (!bag) continue;
-    if (bag.exitInProgress) continue; // Concurrency lock preventing duplicate/parallel execution
+    if (bag.exitInProgress) continue;
 
     const livePrice = Number(State.universe[k]?.priceUSDT || bag.livePriceUSDT || bag.entryPriceUSDT);
     const entryPrice = Number(bag.entryPriceUSDT || livePrice);
@@ -1126,10 +1307,11 @@ async function runPredictiveSentry() {
     bag.troughPrice = Math.min(bag.troughPrice || livePrice, livePrice);
     bag.bouncePeakPrice = Math.max(bag.bouncePeakPrice || livePrice, livePrice);
 
-    // PILLAR 3: Time-Decay Recovery Stepping
-    // Step 1: 0 - 1.5h -> Target +0.30%
-    // Step 2: 1.5 - 3.5h -> Target +0.10% (covers fees + micro gain)
-    // Step 3: > 3.5h -> Target 0.00% (pure breakeven to recycle capital)
+    // Candlestick Pattern Sentinel on Recovery Bags
+    const candleCheck = await checkCandlestickSentry(k);
+    bag.candlestickPattern = candleCheck.patternName;
+
+    // Time-Decay Recovery Stepping
     let recoveryTargetRate = 0.0030;
     let targetStepLabel = 'STEP 1 (+0.30%)';
 
@@ -1145,10 +1327,9 @@ async function runPredictiveSentry() {
     bag.targetExitPriceUSDT = recoveryTargetPrice;
     bag.targetStep = targetStepLabel;
 
-    // Trailing stop calculates 0.30% behind the relief bounce peak
+    // Breakthrough Trailing: Arms once price touches or calculated stop crosses target
     const calculatedStop = Number((bag.bouncePeakPrice * 0.9970).toFixed(8));
 
-    // Breakthrough Trailing: Once price touches or exceeds recovery target, arm protected trailing immediately!
     if (livePrice >= recoveryTargetPrice || calculatedStop >= recoveryTargetPrice) {
       if (!bag.protectedTrailingActive) {
         bag.protectedTrailingActive = true;
@@ -1157,13 +1338,7 @@ async function runPredictiveSentry() {
     }
 
     if (bag.protectedTrailingActive) {
-      // Floor is locked at or above recoveryTargetPrice - can NEVER exit below target!
       bag.recoverySl = Math.max(bag.recoverySl || 0, recoveryTargetPrice, calculatedStop);
-    }
-
-    const selfAware = await checkSelfAwareOrderFlow(k);
-    if (selfAware.isApexExhausted) {
-      bag.exhaustionDetected = true;
     }
 
     // EXIT TRIGGER 1: Protected Trailing Stop Hit (At or Above Stepped Target Floor)
@@ -1193,22 +1368,22 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // EXIT TRIGGER 2: Self-Aware Apex Harvest at or above Stepped Recovery Target
-    if (livePrice >= recoveryTargetPrice && selfAware.isApexExhausted) {
+    // EXIT TRIGGER 2: Candlestick or Self-Aware Apex Harvest at or above Recovery Target
+    if (livePrice >= recoveryTargetPrice && (candleCheck.isBearishReversal || (await checkSelfAwareOrderFlow(k)).isApexExhausted)) {
       bag.exitInProgress = true;
       const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
 
-      logOperation('RECOVERY', `Recovery Apex Harvest on ${bag.pair}: Order flow exhausted at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}% >= ${targetStepLabel}). 100% capital banked.`, 'success');
+      logOperation('RECOVERY', `Recovery Apex Harvest on ${bag.pair} via [${candleCheck.patternName || 'Order Flow'}]: Exit at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}% >= ${targetStepLabel}). 100% capital banked.`, 'success');
 
       const tradePayload = {
         id: Date.now(),
         pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'RECOVERY APEX HARVEST',
+        type: `RECOVERY APEX HARVEST [${candleCheck.patternName || 'ORDER FLOW'}]`,
         entryPriceUSDT: entryPrice,
         exitPriceUSDT: livePrice,
         notionalUSDT: bag.notionalUSDT,
         pnlUSDT: realizedGain,
-        reason: `Recovery Apex Harvest at $${formatPrecisePrice(livePrice)} (Taker Buy ${selfAware.takerBuyRatio}%)`
+        reason: `Recovery Apex Harvest [${candleCheck.patternName}] at $${formatPrecisePrice(livePrice)}`
       };
 
       State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
@@ -1247,29 +1422,29 @@ async function runPredictiveSentry() {
       continue;
     }
 
-    // EXIT TRIGGER 4: Near-Miss Relief Harvest (Option 2 & Option 3 Protected)
+    // EXIT TRIGGER 4: Near-Miss Relief Harvest (Option 2 & Option 3 & Candlestick Protected)
     // 1. Held in bag >= 1.0h and near entry (gainPct >= -0.15%)
-    // 2. Option 3 (Macro VWAP Shield): If price is >= 15m VWAP, DO NOT exit! Allow it to hit +0.30%
-    // 3. Option 2 (15m Multi-Bar Confirmation): Requires 15m bar rejection or 2 consecutive 5m exhaustion bars, NOT a single 5m tick!
+    // 2. Option 3: If price >= 15m VWAP, DO NOT exit!
+    // 3. Option 2 / Candlestick: Requires confirmed bearish rejection below VWAP (Shooting Star, Bearish Engulfing, etc.)
     if (holdHours >= 1.0 && gainPct >= -0.15) {
       const reliefCheck = await checkRecoveryReliefExhaustion(k, livePrice);
 
-      // If price is above VWAP, the recovery bounce is healthy! Do not harvest early.
-      if (!reliefCheck.isAboveVwap && reliefCheck.isConfirmedExhausted) {
+      // If price is below VWAP AND a confirmed Candlestick Reversal or multi-bar exhaustion prints
+      if (!reliefCheck.isAboveVwap && (candleCheck.isBearishReversal || reliefCheck.isConfirmedExhausted)) {
         bag.exitInProgress = true;
         const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
 
-        logOperation('RECOVERY', `Near-Miss Relief Harvest on ${bag.pair} at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%). Confirmed below 15m VWAP ($${formatPrecisePrice(reliefCheck.vwap15m)}) with multi-bar exhaustion. Capital recycled.`, 'info');
+        logOperation('RECOVERY', `Near-Miss Relief Harvest on ${bag.pair} at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%). Pattern: [${candleCheck.patternName}]. Confirmed below 15m VWAP. Capital recycled.`, 'info');
 
         const tradePayload = {
           id: Date.now(),
           pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-          type: 'RECOVERY NEAR-MISS HARVEST',
+          type: `RECOVERY NEAR-MISS HARVEST [${candleCheck.patternName}]`,
           entryPriceUSDT: entryPrice,
           exitPriceUSDT: livePrice,
           notionalUSDT: bag.notionalUSDT,
           pnlUSDT: realizedGain,
-          reason: `Near-miss relief harvest: Below 15m VWAP ($${formatPrecisePrice(reliefCheck.vwap15m)}) with confirmed exhaustion`
+          reason: `Near-miss relief harvest: Below 15m VWAP with ${candleCheck.patternName || 'multi-bar exhaustion'}`
         };
 
         State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
@@ -2000,10 +2175,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
   console.log(`Low-Latency Singapore Stream + Sentinel Active (<5ms)`);
+  console.log(`Candlestick Pattern Sentinel Active (Shooting Star, Hammer, Engulfing)`);
   console.log(`bStocks Shield Active (SOXLB, SNDKB, etc. Excluded)`);
   console.log(`Time-Decay Recovery (+0.30% -> +0.10% -> 0.00% BE)`);
   console.log(`Disaster Tail Risk Floor Calibrated to -3.80%`);
-  console.log(`Solution 1 Active: Trigger 5 Removed (Pure Stepped Recovery)`);
   console.log(`====================================================`);
 
   runDynamicScreener().then(() => {
