@@ -6,7 +6,12 @@
  * - 3 Concurrent Active Breakout Slots (High-Velocity Execution)
  * - Maximum 5 Spot Recovery Bags Limit
  * - Strict Active Position Rule: Never close below +0.35% (Demote to Bag on failure)
- * - NEW: Bullish Candlestick Pattern Screener & Autopilot Entry Engine (Steve Nison Model)
+ * - NEW: 4-Pillar Upstream Realignment & Anti-Bag Accumulation Engine:
+ *     * Pillar 1: Closed-Bar & Minimum-Range Candlestick Pattern Confirmation (Eliminates Minute-1 Marubozu traps)
+ *     * Pillar 2: Widened Demotion Threshold (-1.50% / 25m) to let healthy retests breathe without bag demotion
+ *     * Pillar 3: Strict Zero-Tolerance Resistance Floors (Price >= 15m VWAP & >= 1h 20-EMA; Peak Dist <= 3.5%)
+ *     * Pillar 4: Screener Freshening: Penalize Stale 24h Distribution Tops (1h trend < 0; Pos >= 0.55)
+ * - Bullish Candlestick Pattern Screener & Autopilot Entry Engine (Steve Nison Model)
  *     * Marubozu (Daiken), Belt Hold (Yorikiri), Bullish Engulfing (Tsutsumi)
  *     * Morning Star (Sankei), Takuri Hammer, Piercing Line, Three White Soldiers
  *     * Triad Confluence: Pattern + Taker CVD (>=50%) + 15m VWAP support
@@ -286,8 +291,9 @@ function analyzeCandlestickPattern(klines) {
     const isGreen = close >= open;
     const isRed = close < open;
     const takerBuyRatio = vol > 0 ? (takerBuy / vol) * 100 : 50;
+    const rangePct = low > 0 ? (range / low) * 100 : 0;
 
-    return { open, high, low, close, vol, takerBuy, range, body, upperShadow, lowerShadow, isGreen, isRed, takerBuyRatio };
+    return { open, high, low, close, vol, takerBuy, range, body, upperShadow, lowerShadow, isGreen, isRed, takerBuyRatio, rangePct };
   };
 
   const cur = parseBar(klines[klines.length - 1]);
@@ -301,35 +307,63 @@ function analyzeCandlestickPattern(klines) {
   let bearishPatternName = 'NONE';
   let confidence = 0;
 
+  // Pillar 1: Closed-bar / Minimum-range guard.
+  // Live candle must have meaningful expansion (range >= 0.35%) or pattern is confirmed on closed bar (prev).
+  const hasMinLiveRange = cur.rangePct >= 0.35;
+  const isCurConfirmingGreen = cur.isGreen && cur.upperShadow <= (cur.range * 0.30);
+
   // ==========================================
   // SECTION A: STEVE NISON BULLISH ENTRY SETUPS
   // ==========================================
 
   // 1. BULLISH MARUBOZU (Daiken - The Great Bald Candle)
-  // Powerful institutional impulse: tall green candle with almost no wicks
-  if (cur.isGreen && cur.range > 0 && cur.body >= (cur.range * 0.85)) {
+  // Formed on mature cur (range >= 0.35%) or confirmed on closed prev with cur green continuation
+  if (hasMinLiveRange && cur.isGreen && cur.range > 0 && cur.body >= (cur.range * 0.85)) {
     if (cur.upperShadow <= (cur.range * 0.08) && cur.lowerShadow <= (cur.range * 0.08)) {
       isBullishEntry = true;
       isBullishReversal = true;
       bullishPatternName = 'BULLISH MARUBOZU';
       confidence = cur.takerBuyRatio >= 55 ? 98 : 90;
     }
+  } else if (prev.isGreen && prev.rangePct >= 0.40 && prev.body >= (prev.range * 0.85) && isCurConfirmingGreen) {
+    if (prev.upperShadow <= (prev.range * 0.08) && prev.lowerShadow <= (prev.range * 0.08)) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'BULLISH MARUBOZU (CONFIRMED)';
+      confidence = 94;
+    }
   }
 
   // 2. BULLISH BELT HOLD (Yorikiri)
   // Opens on its absolute low, pushes strongly upward, closes near high
-  if (!isBullishEntry && cur.isGreen && cur.range > 0 && cur.body >= (cur.range * 0.70)) {
+  if (!isBullishEntry && hasMinLiveRange && cur.isGreen && cur.range > 0 && cur.body >= (cur.range * 0.70)) {
     if (cur.lowerShadow <= (cur.range * 0.05) && cur.upperShadow <= (cur.range * 0.20)) {
       isBullishEntry = true;
       isBullishReversal = true;
       bullishPatternName = 'BULLISH BELT HOLD';
       confidence = cur.takerBuyRatio >= 52 ? 95 : 88;
     }
+  } else if (!isBullishEntry && prev.isGreen && prev.rangePct >= 0.40 && prev.body >= (prev.range * 0.70) && isCurConfirmingGreen) {
+    if (prev.lowerShadow <= (prev.range * 0.05) && prev.upperShadow <= (prev.range * 0.20)) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'BULLISH BELT HOLD (CONFIRMED)';
+      confidence = 92;
+    }
   }
 
   // 3. BULLISH ENGULFING (Tsutsumi)
-  // Prior red candle completely engulfed by expanding green real body
-  if (!isBullishEntry && prev.isRed && cur.isGreen && cur.range > 0 && prev.range > 0) {
+  // Confirmed on closed bars (prev engulfs prev2 with cur confirming) or mature live bar
+  if (!isBullishEntry && prev2.isRed && prev.isGreen && prev.range > 0 && prev2.range > 0 && prev.rangePct >= 0.35) {
+    if (prev.open <= (prev2.close * 1.0005) && prev.close >= (prev2.open * 0.9995) && prev.body >= (prev2.body * 1.15)) {
+      if (prev.upperShadow <= (prev.range * 0.30) && isCurConfirmingGreen) {
+        isBullishEntry = true;
+        isBullishReversal = true;
+        bullishPatternName = 'BULLISH ENGULFING';
+        confidence = cur.takerBuyRatio >= 50 ? 95 : 88;
+      }
+    }
+  } else if (!isBullishEntry && hasMinLiveRange && prev.isRed && cur.isGreen && cur.range > 0 && prev.range > 0) {
     if (cur.open <= (prev.close * 1.0005) && cur.close >= (prev.open * 0.9995) && cur.body >= (prev.body * 1.15)) {
       if (cur.upperShadow <= (cur.range * 0.30)) {
         isBullishEntry = true;
@@ -354,8 +388,15 @@ function analyzeCandlestickPattern(klines) {
   }
 
   // 5. TAKURI HAMMER (Kanazuchi / Takuri)
-  // Long lower shadow (>= 2x body), small body near top, tiny upper shadow (<= 15%)
-  if (!isBullishEntry && cur.range > 0 && cur.lowerShadow >= (cur.body * 2.0) && cur.upperShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
+  // Closed hammer on prev confirmed by green cur, or mature hammer on cur
+  if (!isBullishEntry && prev.range > 0 && prev.lowerShadow >= (prev.body * 2.0) && prev.upperShadow <= (prev.range * 0.15) && prev.body <= (prev.range * 0.38)) {
+    if (isCurConfirmingGreen) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'HAMMER (CONFIRMED)';
+      confidence = 94;
+    }
+  } else if (!isBullishEntry && hasMinLiveRange && cur.range > 0 && cur.lowerShadow >= (cur.body * 2.0) && cur.upperShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
     isBullishEntry = true;
     isBullishReversal = true;
     bullishPatternName = 'HAMMER';
@@ -364,7 +405,7 @@ function analyzeCandlestickPattern(klines) {
 
   // 6. PIERCING LINE (Kirikomi)
   // Deep red candle followed by green candle opening low and piercing > 50% into previous body
-  if (!isBullishEntry && prev.isRed && prev.body >= (prev.range * 0.45) && cur.isGreen && cur.range > 0) {
+  if (!isBullishEntry && prev.isRed && prev.body >= (prev.range * 0.45) && cur.isGreen && cur.range > 0 && hasMinLiveRange) {
     const midpoint = (prev.open + prev.close) / 2;
     if (cur.open < prev.low && cur.close >= midpoint && cur.close < prev.open) {
       isBullishEntry = true;
@@ -796,7 +837,8 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
     const liveRvol = avgVol > 0 ? (curVol / avgVol) : 1.0;
     const rvol = Number(Math.max(completedRvol, liveRvol).toFixed(2));
 
-    if (curClose < (vwap4h * 0.995)) {
+    // Pillar 3: Strict Zero-Tolerance VWAP Floor (Must be on or above 15m/4h VWAP, no discount below resistance)
+    if (curClose < vwap4h) {
       return { passed: false, reason: `Price below 15m VWAP ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(vwap4h)})` };
     }
 
@@ -812,8 +854,9 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       };
     }
 
-    const isTrackA = (change15mPct >= 0.35 && rvol >= 1.00 && distFrom4hHighPct <= 5.50);
-    const isTrackB = (curClose >= (vwap4h * 0.998) && distFrom4hHighPct <= 6.00 && (change1hPct >= 0.50 || curChange15m >= 0.20));
+    // Pillar 3: Strict Proximity to 4-Hour High (<= 3.50% - rejects buying into exhausted channel tops)
+    const isTrackA = (change15mPct >= 0.35 && rvol >= 1.00 && distFrom4hHighPct <= 3.50 && curClose >= vwap4h);
+    const isTrackB = (curClose >= vwap4h && distFrom4hHighPct <= 3.50 && (change1hPct >= 0.50 || curChange15m >= 0.20));
 
     if (!isTrackA && !isTrackB) {
       return { 
@@ -852,7 +895,9 @@ async function check1hTrendAlignment(symbol) {
       const c = parseFloat(klines[i][4]);
       ema = (c * k) + (ema * (1 - k));
     }
-    if (curClose < (ema * 0.995)) {
+    
+    // Pillar 3: Strict Zero-Tolerance 1h 20-EMA Floor (Must be strictly on or above EMA, no discount)
+    if (curClose < ema) {
       return { passed: false, reason: `Price below 1h 20-EMA ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(ema)})` };
     }
 
@@ -1042,6 +1087,16 @@ async function runDynamicScreener() {
         const klines15m = await getCachedKlines(topSym, '15m', 5, 2000);
         const pat = analyzeCandlestickPattern(klines15m);
         if (universe[topSym]) {
+          // Pillar 4: Penalize stale 24h gainers that are currently bleeding in the 1h timeframe
+          if (Array.isArray(klines15m) && klines15m.length >= 4) {
+            const open1h = parseFloat(klines15m[klines15m.length - 4][1]);
+            const closeNow = parseFloat(klines15m[klines15m.length - 1][4]);
+            const change1h = open1h > 0 ? ((closeNow - open1h) / open1h) * 100 : 0;
+            if (change1h < -0.25) {
+              universe[topSym].score = Math.max(0, universe[topSym].score - 15);
+            }
+          }
+
           if (pat.bullishPatternName !== 'NONE') {
             universe[topSym].candlestickPattern = pat.bullishPatternName;
             // Award bonus score to promote top bullish candlestick formations
@@ -1151,8 +1206,9 @@ async function evaluateAutopilotEntries() {
       const rangePct = Number(coin.intradayRangePct || 0);
       if (change24h < 0.20 && rangePct < 3.0) continue;
 
+      // Pillar 4: Elevate Range Floor to >= 0.55 (avoid knife-catching in the lower half of the 24h range)
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
-      if (posInRange < 0.40) continue;
+      if (posInRange < 0.55) continue;
 
       const volQuote = (coin.volumeM || 0) * 1000000;
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
@@ -1420,7 +1476,8 @@ async function runPredictiveSentry() {
     if (!pos.tp1Secured && gainPct < 0.35) {
       let shouldDemote = (gainPct <= -2.80);
 
-      if (!shouldDemote && holdMinutes >= 20 && gainPct <= -0.50) {
+      // Pillar 2: Widen demotion threshold to -1.50% and 25m so normal pullbacks aren't prematurely bagged
+      if (!shouldDemote && holdMinutes >= 25 && gainPct <= -1.50) {
         const selfAwareCheck = await checkSelfAwareOrderFlow(k);
         if (selfAwareCheck.isUpsideDead) {
           shouldDemote = true;
