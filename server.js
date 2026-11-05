@@ -6,14 +6,16 @@
  * - 3 Concurrent Active Breakout Slots (High-Velocity Execution)
  * - Maximum 5 Spot Recovery Bags Limit
  * - Strict Active Position Rule: Never close below +0.35% (Demote to Bag on failure)
- * - NEW SKILL: Japanese Candlestick Pattern Sentinel (Steve Nison Model)
- *     * Apex Peak Harvest: Shooting Star, Bearish Engulfing, Evening Star, Gravestone Doji
- *     * Trough Support Shield: Hammer, Bullish Engulfing, Morning Star, Dragonfly Doji
+ * - NEW: Bullish Candlestick Pattern Screener & Autopilot Entry Engine (Steve Nison Model)
+ *     * Marubozu (Daiken), Belt Hold (Yorikiri), Bullish Engulfing (Tsutsumi)
+ *     * Morning Star (Sankei), Takuri Hammer, Piercing Line, Three White Soldiers
+ *     * Triad Confluence: Pattern + Taker CVD (>=50%) + 15m VWAP support
+ *     * Strict Upper Rejection Wick Ceiling (<= 30%) on entries
+ * - Candlestick Apex Harvest on Exits (Shooting Star, Bearish Engulfing, Evening Star, Doji)
  * - bStocks & 3X Leveraged ETF Exclusion Shield (Blocks SOXLB, SNDKB, TSLAB, etc.)
  * - Spot Recovery Bag Engine with Time-Decay Stepping (+0.30% -> +0.10% -> 0.00% BE)
  * - Breakthrough Trailing Runner: Locks recovery floor at stepped target and trails runners
  * - 1h 20-EMA Extension Shield (<= 5.50% above EMA) to prevent second-leg FOMO traps
- * - 15m Upper Rejection Wick Ceiling (<= 35%) to reject buying into distribution shadows
  * - Risk-Parity Notional Sizing: Caps maximum dollar risk at ~$0.80 USDT (~₹76)
  * - Zero Post-Bag Cooldown: Preserves 100% unrestricted entry velocity
  * - Solution 1 Implemented: Removed Trough Crest Trailing (Trigger 5) to eliminate
@@ -88,7 +90,13 @@ const State = {
   cooldowns: {},
   subsystems: {
     liveFeed: [],
-    candlestickSentry: { status: 'ONLINE', patternsTracked: 'Shooting Star, Hammer, Engulfing, Evening/Morning Star', lastPatternDetected: '--' },
+    candlestickSentry: { 
+      status: 'ONLINE', 
+      engine: 'Steve Nison Confluence Triad',
+      bullishPatternsTracked: 'Marubozu, Belt Hold, Engulfing, Morning Star, Hammer, Piercing Line',
+      bearishPatternsTracked: 'Shooting Star, Bearish Engulfing, Evening Star, Gravestone Doji',
+      lastPatternDetected: '--' 
+    },
     pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
     bStockShield: { status: 'ACTIVE', blockedAssets: ['SOXLB', 'SNDKB', 'TSLAB', 'NVDB'], maxUnitPrice: '$350.00' },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 15, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M+)' },
@@ -248,11 +256,20 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
 }
 
 // -------------------------------------------------------------
-// NEW SKILL: JAPANESE CANDLESTICK PATTERN SENTINEL (STEVE NISON MODEL)
+// STEVE NISON JAPANESE CANDLESTICK PATTERN RECOGNITION ENGINE
+// (BULLISH ENTRY SETUPS & BEARISH APEX HARVESTING)
 // -------------------------------------------------------------
 function analyzeCandlestickPattern(klines) {
   if (!Array.isArray(klines) || klines.length < 3) {
-    return { isBearishReversal: false, isBullishReversal: false, patternName: 'NONE', confidence: 0 };
+    return { 
+      isBearishReversal: false, 
+      isBullishReversal: false, 
+      isBullishEntry: false, 
+      bullishPatternName: 'NONE',
+      bearishPatternName: 'NONE',
+      patternName: 'NONE', 
+      confidence: 0 
+    };
   }
 
   const parseBar = (bar) => {
@@ -279,88 +296,158 @@ function analyzeCandlestickPattern(klines) {
 
   let isBearishReversal = false;
   let isBullishReversal = false;
-  let patternName = 'NONE';
+  let isBullishEntry = false;
+  let bullishPatternName = 'NONE';
+  let bearishPatternName = 'NONE';
   let confidence = 0;
 
-  // 1. SHOOTING STAR (Nagareboshi) - Steve Nison
-  // Real body in lower 38% of range, upper shadow >= 2x body, tiny lower shadow <= 15% range
-  if (cur.range > 0 && cur.upperShadow >= (cur.body * 2.0) && cur.lowerShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
-    if (cur.high >= prev.high || cur.close > prev.open) {
-      isBearishReversal = true;
-      patternName = 'SHOOTING STAR';
-      confidence = cur.takerBuyRatio < 42 ? 95 : 85;
+  // ==========================================
+  // SECTION A: STEVE NISON BULLISH ENTRY SETUPS
+  // ==========================================
+
+  // 1. BULLISH MARUBOZU (Daiken - The Great Bald Candle)
+  // Powerful institutional impulse: tall green candle with almost no wicks
+  if (cur.isGreen && cur.range > 0 && cur.body >= (cur.range * 0.85)) {
+    if (cur.upperShadow <= (cur.range * 0.08) && cur.lowerShadow <= (cur.range * 0.08)) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'BULLISH MARUBOZU';
+      confidence = cur.takerBuyRatio >= 55 ? 98 : 90;
     }
   }
 
-  // 2. BEARISH ENGULFING (Tsutsumi) - Steve Nison
-  // Previous green candle engulfed by current red candle with expanding body
-  if (prev.isGreen && cur.isRed && cur.range > 0 && prev.range > 0) {
+  // 2. BULLISH BELT HOLD (Yorikiri)
+  // Opens on its absolute low, pushes strongly upward, closes near high
+  if (!isBullishEntry && cur.isGreen && cur.range > 0 && cur.body >= (cur.range * 0.70)) {
+    if (cur.lowerShadow <= (cur.range * 0.05) && cur.upperShadow <= (cur.range * 0.20)) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'BULLISH BELT HOLD';
+      confidence = cur.takerBuyRatio >= 52 ? 95 : 88;
+    }
+  }
+
+  // 3. BULLISH ENGULFING (Tsutsumi)
+  // Prior red candle completely engulfed by expanding green real body
+  if (!isBullishEntry && prev.isRed && cur.isGreen && cur.range > 0 && prev.range > 0) {
+    if (cur.open <= (prev.close * 1.0005) && cur.close >= (prev.open * 0.9995) && cur.body >= (prev.body * 1.15)) {
+      if (cur.upperShadow <= (cur.range * 0.30)) {
+        isBullishEntry = true;
+        isBullishReversal = true;
+        bullishPatternName = 'BULLISH ENGULFING';
+        confidence = cur.takerBuyRatio >= 50 ? 94 : 85;
+      }
+    }
+  }
+
+  // 4. MORNING STAR (Sankei)
+  // 3-bar bottom reversal: strong red -> small star at low -> strong green closing > 50% into 1st red bar
+  if (!isBullishEntry && prev2.isRed && prev2.body >= (prev2.range * 0.40)) {
+    const isStar = prev.body <= (prev.range * 0.35) && prev.low <= prev2.low;
+    const isMorningGreen = cur.isGreen && cur.close >= (prev2.close + (prev2.body * 0.50));
+    if (isStar && isMorningGreen && cur.upperShadow <= (cur.range * 0.30)) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'MORNING STAR';
+      confidence = 96;
+    }
+  }
+
+  // 5. TAKURI HAMMER (Kanazuchi / Takuri)
+  // Long lower shadow (>= 2x body), small body near top, tiny upper shadow (<= 15%)
+  if (!isBullishEntry && cur.range > 0 && cur.lowerShadow >= (cur.body * 2.0) && cur.upperShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
+    isBullishEntry = true;
+    isBullishReversal = true;
+    bullishPatternName = 'HAMMER';
+    confidence = cur.takerBuyRatio >= 50 ? 92 : 84;
+  }
+
+  // 6. PIERCING LINE (Kirikomi)
+  // Deep red candle followed by green candle opening low and piercing > 50% into previous body
+  if (!isBullishEntry && prev.isRed && prev.body >= (prev.range * 0.45) && cur.isGreen && cur.range > 0) {
+    const midpoint = (prev.open + prev.close) / 2;
+    if (cur.open < prev.low && cur.close >= midpoint && cur.close < prev.open) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'PIERCING LINE';
+      confidence = 90;
+    }
+  }
+
+  // 7. THREE WHITE SOLDIERS (Aka Sansei)
+  // 3 consecutive strong green candles, each closing near its high
+  if (!isBullishEntry && prev2.isGreen && prev.isGreen && cur.isGreen) {
+    if (cur.close > prev.close && prev.close > prev2.close) {
+      if (cur.upperShadow <= (cur.range * 0.25) && prev.upperShadow <= (prev.range * 0.25)) {
+        isBullishEntry = true;
+        isBullishReversal = true;
+        bullishPatternName = 'THREE WHITE SOLDIERS';
+        confidence = 95;
+      }
+    }
+  }
+
+  // 8. DRAGONFLY DOJI (Tonbo Doji)
+  if (!isBullishEntry && cur.range > 0 && cur.body <= (cur.range * 0.08) && cur.lowerShadow >= (cur.range * 0.75)) {
+    isBullishReversal = true;
+    bullishPatternName = 'DRAGONFLY DOJI';
+    confidence = 86;
+  }
+
+  // ==========================================
+  // SECTION B: STEVE NISON BEARISH APEX PATTERNS (TOP-TICK HARVESTING)
+  // ==========================================
+
+  // 1. SHOOTING STAR (Nagareboshi)
+  if (cur.range > 0 && cur.upperShadow >= (cur.body * 2.0) && cur.lowerShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
+    if (cur.high >= prev.high || cur.close > prev.open) {
+      isBearishReversal = true;
+      bearishPatternName = 'SHOOTING STAR';
+      confidence = cur.takerBuyRatio < 44 ? 95 : 85;
+    }
+  }
+
+  // 2. BEARISH ENGULFING (Tsutsumi)
+  if (!isBearishReversal && prev.isGreen && cur.isRed && cur.range > 0 && prev.range > 0) {
     if (cur.open >= (prev.close * 0.9995) && cur.close <= (prev.open * 1.0005) && cur.body >= prev.body) {
       isBearishReversal = true;
-      patternName = 'BEARISH ENGULFING';
+      bearishPatternName = 'BEARISH ENGULFING';
       confidence = cur.takerBuyRatio < 44 ? 92 : 82;
     }
   }
 
-  // 3. EVENING STAR (Sankei) - Steve Nison
-  // 3-bar top: strong green -> small star/doji at high -> strong red closing into first green body
-  if (prev2.isGreen && prev2.body >= (prev2.range * 0.45)) {
+  // 3. EVENING STAR (Sankei)
+  if (!isBearishReversal && prev2.isGreen && prev2.body >= (prev2.range * 0.45)) {
     const isStar = prev.body <= (prev.range * 0.35) && prev.high >= prev2.high;
     const isEveningRed = cur.isRed && cur.close <= (prev2.open + (prev2.body * 0.50));
     if (isStar && isEveningRed) {
       isBearishReversal = true;
-      patternName = 'EVENING STAR';
+      bearishPatternName = 'EVENING STAR';
       confidence = 94;
     }
   }
 
-  // 4. GRAVESTONE DOJI (Toba Doji) - Steve Nison
-  // Open & Close near bottom of candle with long upper shadow >= 75% range
-  if (cur.range > 0 && cur.body <= (cur.range * 0.08) && cur.upperShadow >= (cur.range * 0.75)) {
+  // 4. GRAVESTONE DOJI (Toba Doji)
+  if (!isBearishReversal && cur.range > 0 && cur.body <= (cur.range * 0.08) && cur.upperShadow >= (cur.range * 0.75)) {
     isBearishReversal = true;
-    patternName = 'GRAVESTONE DOJI';
+    bearishPatternName = 'GRAVESTONE DOJI';
     confidence = 88;
   }
 
-  // 5. HAMMER (Kanazuchi / Takuri) - Steve Nison
-  // Real body in upper 38% of range, lower shadow >= 2x body, tiny upper shadow <= 15% range
-  if (cur.range > 0 && cur.lowerShadow >= (cur.body * 2.0) && cur.upperShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
-    isBullishReversal = true;
-    patternName = 'HAMMER';
-    confidence = cur.takerBuyRatio > 55 ? 95 : 85;
-  }
+  const patternName = bearishPatternName !== 'NONE' 
+    ? bearishPatternName 
+    : (bullishPatternName !== 'NONE' ? bullishPatternName : 'NONE');
 
-  // 6. BULLISH ENGULFING (Tsutsumi) - Steve Nison
-  // Previous red candle engulfed by current green candle
-  if (prev.isRed && cur.isGreen && cur.range > 0 && prev.range > 0) {
-    if (cur.open <= (prev.close * 1.0005) && cur.close >= (prev.open * 0.9995) && cur.body >= prev.body) {
-      isBullishReversal = true;
-      patternName = 'BULLISH ENGULFING';
-      confidence = cur.takerBuyRatio > 55 ? 92 : 82;
-    }
-  }
-
-  // 7. MORNING STAR (Sankei) - Steve Nison
-  // 3-bar bottom: strong red -> small star at low -> strong green closing above midpoint of first red
-  if (prev2.isRed && prev2.body >= (prev2.range * 0.45)) {
-    const isStar = prev.body <= (prev.range * 0.35) && prev.low <= prev2.low;
-    const isMorningGreen = cur.isGreen && cur.close >= (prev2.close + (prev2.body * 0.50));
-    if (isStar && isMorningGreen) {
-      isBullishReversal = true;
-      patternName = 'MORNING STAR';
-      confidence = 94;
-    }
-  }
-
-  // 8. DRAGONFLY DOJI (Tonbo Doji) - Steve Nison
-  // Open & Close near top with long lower shadow >= 75% range
-  if (cur.range > 0 && cur.body <= (cur.range * 0.08) && cur.lowerShadow >= (cur.range * 0.75)) {
-    isBullishReversal = true;
-    patternName = 'DRAGONFLY DOJI';
-    confidence = 88;
-  }
-
-  return { isBearishReversal, isBullishReversal, patternName, confidence, curBar: cur };
+  return { 
+    isBearishReversal, 
+    isBullishReversal, 
+    isBullishEntry, 
+    bullishPatternName, 
+    bearishPatternName, 
+    patternName, 
+    confidence, 
+    curBar: cur 
+  };
 }
 
 async function checkCandlestickSentry(symbol) {
@@ -376,7 +463,17 @@ async function checkCandlestickSentry(symbol) {
 
     const isBearish = pat5m.isBearishReversal || pat15m.isBearishReversal;
     const isBullish = pat5m.isBullishReversal || pat15m.isBullishReversal;
-    const activePattern = pat15m.patternName !== 'NONE' ? `${pat15m.patternName} (15m)` : (pat5m.patternName !== 'NONE' ? `${pat5m.patternName} (5m)` : 'NONE');
+    const isBullishEntry = pat15m.isBullishEntry || pat5m.isBullishEntry;
+
+    const activeBullishPattern = pat15m.bullishPatternName !== 'NONE' 
+      ? `${pat15m.bullishPatternName} (15m)` 
+      : (pat5m.bullishPatternName !== 'NONE' ? `${pat5m.bullishPatternName} (5m)` : 'NONE');
+
+    const activeBearishPattern = pat15m.bearishPatternName !== 'NONE' 
+      ? `${pat15m.bearishPatternName} (15m)` 
+      : (pat5m.bearishPatternName !== 'NONE' ? `${pat5m.bearishPatternName} (5m)` : 'NONE');
+
+    const activePattern = activeBearishPattern !== 'NONE' ? activeBearishPattern : activeBullishPattern;
 
     if (activePattern !== 'NONE') {
       State.subsystems.candlestickSentry.lastPatternDetected = `${pairSym}: ${activePattern}`;
@@ -385,11 +482,22 @@ async function checkCandlestickSentry(symbol) {
     return {
       isBearishReversal: isBearish,
       isBullishReversal: isBullish,
+      isBullishEntry: isBullishEntry,
+      bullishPatternName: activeBullishPattern,
+      bearishPatternName: activeBearishPattern,
       patternName: activePattern,
       confidence: Math.max(pat5m.confidence, pat15m.confidence)
     };
   } catch (e) {
-    return { isBearishReversal: false, isBullishReversal: false, patternName: 'NONE', confidence: 0 };
+    return { 
+      isBearishReversal: false, 
+      isBullishReversal: false, 
+      isBullishEntry: false, 
+      bullishPatternName: 'NONE', 
+      bearishPatternName: 'NONE', 
+      patternName: 'NONE', 
+      confidence: 0 
+    };
   }
 }
 
@@ -493,8 +601,9 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
     const range = high - low;
     const clv = range > 0 ? (close - low) / range : 0.5;
 
-    if (takerBuyRatio < 44.0 && netDelta < 0) {
-      return { passed: false, reason: `Negative Taker CVD (Buy: ${takerBuyRatio.toFixed(1)}%)` };
+    // Strict Taker Volume Delta Gate: Buyers must dominate volume
+    if (takerBuyRatio < 48.0 && netDelta < 0) {
+      return { passed: false, reason: `Negative Taker CVD (Buy: ${takerBuyRatio.toFixed(1)}% < 48%)` };
     }
 
     if (clv < 0.35 && range > 0 && close < open) {
@@ -691,15 +800,15 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       return { passed: false, reason: `Price below 15m VWAP ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(vwap4h)})` };
     }
 
-    // Pre-Entry Upper Rejection Wick Gate (Rejects shooting stars & apex wick entries)
+    // Pre-Entry Upper Rejection Wick Gate (Ceiling <= 30% to guarantee solid bullish expansion bodies)
     const curHigh = parseFloat(curBar[2]);
     const curLow = parseFloat(curBar[3]);
     const curRange = curHigh - curLow;
     const curUpperWickRatio = curRange > 0 ? (curHigh - Math.max(curOpen, curClose)) / curRange : 0;
-    if (curUpperWickRatio > 0.35 && curRange > 0) {
+    if (curUpperWickRatio > 0.30 && curRange > 0) {
       return { 
         passed: false, 
-        reason: `15m Upper rejection wick too large (${Math.round(curUpperWickRatio * 100)}% > 35%). Active selling into resistance.` 
+        reason: `15m Upper rejection wick too large (${Math.round(curUpperWickRatio * 100)}% > 30%). Active selling into resistance.` 
       };
     }
 
@@ -795,7 +904,7 @@ async function fetchRealOrderBookDepth(symbol) {
   }
 }
 
-async function executeSpotBuy(symbol, coin, book, microMom) {
+async function executeSpotBuy(symbol, coin, book, microMom, candlePattern = 'MOMENTUM_EXPANSION') {
   const sym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
   const pairKey = `${sym}USDT`;
   const livePrice = Number(coin.priceUSDT || coin.price || 1.0);
@@ -844,11 +953,11 @@ async function executeSpotBuy(symbol, coin, book, microMom) {
     peakHighPrice: livePrice,
     ratchetStage: 'INITIAL',
     tp1Secured: false,
-    candlestickPattern: 'MONITORING'
+    candlestickPattern: candlePattern
   };
 
-  console.log(`[Order Execution] BOUGHT ${sym}/USDT at $${formatPrecisePrice(livePrice)} ($${notional.toFixed(2)} USDT)`);
-  logOperation('EXECUTION', `BOUGHT ${sym}/USDT at $${formatPrecisePrice(livePrice)} ($${notional.toFixed(2)} USDT). Slot occupied.`, 'success');
+  console.log(`[Order Execution] BOUGHT ${sym}/USDT at $${formatPrecisePrice(livePrice)} ($${notional.toFixed(2)} USDT) [Pattern: ${candlePattern}]`);
+  logOperation('EXECUTION', `BOUGHT ${sym}/USDT at $${formatPrecisePrice(livePrice)} ($${notional.toFixed(2)} USDT) via [${candlePattern}]. Slot occupied.`, 'success');
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
 }
@@ -860,6 +969,8 @@ async function runDynamicScreener() {
     if (!Array.isArray(tickers)) return;
 
     const universe = {};
+    const candidateKlinesQueue = [];
+
     for (const t of tickers) {
       const sym = t.symbol;
       if (!sym.endsWith('USDT')) continue;
@@ -916,15 +1027,39 @@ async function runDynamicScreener() {
         volumeM: Math.round(volQuote / 1000000),
         obi: 0.55,
         isPumpAndDump: isPumpDump,
-        pumpDumpReason: pumpDumpReason
+        pumpDumpReason: pumpDumpReason,
+        candlestickPattern: 'WATCH'
       };
+
+      if (!isPumpDump && score >= 65 && candidateKlinesQueue.length < 25) {
+        candidateKlinesQueue.push(sym);
+      }
+    }
+
+    // Inspect candlestick patterns on top candidate subset to award Steve Nison momentum bonuses
+    for (const topSym of candidateKlinesQueue) {
+      try {
+        const klines15m = await getCachedKlines(topSym, '15m', 5, 2000);
+        const pat = analyzeCandlestickPattern(klines15m);
+        if (universe[topSym]) {
+          if (pat.bullishPatternName !== 'NONE') {
+            universe[topSym].candlestickPattern = pat.bullishPatternName;
+            // Award bonus score to promote top bullish candlestick formations
+            universe[topSym].score = Math.min(99, universe[topSym].score + 12);
+          } else if (pat.bearishPatternName !== 'NONE') {
+            universe[topSym].candlestickPattern = `⚠️ ${pat.bearishPatternName}`;
+            // Demote candidates forming rejection wicks
+            universe[topSym].score = Math.max(0, universe[topSym].score - 20);
+          }
+        }
+      } catch (err) {}
     }
 
     State.universe = universe;
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
     State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= 70 && !c.isPumpAndDump).length;
 
-    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 70).`, 'info');
+    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= 70). Candlestick Sentinel active.`, 'info');
     broadcastStateUpdate();
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
@@ -933,6 +1068,7 @@ async function runDynamicScreener() {
 
 // -------------------------------------------------------------
 // AUTOPILOT ENTRY EVALUATOR (3 SLOTS & MAX 5 RECOVERY BAGS)
+// (INTEGRATING STEVE NISON BULLISH ENTRY CONFLUENCE GATES)
 // -------------------------------------------------------------
 let isEvaluatingEntries = false;
 let lastStandbyNotice = 0;
@@ -1028,6 +1164,7 @@ async function evaluateAutopilotEntries() {
         }
       }
 
+      // Wyckoff Order Flow: Taker Buy Volume and Positive Net Delta
       const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
       if (!orderFlow.passed) {
         candidateCooldownMemo.set(pairKey, now + 25000);
@@ -1035,6 +1172,7 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
+      // Microstructure & VWAP Gate: Solid bodies with Upper Wick <= 30%
       const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
       if (!microMom.passed) {
         candidateCooldownMemo.set(pairKey, now + 25000);
@@ -1042,12 +1180,35 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
+      // 1-Hour 20-EMA Trend & Overextension Shield (<= 5.50%)
       const trend1h = await check1hTrendAlignment(pairKey);
       if (!trend1h.passed) {
         candidateCooldownMemo.set(pairKey, now + 25000);
         logOperation('TREND_VETO', `${pairKey} halted: ${trend1h.reason}`, 'warning');
         continue;
       }
+
+      // STEVE NISON BULLISH CANDLESTICK PATTERN ENTRY GATE
+      const candleCheck = await checkCandlestickSentry(pairKey);
+      
+      // Absolute Veto: Reject if the live candle is forming a Bearish Reversal pattern (Shooting Star, Evening Star, Doji)
+      if (candleCheck.isBearishReversal) {
+        candidateCooldownMemo.set(pairKey, now + 35000);
+        logOperation('CANDLE_VETO', `${pairKey} halted: Bearish pattern detected [${candleCheck.patternName}]. Rejecting distribution wick.`, 'warning');
+        continue;
+      }
+
+      // Bullish Pattern Confluence: Must have a confirmed Bullish Pattern OR strong momentum ignition with high taker buy volume
+      const isConfirmedPatternEntry = candleCheck.isBullishEntry;
+      const isStrongIgnitionFallback = (microMom.change15mPct >= 0.60 && orderFlow.takerBuyRatio >= 52.0);
+
+      if (!isConfirmedPatternEntry && !isStrongIgnitionFallback) {
+        candidateCooldownMemo.set(pairKey, now + 25000);
+        logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting Steve Nison bullish confirmation (Marubozu, Engulfing, Morning Star, Hammer).`, 'info');
+        continue;
+      }
+
+      const patternLabel = isConfirmedPatternEntry ? candleCheck.bullishPatternName : 'MOMENTUM_IGNITION';
 
       let book = await fetchRealOrderBookDepth(pairKey);
       if (!book) {
@@ -1065,10 +1226,10 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
-      logOperation('BOOK_CLEAR', `${pairKey} Order Book verified: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%. Deploying capital...`, 'success');
+      logOperation('BOOK_CLEAR', `${pairKey} confirmed [${patternLabel}]: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%, Taker Buy ${orderFlow.takerBuyRatio}%. Entering...`, 'success');
 
-      console.log(`[Autopilot Signal] Entering ${pairKey}: Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, 15m ${microMom.change15mPct}%`);
-      await executeSpotBuy(pairKey, coin, book, microMom);
+      console.log(`[Autopilot Signal] Entering ${pairKey}: Pattern [${patternLabel}], Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, 15m ${microMom.change15mPct}%`);
+      await executeSpotBuy(pairKey, coin, book, microMom, patternLabel);
     }
   } finally {
     isEvaluatingEntries = false;
@@ -1124,7 +1285,9 @@ async function runPredictiveSentry() {
 
     // NEW SKILL EVALUATION: Japanese Candlestick Sentry (Steve Nison Model)
     const candleCheck = await checkCandlestickSentry(k);
-    pos.candlestickPattern = candleCheck.patternName;
+    if (candleCheck.patternName !== 'NONE') {
+      pos.candlestickPattern = candleCheck.patternName;
+    }
 
     // CANDLESTICK APEX HARVEST (STRICTLY >= +0.35%)
     // If in profit and an authentic Japanese reversal pattern prints (Shooting Star, Engulfing, Evening Star, Doji)
@@ -1309,7 +1472,9 @@ async function runPredictiveSentry() {
 
     // Candlestick Pattern Sentinel on Recovery Bags
     const candleCheck = await checkCandlestickSentry(k);
-    bag.candlestickPattern = candleCheck.patternName;
+    if (candleCheck.patternName !== 'NONE') {
+      bag.candlestickPattern = candleCheck.patternName;
+    }
 
     // Time-Decay Recovery Stepping
     let recoveryTargetRate = 0.0030;
@@ -2175,7 +2340,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
   console.log(`Low-Latency Singapore Stream + Sentinel Active (<5ms)`);
-  console.log(`Candlestick Pattern Sentinel Active (Shooting Star, Hammer, Engulfing)`);
+  console.log(`Bullish Candlestick Pattern Screener & Sentry Active`);
   console.log(`bStocks Shield Active (SOXLB, SNDKB, etc. Excluded)`);
   console.log(`Time-Decay Recovery (+0.30% -> +0.10% -> 0.00% BE)`);
   console.log(`Disaster Tail Risk Floor Calibrated to -3.80%`);
