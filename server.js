@@ -3,7 +3,7 @@
  * SISIR QUANT TERMINAL - BACKEND ENGINE v5.0 (RISK-FIRST REBUILD)
  * =========================================================================
  * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
- * No orders are sent to Binance from this file.
+ * No orders are sent to Binance from this file...
  *
  * What changed from v4.3 and why (full notes in CHANGES.md):
  *  - Every trade has a real stop (0.6%..1.5%) from the moment it opens.
