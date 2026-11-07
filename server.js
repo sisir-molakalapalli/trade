@@ -1,25 +1,25 @@
- /**
+/**
  * =========================================================================
- * SISIR QUANT TERMINAL - PRODUCTION BACKEND TRADING ENGINE
+ * SISIR QUANT TERMINAL - BACKEND ENGINE v5.0 (RISK-FIRST REBUILD)
  * =========================================================================
- * - Low-latency Singapore Binance WebSocket stream (<5ms latency)
- * - 3 Concurrent Active Breakout Slots (High-Velocity Execution)
- * - Maximum 5 Spot Recovery Bags Limit
- * - Strict Active Position Rule: Never close below +0.35% (Demote to Bag on failure)
- * - TIER-1 STEVE NISON PATTERNS & DUAL-EMA SENTINEL (v4.3.0-PROD):
- *     * Tier-1 Bullish Patterns: Inverted Hammer, Tweezers Bottom, Rising Three Methods
- *     * Tier-1 Anti-Vetoes: Tweezers Top, Hanging Man at Highs, Dark Cloud Cover
- *     * 1h Dual-EMA Macro Stack: Price >= EMA20 & EMA20 not in severe bear cross vs EMA50
- *     * Large-Cap Beta Floor: Rejects low-volatility large caps (range < 4.0%)
- *     * Zero Velocity Drag: Calibrated base distance <= 2.50%, Score 65, batch size 16
- * - Steve Nison Pattern Morphology (Marubozu, Belt Hold, Engulfing, Morning Star, Hammer, Piercing Line)
- * - Candlestick Apex Harvest on Exits (Shooting Star, Bearish Engulfing, Evening Star, Doji)
- * - bStocks & 3X Leveraged ETF Exclusion Shield (Blocks SOXLB, SNDKB, TSLAB, etc.)
- * - Spot Recovery Bag Engine with Time-Decay Stepping (+0.30% -> +0.10% -> 0.00% BE)
- * - Breakthrough Trailing Runner: Locks recovery floor at stepped target and trails runners
- * - 1h 20-EMA Extension Shield (<= 5.50% above EMA) to prevent second-leg FOMO traps
- * - Risk-Parity Notional Sizing: Caps maximum dollar risk at ~$0.80 USDT (~₹76)
- * - Zero Post-Bag Cooldown: Preserves 100% unrestricted entry velocity
+ * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
+ * No orders are sent to Binance from this file.
+ *
+ * What changed from v4.3 and why (full notes in CHANGES.md):
+ *  - Every trade has a real stop (0.6%..1.5%) from the moment it opens.
+ *    v4 never sold below +0.35%, parked losers as "recovery bags" and only cut
+ *    them at -3.80% -> that rule is what produced the hard-disaster cuts.
+ *  - The v4 breakeven/profit locks could not fire (zero-width trigger window).
+ *  - Size is set from the stop: one stop-out = 0.5% of equity.
+ *  - Exits in R: breakeven at +1R, 50% off at +1.5R, trail, full exit at +3R,
+ *    time-stop if a trade does nothing for 90 minutes.
+ *  - Entries use CLOSED candles only, require a 1h uptrend + healthy BTC,
+ *    skip coins too volatile for the stop, never chase. Missing data = no trade.
+ *  - Daily loss limit (-2%), pause after 3 losses in a row, 4h cooldown on a
+ *    coin after it loses, learning-engine blacklist actually enforced.
+ *  - Fixed: double-run sentry, TP1 cash leak, fake $500 cash refills,
+ *    fees missing from P&L.
+ * Strategy logic lives in strategy.js (shared with backtest.js).
  * =========================================================================
  */
 
@@ -53,6 +53,10 @@ try {
     state: { dynamicHurdles: { scoreOffset: 0, wickCeiling: 0.40, minOddsRequired: 45 } }
   };
 }
+
+
+// Strategy core (pure functions, shared with backtest.js)
+const Strategy = require('./strategy');
 
 const PORT = process.env.PORT || 3000;
 const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
@@ -93,9 +97,10 @@ const State = {
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 22, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M+)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
+    riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
-    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% Floor • Candlestick Apex Harvest • -3.80% Cap' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Time-Decay (+0.30% -> +0.10% -> 0.00% BE) / Pure Stepped Recovery', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'v5: Hard stop 0.6-1.5% • BE at +1R • TP1 50% at +1.5R • Trail • Exit +3R • 90m time-stop' },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'v5: no new bags. Legacy bags exit at breakeven+fees or -3.80%', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -247,398 +252,69 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
 }
 
 // -------------------------------------------------------------
-// RECALIBRATED HIGH-EFFICIENCY CANDLESTICK PATTERN ENGINE
-// (REALISTIC CRYPTO GEOMETRY + TIER-1 NISON INTEGRATION)
+// FAIL-CLOSED MARKET DATA HELPERS (v5)
+// Any missing or rate-limited data => no trade. v4 returned "passed: true"
+// whenever a fetch failed, so outages and Binance rate limits opened trades.
 // -------------------------------------------------------------
-function analyzeCandlestickPattern(klines) {
-  if (!Array.isArray(klines) || klines.length < 5) {
-    return { 
-      isBearishReversal: false, 
-      isBullishReversal: false, 
-      isBullishEntry: false, 
-      bullishPatternName: 'NONE',
-      bearishPatternName: 'NONE',
-      patternName: 'NONE', 
-      confidence: 0,
-      patternRvol: 1.0,
-      bodyPct: 0
-    };
-  }
-
-  const parseBar = (bar) => {
-    const open = parseFloat(bar[1]);
-    const high = parseFloat(bar[2]);
-    const low = parseFloat(bar[3]);
-    const close = parseFloat(bar[4]);
-    const vol = parseFloat(bar[5]);
-    const takerBuy = parseFloat(bar[9]);
-    const range = high - low;
-    const body = Math.abs(close - open);
-    const upperShadow = range > 0 ? (high - Math.max(open, close)) : 0;
-    const lowerShadow = range > 0 ? (Math.min(open, close) - low) : 0;
-    const isGreen = close >= open;
-    const isRed = close < open;
-    const takerBuyRatio = vol > 0 ? (takerBuy / vol) * 100 : 50;
-    const rangePct = low > 0 ? ((range / low) * 100) : 0;
-    const bodyPct = open > 0 ? (body / open) * 100 : 0;
-
-    return { open, high, low, close, vol, takerBuy, range, body, upperShadow, lowerShadow, isGreen, isRed, takerBuyRatio, rangePct, bodyPct };
-  };
-
-  const cur = parseBar(klines[klines.length - 1]);
-  const prev = parseBar(klines[klines.length - 2]);
-  const prev2 = parseBar(klines[klines.length - 3]);
-  const prev3 = klines.length >= 4 ? parseBar(klines[klines.length - 4]) : null;
-  const prev4 = klines.length >= 5 ? parseBar(klines[klines.length - 5]) : null;
-
-  // Relative Volume calculation relative to prior 8-10 completed bars
-  let priorVolSum = 0;
-  let priorVolCount = 0;
-  for (let i = Math.max(0, klines.length - 12); i < klines.length - 2; i++) {
-    priorVolSum += parseFloat(klines[i][5]);
-    priorVolCount++;
-  }
-  const avgPriorVol = priorVolCount > 0 ? (priorVolSum / priorVolCount) : 1.0;
-  const prevRvol = avgPriorVol > 0 ? Number((prev.vol / avgPriorVol).toFixed(2)) : 1.0;
-  const curRvol = avgPriorVol > 0 ? Number((cur.vol / avgPriorVol).toFixed(2)) : 1.0;
-
-  let isBearishReversal = false;
-  let isBullishReversal = false;
-  let isBullishEntry = false;
-  let bullishPatternName = 'NONE';
-  let bearishPatternName = 'NONE';
-  let confidence = 0;
-  let patternRvol = prevRvol;
-
-  // Real-world continuation check: live candle holding green or shallow pullback
-  const isCurConfirmingGreen = (cur.isGreen && cur.upperShadow <= (cur.range * 0.30)) || (cur.close >= (prev.close * 0.9985));
-
-  // ==========================================
-  // SECTION A: RECALIBRATED HIGH-EFFICIENCY BULLISH ENTRY SETUPS (INCL. TIER-1)
-  // ==========================================
-
-  // 1. BULLISH MARUBOZU (Daiken - Realistic Crypto Tolerances)
-  if (prev.isGreen && prev.bodyPct >= 0.50 && prev.range > 0 && prev.body >= (prev.range * 0.72)) {
-    if (prev.upperShadow <= (prev.range * 0.20) && prev.lowerShadow <= (prev.range * 0.18) && prevRvol >= 1.20 && prev.takerBuyRatio >= 50.0) {
-      if (isCurConfirmingGreen) {
-        isBullishEntry = true;
-        isBullishReversal = true;
-        bullishPatternName = 'BULLISH MARUBOZU (CONFIRMED)';
-        confidence = 94;
-        patternRvol = prevRvol;
-      }
-    }
-  } else if (cur.rangePct >= 0.65 && cur.bodyPct >= 0.55 && cur.isGreen && cur.body >= (cur.range * 0.75)) {
-    if (cur.upperShadow <= (cur.range * 0.15) && cur.lowerShadow <= (cur.range * 0.15) && curRvol >= 1.25 && cur.takerBuyRatio >= 52.0) {
-      isBullishEntry = true;
-      isBullishReversal = true;
-      bullishPatternName = 'BULLISH MARUBOZU (LIVE)';
-      confidence = 92;
-      patternRvol = curRvol;
-    }
-  }
-
-  // 2. BULLISH BELT HOLD (Yorikiri)
-  if (!isBullishEntry && prev.isGreen && prev.bodyPct >= 0.50 && prev.range > 0 && prev.body >= (prev.range * 0.68)) {
-    if (prev.lowerShadow <= (prev.range * 0.10) && prev.upperShadow <= (prev.range * 0.22) && prevRvol >= 1.20 && prev.takerBuyRatio >= 50.0) {
-      if (isCurConfirmingGreen) {
-        isBullishEntry = true;
-        isBullishReversal = true;
-        bullishPatternName = 'BULLISH BELT HOLD (CONFIRMED)';
-        confidence = 92;
-        patternRvol = prevRvol;
-      }
-    }
-  } else if (!isBullishEntry && cur.rangePct >= 0.60 && cur.bodyPct >= 0.50 && cur.isGreen && cur.body >= (cur.range * 0.70)) {
-    if (cur.lowerShadow <= (cur.range * 0.08) && cur.upperShadow <= (cur.range * 0.20) && curRvol >= 1.25 && cur.takerBuyRatio >= 52.0) {
-      isBullishEntry = true;
-      isBullishReversal = true;
-      bullishPatternName = 'BULLISH BELT HOLD (LIVE)';
-      confidence = 90;
-      patternRvol = curRvol;
-    }
-  }
-
-  // 3. BULLISH ENGULFING (Tsutsumi)
-  if (!isBullishEntry && prev2.isRed && prev.isGreen && prev.bodyPct >= 0.45 && prev.range > 0 && prev2.range > 0) {
-    if (prev.open <= (prev2.close * 1.001) && prev.close >= (prev2.open * 0.999) && prev.body >= (prev2.body * 1.05)) {
-      if (prev.upperShadow <= (prev.range * 0.28) && prevRvol >= 1.20 && prev.takerBuyRatio >= 50.0 && isCurConfirmingGreen) {
-        isBullishEntry = true;
-        isBullishReversal = true;
-        bullishPatternName = 'BULLISH ENGULFING';
-        confidence = 95;
-        patternRvol = prevRvol;
-      }
-    }
-  }
-
-  // 4. MORNING STAR (Sankei)
-  if (!isBullishEntry && prev2.isRed && prev2.bodyPct >= 0.40) {
-    const isStar = prev.body <= (prev.range * 0.40) && prev.low <= (prev2.low * 1.001);
-    const isMorningGreen = cur.isGreen && cur.bodyPct >= 0.45 && cur.close >= (prev2.close + (prev2.body * 0.45));
-    if (isStar && isMorningGreen && cur.upperShadow <= (cur.range * 0.28) && curRvol >= 1.20 && cur.takerBuyRatio >= 50.0) {
-      isBullishEntry = true;
-      isBullishReversal = true;
-      bullishPatternName = 'MORNING STAR';
-      confidence = 96;
-      patternRvol = curRvol;
-    }
-  }
-
-  // 5. TAKURI HAMMER (Kanazuchi / Takuri)
-  if (!isBullishEntry && prev.range > 0 && prev.lowerShadow >= (prev.body * 1.8) && prev.upperShadow <= (prev.range * 0.20) && prev.body <= (prev.range * 0.42)) {
-    if (prevRvol >= 1.10 && cur.isGreen && cur.bodyPct >= 0.25 && cur.upperShadow <= (cur.range * 0.28)) {
-      isBullishEntry = true;
-      isBullishReversal = true;
-      bullishPatternName = 'HAMMER (CONFIRMED)';
-      confidence = 92;
-      patternRvol = prevRvol;
-    }
-  }
-
-  // 6. INVERTED HAMMER (Gyaku Kanazuchi - Tier-1 Support Reversal)
-  if (!isBullishEntry && prev.range > 0 && prev.upperShadow >= (prev.body * 1.8) && prev.lowerShadow <= (prev.range * 0.18) && prev.body <= (prev.range * 0.42)) {
-    if (cur.isGreen && cur.bodyPct >= 0.30 && cur.close >= prev.close && cur.upperShadow <= (cur.range * 0.25)) {
-      isBullishEntry = true;
-      isBullishReversal = true;
-      bullishPatternName = 'INVERTED HAMMER (SUPPORT)';
-      confidence = 93;
-      patternRvol = curRvol;
-    }
-  }
-
-  // 7. TWEEZERS BOTTOM (Kenuki Bottom - Tier-1 Support Double Test)
-  if (!isBullishEntry && prev2 && prev && prev2.low > 0) {
-    const isTweezerLows = Math.abs(prev.low - prev2.low) <= (prev2.low * 0.0010);
-    const hasLowerRejection = (prev.lowerShadow >= prev.body * 0.7 || prev2.lowerShadow >= prev2.body * 0.7);
-    if (isTweezerLows && hasLowerRejection && isCurConfirmingGreen) {
-      isBullishEntry = true;
-      isBullishReversal = true;
-      bullishPatternName = 'TWEEZERS BOTTOM';
-      confidence = 94;
-      patternRvol = Math.max(prevRvol, curRvol);
-    }
-  }
-
-  // 8. RISING THREE METHODS (Sanpou - Tier-1 Institutional Continuation Base)
-  if (!isBullishEntry && prev4 && prev3 && prev2 && prev && prev4.isGreen && prev4.bodyPct >= 0.45) {
-    const isBaseDefended = (prev3.low >= prev4.low * 0.998 && prev3.high <= prev4.high * 1.008) &&
-                           (prev2.low >= prev4.low * 0.998 && prev2.high <= prev4.high * 1.008) &&
-                           (prev.low >= prev4.low * 0.998 && prev.high <= prev4.high * 1.008);
-    const isBreakoutBar = cur.isGreen && cur.close >= prev4.high * 0.999 && cur.bodyPct >= 0.35;
-    if (isBaseDefended && isBreakoutBar && curRvol >= 1.20) {
-      isBullishEntry = true;
-      isBullishReversal = true;
-      bullishPatternName = 'RISING THREE METHODS';
-      confidence = 97;
-      patternRvol = curRvol;
-    }
-  }
-
-  // 9. PIERCING LINE (Kirikomi)
-  if (!isBullishEntry && prev.isRed && prev.bodyPct >= 0.45 && cur.isGreen && cur.bodyPct >= 0.50 && cur.range > 0) {
-    const midpoint = (prev.open + prev.close) / 2;
-    if (cur.open <= (prev.low * 1.001) && cur.close >= (midpoint * 0.9995) && cur.close < prev.open && curRvol >= 1.20 && cur.takerBuyRatio >= 50.0) {
-      isBullishEntry = true;
-      isBullishReversal = true;
-      bullishPatternName = 'PIERCING LINE';
-      confidence = 91;
-      patternRvol = curRvol;
-    }
-  }
-
-  // 10. THREE WHITE SOLDIERS (Aka Sansei)
-  if (!isBullishEntry && prev2.isGreen && prev.isGreen && cur.isGreen) {
-    if (prev2.bodyPct >= 0.35 && prev.bodyPct >= 0.35 && cur.bodyPct >= 0.35) {
-      if (cur.close > prev.close && prev.close > prev2.close) {
-        if (cur.upperShadow <= (cur.range * 0.25) && prev.upperShadow <= (prev.range * 0.25) && curRvol >= 1.20 && cur.takerBuyRatio >= 50.0) {
-          isBullishEntry = true;
-          isBullishReversal = true;
-          bullishPatternName = 'THREE WHITE SOLDIERS';
-          confidence = 96;
-          patternRvol = curRvol;
-        }
-      }
-    }
-  }
-
-  // 11. DRAGONFLY DOJI (Tonbo Doji)
-  if (!isBullishEntry && cur.range > 0 && cur.body <= (cur.range * 0.10) && cur.lowerShadow >= (cur.range * 0.70)) {
-    isBullishReversal = true;
-    bullishPatternName = 'DRAGONFLY DOJI';
-    confidence = 86;
-  }
-
-  // ==========================================
-  // SECTION B: BEARISH APEX PATTERNS & TIER-1 ANTI-ENTRY VETOES
-  // ==========================================
-
-  // 1. TWEEZERS TOP (Kenuki Top - Twin High Rejection Veto)
-  if (prev && cur && cur.high > 0) {
-    const isTwinHigh = Math.abs(cur.high - prev.high) <= (cur.high * 0.0010);
-    const hasUpperRejection = (cur.upperShadow >= cur.body * 0.8 || prev.upperShadow >= prev.body * 0.8);
-    if (isTwinHigh && hasUpperRejection && (cur.isRed || cur.upperShadow >= cur.range * 0.28)) {
-      isBearishReversal = true;
-      bearishPatternName = 'TWEEZERS TOP';
-      confidence = 96;
-    }
-  }
-
-  // 2. HANGING MAN (Kubitsuri - Fragile Bid Warning at Highs)
-  if (!isBearishReversal && cur.range > 0 && cur.lowerShadow >= (cur.body * 1.8) && cur.upperShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
-    if (cur.high >= prev.high || cur.close >= prev.high * 0.998) {
-      isBearishReversal = true;
-      bearishPatternName = 'HANGING MAN';
-      confidence = 92;
-    }
-  }
-
-  // 3. DARK CLOUD COVER (Kabuze - Bearish Penetration Reversal)
-  if (!isBearishReversal && prev.isGreen && cur.isRed && cur.open >= (prev.close * 0.999)) {
-    const midpoint = (prev.open + prev.close) / 2;
-    if (cur.close < midpoint && cur.close > prev.open) {
-      isBearishReversal = true;
-      bearishPatternName = 'DARK CLOUD COVER';
-      confidence = 94;
-    }
-  }
-
-  // 4. SHOOTING STAR (Nagareboshi)
-  if (!isBearishReversal && cur.range > 0 && cur.upperShadow >= (cur.body * 2.0) && cur.lowerShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
-    if (cur.high >= prev.high || cur.close > prev.open) {
-      isBearishReversal = true;
-      bearishPatternName = 'SHOOTING STAR';
-      confidence = cur.takerBuyRatio < 44 ? 95 : 85;
-    }
-  }
-
-  // 5. BEARISH ENGULFING (Tsutsumi)
-  if (!isBearishReversal && prev.isGreen && cur.isRed && cur.range > 0 && prev.range > 0) {
-    if (cur.open >= (prev.close * 0.9995) && cur.close <= (prev.open * 1.0005) && cur.body >= prev.body) {
-      isBearishReversal = true;
-      bearishPatternName = 'BEARISH ENGULFING';
-      confidence = cur.takerBuyRatio < 44 ? 92 : 82;
-    }
-  }
-
-  // 6. EVENING STAR (Sankei)
-  if (!isBearishReversal && prev2 && prev2.isGreen && prev2.body >= (prev2.range * 0.40)) {
-    const isStar = prev.body <= (prev.range * 0.40) && prev.high >= prev2.high;
-    const isEveningRed = cur.isRed && cur.close <= (prev2.open + (prev2.body * 0.50));
-    if (isStar && isEveningRed) {
-      isBearishReversal = true;
-      bearishPatternName = 'EVENING STAR';
-      confidence = 94;
-    }
-  }
-
-  // 7. GRAVESTONE DOJI (Toba Doji)
-  if (!isBearishReversal && cur.range > 0 && cur.body <= (cur.range * 0.08) && cur.upperShadow >= (cur.range * 0.72)) {
-    isBearishReversal = true;
-    bearishPatternName = 'GRAVESTONE DOJI';
-    confidence = 88;
-  }
-
-  const patternName = bearishPatternName !== 'NONE' 
-    ? bearishPatternName 
-    : (bullishPatternName !== 'NONE' ? bullishPatternName : 'NONE');
-
-  return { 
-    isBearishReversal, 
-    isBullishReversal, 
-    isBullishEntry, 
-    bullishPatternName, 
-    bearishPatternName, 
-    patternName, 
-    confidence, 
-    patternRvol,
-    bodyPct: cur.bodyPct,
-    curBar: cur 
-  };
-}
-
-async function checkCandlestickSentry(symbol) {
+async function getKlinesStrict(symbol, interval, limit) {
   try {
-    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-
-    const klines5m = await getCachedKlines(pairSym, '5m', 8, 2500);
-    const klines15m = await getCachedKlines(pairSym, '15m', 8, 2500);
-
-    const pat5m = analyzeCandlestickPattern(klines5m);
-    const pat15m = analyzeCandlestickPattern(klines15m);
-
-    const isBearish = pat5m.isBearishReversal || pat15m.isBearishReversal;
-    const isBullish = pat5m.isBullishReversal || pat15m.isBullishReversal;
-    const isBullishEntry = pat15m.isBullishEntry || pat5m.isBullishEntry;
-
-    const activeBullishPattern = pat15m.bullishPatternName !== 'NONE' 
-      ? `${pat15m.bullishPatternName} (15m)` 
-      : (pat5m.bullishPatternName !== 'NONE' ? `${pat5m.bullishPatternName} (5m)` : 'NONE');
-
-    const activeBearishPattern = pat15m.bearishPatternName !== 'NONE' 
-      ? `${pat15m.bearishPatternName} (15m)` 
-      : (pat5m.bearishPatternName !== 'NONE' ? `${pat5m.bearishPatternName} (5m)` : 'NONE');
-
-    const activePattern = activeBearishPattern !== 'NONE' ? activeBearishPattern : activeBullishPattern;
-
-    if (activePattern !== 'NONE') {
-      State.subsystems.candlestickSentry.lastPatternDetected = `${pairSym}: ${activePattern}`;
-    }
-
-    return {
-      isBearishReversal: isBearish,
-      isBullishReversal: isBullish,
-      isBullishEntry: isBullishEntry,
-      bullishPatternName: activeBullishPattern,
-      bearishPatternName: activeBearishPattern,
-      patternName: activePattern,
-      confidence: Math.max(pat5m.confidence, pat15m.confidence),
-      patternRvol: Math.max(pat5m.patternRvol || 1.0, pat15m.patternRvol || 1.0)
-    };
+    const d = await getCachedKlines(symbol, interval, limit);
+    return Array.isArray(d) && d.length > 0 ? d : null;
   } catch (e) {
-    return { 
-      isBearishReversal: false, 
-      isBullishReversal: false, 
-      isBullishEntry: false, 
-      bullishPatternName: 'NONE', 
-      bearishPatternName: 'NONE', 
-      patternName: 'NONE', 
-      confidence: 0,
-      patternRvol: 1.0
-    };
+    return null;
   }
 }
 
-// -------------------------------------------------------------
-// BITCOIN MACRO WEATHER SHIELD (CIRCUIT BREAKER)
-// -------------------------------------------------------------
-async function checkBtcMacroWeatherShield() {
+let btcRegimeCache = { at: 0, result: null };
+async function refreshBtcRegime() {
+  if (btcRegimeCache.result && Date.now() - btcRegimeCache.at < 15000) return btcRegimeCache.result;
+  const [h, m] = await Promise.all([
+    getKlinesStrict('BTCUSDT', '1h', 100),
+    getKlinesStrict('BTCUSDT', '15m', 10)
+  ]);
+  const r = (h && m) ? Strategy.evaluateBtcRegime(h, m) : { ok: false, reason: 'BTC data unavailable' };
+  const g = State.subsystems.btcMacroGate;
+  g.status = r.ok ? 'NORMAL' : 'PAUSED';
+  g.allowAltcoinEntries = r.ok;
+  g.btcChange15m = Number((r.chg15 || 0).toFixed(2));
+  g.reason = r.ok ? 'BTC above 1h EMA50, no 15m dump' : r.reason;
+  btcRegimeCache = { at: Date.now(), result: r };
+  return r;
+}
+
+// Taker buy ratio on the last 3 CLOSED 5m bars. Fails closed.
+async function checkTakerFlow(pairKey) {
+  const k = await getKlinesStrict(pairKey, '5m', 30);
+  if (!k) return { passed: false, reason: '5m data unavailable' };
+  const closed = Strategy.closedOnly(k).slice(-3);
+  if (closed.length < 3) return { passed: false, reason: 'not enough closed 5m bars' };
+  let vol = 0, buy = 0;
+  closed.forEach((b) => { vol += parseFloat(b[5]); buy += parseFloat(b[9]); });
+  const ratio = vol > 0 ? (buy / vol) * 100 : 0;
+  if (ratio < 48) return { passed: false, takerBuyRatio: ratio, reason: `taker buy ${ratio.toFixed(1)}% < 48% (sellers in control)` };
+  return { passed: true, takerBuyRatio: Number(ratio.toFixed(1)), k5: k };
+}
+
+async function fetchTickerPrice(pairKey) {
   try {
-    const klines = await getCachedKlines('BTCUSDT', '15m', 3, 3000);
-    if (!Array.isArray(klines) || klines.length === 0) return true;
-    
-    const curBar = klines[klines.length - 1];
-    const open = parseFloat(curBar[1]);
-    const close = parseFloat(curBar[4]);
-    const change15m = open > 0 ? ((close - open) / open) * 100 : 0;
-
-    State.subsystems.btcMacroGate.btcChange15m = Number(change15m.toFixed(2));
-
-    if (change15m <= -0.35) {
-      State.subsystems.btcMacroGate.status = 'PAUSED';
-      State.subsystems.btcMacroGate.allowAltcoinEntries = false;
-      State.subsystems.btcMacroGate.reason = `BTC 15m dip ${change15m.toFixed(2)}% <= -0.35%`;
-      return false;
-    }
-
-    State.subsystems.btcMacroGate.status = 'NORMAL';
-    State.subsystems.btcMacroGate.allowAltcoinEntries = true;
-    State.subsystems.btcMacroGate.reason = 'BTC macro healthy';
-    return true;
-  } catch (err) {
-    return true;
+    const d = await safeFetch(`https://api.binance.com/api/v3/ticker/price?symbol=${pairKey}`, 2500);
+    const p = parseFloat(d && d.price);
+    return p > 0 ? p : null;
+  } catch (e) {
+    return null;
   }
+}
+
+function computeEquity() {
+  let eq = Number(State.portfolio.cashUSDT) || 0;
+  const add = (p) => {
+    const px = Number(p.livePriceUSDT || p.entryPriceUSDT) || 0;
+    const qty = Number(p.qty) || (Number(p.notionalUSDT) / Number(p.entryPriceUSDT || 1));
+    eq += qty * px;
+  };
+  Object.values(State.activePositions || {}).forEach(add);
+  Object.values(State.recoveryBags || {}).forEach(add);
+  return eq;
 }
 
 // -------------------------------------------------------------
@@ -666,271 +342,6 @@ async function checkDormantPumpAndDumpTrap(symbol, volQuote, change24, rangePct)
     return { isTrap: false };
   } catch (e) {
     return { isTrap: false };
-  }
-}
-
-// -------------------------------------------------------------
-// WYCKOFF ORDER FLOW & TAKER CVD ANALYZER
-// -------------------------------------------------------------
-async function checkVeteranOrderFlowAndVSA(symbol) {
-  try {
-    const klines = await getCachedKlines(symbol, '5m', 8, 2500);
-    if (!Array.isArray(klines) || klines.length < 3) {
-      return { passed: true, takerBuyRatio: 52, reason: 'Fallback pass' };
-    }
-
-    let totalVol = 0;
-    let takerBuyVol = 0;
-    for (let i = klines.length - 3; i < klines.length; i++) {
-      totalVol += parseFloat(klines[i][5]);
-      takerBuyVol += parseFloat(klines[i][9]);
-    }
-
-    const takerBuyRatio = totalVol > 0 ? Number(((takerBuyVol / totalVol) * 100).toFixed(1)) : 50;
-    const curBar = klines[klines.length - 1];
-    const open = parseFloat(curBar[1]);
-    const high = parseFloat(curBar[2]);
-    const low = parseFloat(curBar[3]);
-    const close = parseFloat(curBar[4]);
-    const range = high - low;
-    const clv = range > 0 ? (close - low) / range : 0.5;
-
-    if (takerBuyRatio < 46.0 && clv < 0.35) {
-      return { passed: false, takerBuyRatio, reason: `Seller Absorption: Taker Buy ${takerBuyRatio}% (<46%) & CLV ${(clv*100).toFixed(0)}%` };
-    }
-
-    return { passed: true, takerBuyRatio, clv: Number(clv.toFixed(2)) };
-  } catch (e) {
-    return { passed: true, takerBuyRatio: 52, reason: 'Error fallback' };
-  }
-}
-
-// -------------------------------------------------------------
-// MICROSTRUCTURE MOMENTUM, VWAP & RANGE BREAKOUT GATE
-// -------------------------------------------------------------
-async function checkMicrostructureMomentumAndVwap(symbol) {
-  try {
-    const klines = await getCachedKlines(symbol, '15m', 16, 2500);
-    if (!Array.isArray(klines) || klines.length < 8) {
-      return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Fallback pass' };
-    }
-
-    const curBar = klines[klines.length - 1];
-    const curOpen = parseFloat(curBar[1]);
-    const curHigh = parseFloat(curBar[2]);
-    const curLow = parseFloat(curBar[3]);
-    const curClose = parseFloat(curBar[4]);
-    const curVol = parseFloat(curBar[5]);
-
-    const change15mPct = curOpen > 0 ? Number((((curClose - curOpen) / curOpen) * 100).toFixed(2)) : 0;
-    const range = curHigh - curLow;
-    const upperWickRatio = range > 0 ? (curHigh - Math.max(curOpen, curClose)) / range : 0;
-
-    // Upper Rejection Shadow Ceiling (<= 30%)
-    if (upperWickRatio > 0.30 && range > 0) {
-      return { passed: false, reason: `Upper rejection shadow too high (${(upperWickRatio * 100).toFixed(0)}% > 30%)` };
-    }
-
-    // Rolling 4h VWAP calculation
-    let volSum = 0;
-    let vwapSum = 0;
-    for (let i = Math.max(0, klines.length - 16); i < klines.length; i++) {
-      const h = parseFloat(klines[i][2]);
-      const l = parseFloat(klines[i][3]);
-      const c = parseFloat(klines[i][4]);
-      const v = parseFloat(klines[i][5]);
-      vwapSum += (((h + l + c) / 3) * v);
-      volSum += v;
-    }
-    const vwap4h = volSum > 0 ? (vwapSum / volSum) : curClose;
-
-    // Strict Zero-Tolerance VWAP Support: Price MUST be >= VWAP
-    if (curClose < vwap4h) {
-      return { passed: false, reason: `Below 15m/4h VWAP ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(vwap4h)})` };
-    }
-
-    // Relative Volume (RVOL)
-    let priorVolSum = 0;
-    for (let i = Math.max(0, klines.length - 10); i < klines.length - 1; i++) {
-      priorVolSum += parseFloat(klines[i][5]);
-    }
-    const avgVol = priorVolSum / 9;
-    const rvol = avgVol > 0 ? Number((curVol / avgVol).toFixed(2)) : 1.0;
-
-    // 2-Hour Base Ceiling Distance Gate (<= 2.50%)
-    let highPriorBase = 0;
-    for (let i = Math.max(0, klines.length - 9); i < klines.length - 1; i++) {
-      const h = parseFloat(klines[i][2]);
-      if (h > highPriorBase) highPriorBase = h;
-    }
-    const distFromBaseHighPct = highPriorBase > 0 ? ((highPriorBase - curClose) / highPriorBase) * 100 : 0;
-    if (distFromBaseHighPct > 2.50) {
-      return {
-        passed: false,
-        reason: `Mid-range chop: Price is -${distFromBaseHighPct.toFixed(2)}% below 2h base ceiling ($${formatPrecisePrice(highPriorBase)}). Max allowed 2.50%.`
-      };
-    }
-
-    return {
-      passed: true,
-      change15mPct,
-      rvol,
-      vwap4h: Number(vwap4h.toFixed(6)),
-      upperWickRatio: Number(upperWickRatio.toFixed(2))
-    };
-  } catch (e) {
-    return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Error fallback' };
-  }
-}
-
-// -------------------------------------------------------------
-// SELF-AWARE PEAK EXHAUSTION DETECTOR
-// -------------------------------------------------------------
-async function checkSelfAwareOrderFlow(symbol) {
-  try {
-    const klines = await getCachedKlines(symbol, '5m', 5, 2500);
-    if (!Array.isArray(klines) || klines.length === 0) {
-      return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50, upperWickRatio: 0.1 };
-    }
-    const cur = klines[klines.length - 1];
-    const open = parseFloat(cur[1]);
-    const high = parseFloat(cur[2]);
-    const low = parseFloat(cur[3]);
-    const close = parseFloat(cur[4]);
-    const vol = parseFloat(cur[5]);
-    const takerBuy = parseFloat(cur[9]);
-    const range = high - low;
-    const upperWick = range > 0 ? (high - Math.max(open, close)) : 0;
-    const upperWickRatio = range > 0 ? (upperWick / range) : 0;
-    const takerBuyRatio = vol > 0 ? (takerBuy / vol) * 100 : 50;
-    const clv = range > 0 ? (close - low) / range : 0.5;
-
-    const isApexExhausted = (takerBuyRatio < 42.0 && upperWickRatio >= 0.35) || (clv < 0.30 && range > 0);
-    const isUpsideDead = (takerBuyRatio < 40.0 && close < open && clv < 0.35);
-
-    return {
-      isApexExhausted,
-      isUpsideDead,
-      takerBuyRatio: Number(takerBuyRatio.toFixed(1)),
-      upperWickRatio: Number(upperWickRatio.toFixed(2))
-    };
-  } catch (e) {
-    return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50, upperWickRatio: 0.1 };
-  }
-}
-
-// -------------------------------------------------------------
-// RECOVERY RELIEF EXHAUSTION DETECTOR
-// -------------------------------------------------------------
-async function checkRecoveryReliefExhaustion(symbol, livePrice) {
-  try {
-    const klines = await getCachedKlines(symbol, '15m', 8, 2500);
-    if (!Array.isArray(klines) || klines.length === 0) {
-      return { isAboveVwap: true, isConfirmedExhausted: false };
-    }
-    let volSum = 0;
-    let vwapSum = 0;
-    for (let i = 0; i < klines.length; i++) {
-      const h = parseFloat(klines[i][2]);
-      const l = parseFloat(klines[i][3]);
-      const c = parseFloat(klines[i][4]);
-      const v = parseFloat(klines[i][5]);
-      vwapSum += (((h + l + c) / 3) * v);
-      volSum += v;
-    }
-    const vwap = volSum > 0 ? (vwapSum / volSum) : livePrice;
-    const isAboveVwap = livePrice >= vwap;
-
-    const lastBar = klines[klines.length - 1];
-    const tb = parseFloat(lastBar[9]);
-    const tv = parseFloat(lastBar[5]);
-    const ratio = tv > 0 ? (tb / tv) * 100 : 50;
-    const isConfirmedExhausted = ratio < 44.0;
-
-    return { isAboveVwap, isConfirmedExhausted };
-  } catch (e) {
-    return { isAboveVwap: true, isConfirmedExhausted: false };
-  }
-}
-
-// -------------------------------------------------------------
-// 1-HOUR DUAL-EMA MACRO STACK & EXTENSION SHIELD
-// (BLOCKS DOWNWARD BEAR CHANNELS LIKE DOT/POL WITHOUT VELOCITY LOSS)
-// -------------------------------------------------------------
-async function check1hTrendAlignment(symbol) {
-  try {
-    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const klines = await getCachedKlines(pairSym, '1h', 60, 3500);
-
-    if (!Array.isArray(klines) || klines.length < 20) {
-      return { passed: true, reason: 'Fallback pass' };
-    }
-    const curClose = parseFloat(klines[klines.length - 1][4]);
-    
-    // EMA 20
-    const k20 = 2 / (20 + 1);
-    let ema20 = parseFloat(klines[0][4]);
-    let emaPrev2 = ema20;
-    for (let i = 1; i < klines.length; i++) {
-      const c = parseFloat(klines[i][4]);
-      ema20 = (c * k20) + (ema20 * (1 - k20));
-      if (i === klines.length - 3) {
-        emaPrev2 = ema20;
-      }
-    }
-
-    // EMA 50 (evaluated across up to 60 bars)
-    let ema50 = null;
-    if (klines.length >= 45) {
-      const k50 = 2 / (50 + 1);
-      ema50 = parseFloat(klines[0][4]);
-      for (let i = 1; i < klines.length; i++) {
-        const c = parseFloat(klines[i][4]);
-        ema50 = (c * k50) + (ema50 * (1 - k50));
-      }
-    }
-    
-    // Strict Zero-Tolerance 1h 20-EMA Floor (Price MUST be on or above EMA20)
-    if (curClose < (ema20 * 0.9985)) {
-      return { passed: false, reason: `Price below 1h 20-EMA ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(ema20)})` };
-    }
-
-    // 1h Dual-EMA Bullish Stack Gate:
-    // Rejects candidates trading in an entrenched macro bear channel where EMA20 is deep below EMA50 (> 1.20%)
-    if (ema50 && ema20 < (ema50 * 0.988)) {
-      return { 
-        passed: false, 
-        reason: `Macro Bear Stack: 1h 20-EMA ($${formatPrecisePrice(ema20)}) is -${(((ema50 - ema20) / ema50) * 100).toFixed(2)}% below 50-EMA ($${formatPrecisePrice(ema50)}). Downward bear channel.` 
-      };
-    }
-
-    // Decoupled 1h EMA Slope Gate:
-    // Only veto if 1h 20-EMA is in severe macro downtrend (< 0.9970) to prevent lagging 20h vetoes on fresh turnarounds
-    if (ema20 < (emaPrev2 * 0.9970)) {
-      return { 
-        passed: false, 
-        reason: `1h 20-EMA slope is declining sharply ($${formatPrecisePrice(ema20)} < $${formatPrecisePrice(emaPrev2)}). Macro bear flag.` 
-      };
-    }
-
-    // 1h 20-EMA Extension Shield (Prevents FOMO into overextended 2nd/3rd wave impulses)
-    const distAboveEmaPct = ema20 > 0 ? ((curClose - ema20) / ema20) * 100 : 0;
-    if (distAboveEmaPct > 5.50) {
-      return { 
-        passed: false, 
-        reason: `Overextended above 1h 20-EMA (+${distAboveEmaPct.toFixed(2)}% > 5.50%). Awaiting base consolidation.` 
-      };
-    }
-
-    return { 
-      passed: true, 
-      ema1h: Number(ema20.toFixed(4)), 
-      ema50: ema50 ? Number(ema50.toFixed(4)) : null,
-      distAboveEmaPct: Number(distAboveEmaPct.toFixed(2)) 
-    };
-  } catch (err) {
-    return { passed: true, reason: 'Error fallback' };
   }
 }
 
@@ -965,64 +376,6 @@ async function fetchRealOrderBookDepth(symbol) {
   } catch (err) {
     return null;
   }
-}
-
-async function executeSpotBuy(symbol, coin, book, microMom, candlePattern = 'MOMENTUM_EXPANSION') {
-  const sym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
-  const pairKey = `${sym}USDT`;
-  const livePrice = Number(coin.priceUSDT || coin.price || 1.0);
-
-  let freeCash = Number(State.portfolio.cashUSDT);
-  if (isNaN(freeCash) || freeCash < 10.00) {
-    State.portfolio.cashUSDT = 500.00;
-    freeCash = 500.00;
-    saveDiskState();
-    logOperation('PORTFOLIO', `Auto-replenished free cash to $500.00 USDT reserve to keep Autopilot operational.`, 'success');
-  }
-
-  const allocPct = Number(State.portfolio.allocationPct || 15.0);
-
-  // Risk-Parity Notional Sizing: Cap max loss at ~$0.80 USDT (~₹76)
-  const maxAllowableLossUSDT = 0.80;
-  const disasterStopRatio = 0.038; // -3.80% hard disaster stop
-  const riskParityNotionalCap = Number((maxAllowableLossUSDT / disasterStopRatio).toFixed(2)); // ~$21.05 USDT
-
-  let notional;
-  if (freeCash <= 25.00) {
-    notional = Math.min(freeCash, Math.max(10.05, Number((freeCash * 0.95).toFixed(2))));
-  } else {
-    const proportionalNotional = freeCash * (allocPct / 100);
-    notional = Math.max(10.50, Math.min(proportionalNotional, riskParityNotionalCap, freeCash));
-  }
-
-  if (freeCash < 10.00 || notional < 10.00) {
-    logOperation('CASH_GUARD', `Cannot open ${sym}/USDT: Available cash ($${freeCash.toFixed(2)}) is below Binance $10 min notional requirement.`, 'danger');
-    return;
-  }
-
-  const qty = notional / livePrice;
-  State.portfolio.cashUSDT = Number((freeCash - notional).toFixed(4));
-
-  State.activePositions[pairKey] = {
-    pair: `${sym}/USDT`,
-    pairSymbol: sym,
-    openedAt: Date.now(),
-    entryPriceUSDT: livePrice,
-    livePriceUSDT: livePrice,
-    qty: qty,
-    notionalUSDT: notional,
-    sl: Number((livePrice * 1.0035).toFixed(8)), // Minimum +0.35% exit floor
-    peakGainPct: 0,
-    peakHighPrice: livePrice,
-    ratchetStage: 'INITIAL',
-    tp1Secured: false,
-    candlestickPattern: candlePattern
-  };
-
-  console.log(`[Order Execution] BOUGHT ${sym}/USDT at $${formatPrecisePrice(livePrice)} ($${notional.toFixed(2)} USDT) [Pattern: ${candlePattern}]`);
-  logOperation('EXECUTION', `BOUGHT ${sym}/USDT at $${formatPrecisePrice(livePrice)} ($${notional.toFixed(2)} USDT) via [${candlePattern}]. Slot occupied.`, 'success');
-  syncActiveSymbolSubscriptions();
-  broadcastStateUpdate();
 }
 
 async function runDynamicScreener() {
@@ -1102,8 +455,9 @@ async function runDynamicScreener() {
     // Inspect candlestick patterns on top candidates to award Steve Nison momentum bonuses
     for (const topSym of candidateKlinesQueue) {
       try {
-        const klines15m = await getCachedKlines(topSym, '15m', 8, 2000);
-        const pat = analyzeCandlestickPattern(klines15m);
+        // 100 bars = same cache key the entry evaluator uses; patterns on CLOSED bars only
+        const klines15m = await getCachedKlines(topSym, '15m', 100, 2000);
+        const pat = Strategy.analyzeCandlestickPattern(Strategy.closedOnly(klines15m));
         if (universe[topSym]) {
           // Penalize stale 24h gainers that are actively bleeding in the 1h timeframe
           if (Array.isArray(klines15m) && klines15m.length >= 5) {
@@ -1139,177 +493,250 @@ async function runDynamicScreener() {
 }
 
 // -------------------------------------------------------------
-// AUTOPILOT ENTRY EVALUATOR (HIGH-EFFICIENCY CALIBRATED GATE)
+// ORDER SIMULATION: OPEN / CLOSE WITH CORRECT CASH + FEES (v5)
+// NOTE: this engine is a PAPER TRADER. No order is sent to Binance.
+// -------------------------------------------------------------
+const FEE_RATE = Strategy.CONFIG.feePct / 100;
+
+function openPosition(pairKey, signal, plan, takerBuyRatio) {
+  const sym = pairKey.replace(/USDT$/, '');
+  const entry = plan.entryPrice;
+  const R = entry - plan.stopPrice;
+  const cost = plan.notional * (1 + FEE_RATE);
+  if (State.portfolio.cashUSDT < cost) {
+    logOperation('CASH_GUARD', `Cannot open ${sym}/USDT: need $${cost.toFixed(2)}, free cash $${State.portfolio.cashUSDT.toFixed(2)}.`, 'danger');
+    return false;
+  }
+  State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT - cost).toFixed(6));
+
+  State.activePositions[pairKey] = {
+    pair: `${sym}/USDT`,
+    pairSymbol: sym,
+    strategyVersion: 5,
+    openedAt: Date.now(),
+    entryPriceUSDT: entry,
+    livePriceUSDT: entry,
+    lastTickAt: Date.now(),
+    qty: plan.qty,
+    notionalUSDT: plan.notional,
+    initialNotionalUSDT: plan.notional,
+    initialStopPrice: plan.stopPrice,
+    sl: plan.stopPrice,
+    stopPct: Number(plan.stopPct.toFixed(3)),
+    riskUSDT: plan.riskUSDT,
+    atrPct: Number(signal.atrPct.toFixed(3)),
+    breakevenPrice: entry + Strategy.CONFIG.breakevenAtR * R,
+    tp1Price: entry + Strategy.CONFIG.tp1AtR * R,
+    targetPrice: entry + Strategy.CONFIG.finalTargetR * R,
+    peakGainPct: 0,
+    peakHighPrice: entry,
+    ratchetStage: 'INITIAL',
+    tp1Secured: false,
+    candlestickPattern: signal.pattern
+  };
+
+  logOperation('EXECUTION',
+    `BOUGHT ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}) via [${signal.pattern}] • ` +
+    `Stop $${formatPrecisePrice(plan.stopPrice)} (-${plan.stopPct.toFixed(2)}%, risk $${plan.riskUSDT.toFixed(2)}) • ` +
+    `TP1 $${formatPrecisePrice(entry + 1.5 * R)} • Target $${formatPrecisePrice(entry + 3 * R)} • RVOL ${signal.rvol}x • Taker ${takerBuyRatio}%`,
+    'success');
+  console.log(`[Order] BUY ${pairKey} @ ${entry} notional ${plan.notional} stop ${plan.stopPrice}`);
+  saveDiskState();
+  syncActiveSymbolSubscriptions();
+  broadcastStateUpdate();
+  return true;
+}
+
+/**
+ * Sells `fraction` of a position/bag at `price`. Credits cash with proceeds
+ * minus fee, records net P&L (both fees), deletes the position when fully closed.
+ */
+function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
+  const bookObj = State[bookName];
+  const pos = bookObj && bookObj[key];
+  if (!pos || pos.exitInProgress) return null;
+
+  const entry = Number(pos.entryPriceUSDT);
+  const totalQty = Number(pos.qty) || (Number(pos.notionalUSDT) / entry);
+  const qtySold = fraction >= 1 ? totalQty : totalQty * fraction;
+  const proceeds = qtySold * price * (1 - FEE_RATE);
+  const pnl = Strategy.netPnl(qtySold, entry, price);
+
+  State.portfolio.cashUSDT = Number((Number(State.portfolio.cashUSDT) + proceeds).toFixed(6));
+  State.portfolio.realizedPnL = Number((Number(State.portfolio.realizedPnL || 0) + pnl).toFixed(6));
+
+  const remainingQty = totalQty - qtySold;
+  const fullyClosed = fraction >= 1 || remainingQty * price < 1;
+  if (fullyClosed) {
+    pos.exitInProgress = true;
+    delete bookObj[key];
+  } else {
+    pos.qty = remainingQty;
+    pos.notionalUSDT = Number((remainingQty * entry).toFixed(4));
+  }
+
+  const gainPct = ((price - entry) / entry) * 100;
+  const tradePayload = {
+    id: Date.now(),
+    pair: pos.pair || `${key.replace('USDT', '')}/USDT`,
+    type: typeLabel,
+    entryPriceUSDT: entry,
+    exitPriceUSDT: price,
+    notionalUSDT: Number((qtySold * entry).toFixed(4)),
+    pnlUSDT: Number(pnl.toFixed(4)),
+    holdMinutes: Math.round((Date.now() - Number(pos.openedAt || Date.now())) / 60000),
+    feesIncluded: true, // v5 P&L is already net of both 0.10% fees
+    strategyVersion: 5,
+    reason: reasonText
+  };
+
+  logOperation(pnl >= 0 ? 'SENTRY_EXIT' : 'RISK_STOP',
+    `${typeLabel} on ${tradePayload.pair} @ $${formatPrecisePrice(price)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%) • ` +
+    `Net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} after fees${fullyClosed ? '' : ' • runner continues'}`,
+    pnl >= 0 ? 'success' : 'warning');
+
+  saveDiskState();
+  broadcastStateUpdate();
+  recordTradeToCloudLedger(tradePayload).catch((e) => console.error('[Ledger Dispatch Notice]', e.message));
+  return tradePayload;
+}
+
+// -------------------------------------------------------------
+// AUTOPILOT ENTRY EVALUATOR (v5: closed candles, fail-closed, risk-sized)
 // -------------------------------------------------------------
 let isEvaluatingEntries = false;
-let lastStandbyNotice = 0;
-let lastBagHoldNotice = 0;
-let lastBtcPauseNotice = 0;
+const noticeTimes = {};
 const candidateCooldownMemo = new Map();
+
+function throttledNotice(key, category, message, level = 'info', everyMs = 60000) {
+  if (Date.now() - (noticeTimes[key] || 0) < everyMs) return;
+  noticeTimes[key] = Date.now();
+  logOperation(category, message, level);
+}
+
+function vetoCategory(reason) {
+  const r = String(reason);
+  if (r.includes('bearish')) return 'CANDLE_VETO';
+  if (r.includes('no closed-bar trigger')) return 'CANDLE_WAIT';
+  if (r.includes('ATR') || r.includes('stop')) return 'VOL_VETO';
+  if (r.includes('EMA') || r.includes('uptrend') || r.includes('overextended')) return 'TREND_VETO';
+  return 'MOM_VETO';
+}
 
 async function evaluateAutopilotEntries() {
   if (!State.autopilotEnabled || isEvaluatingEntries) return;
+  const cfg = Strategy.CONFIG;
 
-  const currentCount = Object.keys(State.activePositions || {}).length;
-  const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 3;
-  if (currentCount >= maxSlots) {
-    if (Date.now() - lastStandbyNotice > 30000) {
-      lastStandbyNotice = Date.now();
-      logOperation('AUTOPILOT', `All ${maxSlots} breakout slots occupied (${currentCount}/${maxSlots}). Monitoring trailing sentry.`, 'info');
-    }
+  const openCount = Object.keys(State.activePositions || {}).length;
+  if (openCount >= cfg.maxConcurrent) {
+    throttledNotice('slots', 'AUTOPILOT', `All ${cfg.maxConcurrent} slots in use. Managing open positions.`);
     return;
   }
 
-  const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
-  const maxBagsLimit = State.tradeFrequencyController?.maxRecoveryBagsLimit || 5;
-  if (activeBagsCount >= maxBagsLimit) {
-    if (Date.now() - lastBagHoldNotice > 30000) {
-      lastBagHoldNotice = Date.now();
-      logOperation('AUTOPILOT', `Max recovery bags active (${activeBagsCount}/${maxBagsLimit}). Awaiting relief recoveries before opening fresh trades.`, 'warning');
-    }
+  const equity = computeEquity();
+  const guard = Strategy.portfolioGuard(State.tradeLogs, equity);
+  State.subsystems.riskGuard = {
+    status: guard.ok ? 'ARMED' : 'TRADING PAUSED',
+    reason: guard.ok ? `Day P&L ${guard.dayPnl >= 0 ? '+' : ''}$${(guard.dayPnl || 0).toFixed(2)}` : guard.reason,
+    equityUSDT: Number(equity.toFixed(2)),
+    riskPerTradePct: cfg.riskPerTradePct,
+    dailyLossLimitPct: cfg.dailyLossLimitPct
+  };
+  if (!guard.ok) {
+    throttledNotice('guard', 'CASH_GUARD', guard.reason, 'danger', 300000);
     return;
   }
-
-  const isBtcHealthy = await checkBtcMacroWeatherShield();
-  if (!isBtcHealthy) {
-    if (Date.now() - lastBtcPauseNotice > 30000) {
-      lastBtcPauseNotice = Date.now();
-      logOperation('BTC_WEATHER', `Entries paused: ${State.subsystems.btcMacroGate.reason}`, 'warning');
-    }
-    return;
-  }
-
-  learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
-
-  const minScore = State.activeThresholds?.scoreThreshold || 65;
-  const keys = Object.keys(State.universe || {});
-  if (keys.length === 0) return;
-
-  const sorted = [...keys].sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
 
   isEvaluatingEntries = true;
   try {
-    let evaluatedCount = 0;
+    const btc = await refreshBtcRegime();
+    if (!btc.ok) {
+      throttledNotice('btc', 'BTC_WEATHER', `Entries paused: ${btc.reason}`, 'warning');
+      return;
+    }
+
+    const minScore = State.activeThresholds?.scoreThreshold || 65;
     const now = Date.now();
+    const sorted = Object.keys(State.universe || {})
+      .sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
 
+    let evaluated = 0;
     for (const k of sorted) {
-      if (Object.keys(State.activePositions || {}).length >= maxSlots) break;
-      if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
+      if (Object.keys(State.activePositions).length >= cfg.maxConcurrent) break;
       const coin = State.universe[k];
-      if (!coin || !coin.symbol) continue;
-
-      if (coin.isPumpAndDump) continue;
+      if (!coin || !coin.symbol || coin.isPumpAndDump) continue;
       if ((coin.score || 0) < minScore) break;
 
-      const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
-      const pairKey = `${baseSym}USDT`;
-
-      const blockedDerivatives = ['SOXLB', 'SNDKB', 'TSLAB', 'AAPLB', 'NVDB', 'MSFTB', 'AMZNB', 'SPYB', 'QQQB'];
-      if (blockedDerivatives.some(d => pairKey.startsWith(d))) continue;
-
-      if (Number(coin.priceUSDT || 0) > 350.0 && !['BTCUSDT', 'ETHUSDT'].includes(pairKey)) continue;
-
+      const pairKey = `${String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '')}USDT`;
+      if (pairKey === 'BTCUSDT') continue;
       if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
+      if ((candidateCooldownMemo.get(pairKey) || 0) > now) continue;
+      if (Strategy.inSymbolCooldown(State.tradeLogs, `${coin.symbol}/USDT`, now)) continue;
 
-      if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > now) continue;
+      const elig = learningEngine.evaluateCandidateEligibility
+        ? learningEngine.evaluateCandidateEligibility(pairKey)
+        : { allowed: true };
+      if (!elig.allowed) {
+        candidateCooldownMemo.set(pairKey, now + 30 * 60000);
+        throttledNotice(`rep_${pairKey}`, 'TRAP_GUARD', `${pairKey} skipped: ${elig.reason}`, 'warning', 600000);
+        continue;
+      }
 
-      const nextAllowed = candidateCooldownMemo.get(pairKey) || 0;
-      if (nextAllowed > now) continue;
+      if (++evaluated > 6) break; // keep Binance request weight low
+      // A signal is tied to a closed 15m bar, so re-checking a rejected coin
+      // more often than once a minute only burns rate limit.
+      candidateCooldownMemo.set(pairKey, now + 60000);
 
-      // Evaluates up to 16 qualified candidates per pass to eliminate starvation
-      if (++evaluatedCount > 16) break;
-
-      const change24h = Number(coin.priceChangePct || coin.change24h || 0);
+      const volQuote = (coin.volumeM || 0) * 1e6;
+      const change24h = Number(coin.change24h || 0);
       const rangePct = Number(coin.intradayRangePct || 0);
-      if (change24h < 0.20 && rangePct < 3.0) continue;
-
-      const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
-      if (posInRange < 0.50) continue;
-
-      const volQuote = (coin.volumeM || 0) * 1000000;
+      if (change24h > 20) {
+        throttledNotice(`chase_${pairKey}`, 'TRAP_GUARD', `${pairKey} skipped: already +${change24h.toFixed(1)}% in 24h (late-stage pump).`, 'warning', 600000);
+        continue;
+      }
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
-        const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
-        if (pdCheck.isTrap) {
-          candidateCooldownMemo.set(pairKey, now + 120000);
-          logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pdCheck.reason}`, 'danger');
+        const pd = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
+        if (pd.isTrap) {
+          candidateCooldownMemo.set(pairKey, now + 30 * 60000);
+          logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pd.reason}`, 'danger');
           continue;
         }
       }
 
-      // Wyckoff Order Flow: Taker Buy Volume and Positive Net Delta
-      const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
-      if (!orderFlow.passed) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
-        logOperation('FLOW_VETO', `${pairKey} halted: ${orderFlow.reason || 'Negative Taker CVD'}`, 'warning');
+      const [k15, k1h] = await Promise.all([
+        getKlinesStrict(pairKey, '15m', 100),
+        getKlinesStrict(pairKey, '1h', 100)
+      ]);
+      if (!k15 || !k1h) continue; // fail closed
+
+      const flow = await checkTakerFlow(pairKey);
+      if (!flow.passed) {
+        throttledNotice(`flow_${pairKey}`, 'FLOW_VETO', `${pairKey}: ${flow.reason}`, 'warning', 300000);
         continue;
       }
 
-      // Large-Cap Low-Volatility Filter: Prevent committing breakout slots to slow heavy coins (e.g., DOT, ADA, XRP) with narrow intraday ranges
-      const priceUnit = Number(coin.priceUSDT || 0);
-      if (priceUnit >= 0.50 && rangePct < 4.0 && change24h < 0.60) {
-        candidateCooldownMemo.set(pairKey, now + 30000);
-        logOperation('VOL_VETO', `${pairKey} skipped: Large-cap low volatility (Range: ${rangePct.toFixed(2)}% < 4.00%). Scalping slots reserved for high-beta momentum.`, 'info');
+      const signal = Strategy.evaluateEntry({ k15, k1h, k5: flow.k5 });
+      if (!signal.ok) {
+        throttledNotice(`sig_${pairKey}`, vetoCategory(signal.reason), `${pairKey}: ${signal.reason}`, 'info', 300000);
         continue;
       }
 
-      // Microstructure & VWAP & Recalibrated Range Breakout Gate (<= 2.50%)
-      const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
-      if (!microMom.passed) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
-        logOperation('MOM_VETO', `${pairKey} halted: ${microMom.reason}`, 'warning');
+      const book = await fetchRealOrderBookDepth(pairKey);
+      if (!book) continue; // fail closed
+      if (book.obi < 0.45 || book.spreadPct > 0.15) {
+        logOperation('BOOK_VETO', `${pairKey}: OBI ${Math.round(book.obi * 100)}% (need >=45%) / spread ${book.spreadPct.toFixed(3)}% (need <=0.15%).`, 'warning');
         continue;
       }
 
-      // 1-Hour Dual-EMA Trend Stack Gate
-      const trend1h = await check1hTrendAlignment(pairKey);
-      if (!trend1h.passed) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
-        logOperation('TREND_VETO', `${pairKey} halted: ${trend1h.reason}`, 'warning');
+      // Buy at the ASK (what a market order actually pays)
+      const plan = Strategy.planEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT));
+      if (!plan.ok) {
+        logOperation('MOM_VETO', `${pairKey}: ${plan.reason}`, 'info');
         continue;
       }
 
-      // Recalibrated Candlestick Pattern Evaluation (with Tier-1 Anti-Vetoes)
-      const candleCheck = await checkCandlestickSentry(pairKey);
-      
-      // Absolute Veto: Reject if forming or closed Bearish Reversal pattern (Tweezers Top, Hanging Man, Dark Cloud Cover, Shooting Star)
-      if (candleCheck.isBearishReversal) {
-        candidateCooldownMemo.set(pairKey, now + 20000);
-        logOperation('CANDLE_VETO', `${pairKey} halted: Bearish pattern detected [${candleCheck.patternName}]. Rejecting distribution wick.`, 'warning');
-        continue;
-      }
-
-      // High-Probability Entry Gate: Confirmed Steve Nison Pattern OR High-Volume Ignition (+0.80% / 1.35x RVOL)
-      const isConfirmedPatternEntry = candleCheck.isBullishEntry && (candleCheck.patternRvol >= 1.20 || microMom.rvol >= 1.20);
-      const isAuthenticIgnition = (microMom.change15mPct >= 0.80 && microMom.rvol >= 1.35 && orderFlow.takerBuyRatio >= 52.0);
-
-      if (!isConfirmedPatternEntry && !isAuthenticIgnition) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
-        logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting confirmed bullish pattern (Marubozu/Engulfing/Hammer/Tweezers/RisingThree) or Ignition (15m >= +0.80%).`, 'info');
-        continue;
-      }
-
-      const patternLabel = isConfirmedPatternEntry ? candleCheck.bullishPatternName : 'HIGH_VOL_IGNITION';
-
-      let book = await fetchRealOrderBookDepth(pairKey);
-      if (!book) {
-        book = {
-          obi: Number(coin.obi || 0.55),
-          spreadPct: 0.05,
-          bestBid: Number(coin.priceUSDT || 1.0),
-          bestAsk: Number(coin.priceUSDT || 1.0) * 1.0005
-        };
-      }
-
-      if (book.obi < 0.45 || book.spreadPct > 0.20) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
-        logOperation('BOOK_VETO', `${pairKey} halted: OBI ${Math.round(book.obi * 100)}% (req >= 45%) or Spread ${book.spreadPct.toFixed(2)}% (req <= 0.20%).`, 'warning');
-        continue;
-      }
-
-      logOperation('BOOK_CLEAR', `${pairKey} confirmed [${patternLabel}]: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%, Taker Buy ${orderFlow.takerBuyRatio}%. Entering...`, 'success');
-
-      console.log(`[Autopilot Signal] Entering ${pairKey}: Pattern [${patternLabel}], Score ${coin.score}, OBI ${Math.round(book.obi * 100)}%, 15m ${microMom.change15mPct}%`);
-      await executeSpotBuy(pairKey, coin, book, microMom, patternLabel);
+      logOperation('BOOK_CLEAR', `${pairKey} [${signal.pattern}] passed all gates: OBI ${Math.round(book.obi * 100)}%, spread ${book.spreadPct.toFixed(3)}%, ATR ${signal.atrPct.toFixed(2)}%.`, 'success');
+      openPosition(pairKey, signal, plan, flow.takerBuyRatio);
     }
   } finally {
     isEvaluatingEntries = false;
@@ -1317,414 +744,91 @@ async function evaluateAutopilotEntries() {
 }
 
 // -------------------------------------------------------------
-// PREDICTIVE SENTRY & TIME-DECAY SPOT RECOVERY BAG ENGINE
-// (INTEGRATING JAPANESE CANDLESTICK TRAILING SKILL)
+// POSITION SENTRY (v5): one runner at a time, unconditional stops
 // -------------------------------------------------------------
-async function runPredictiveSentry() {
-  const activeKeys = Object.keys(State.activePositions || {});
-  const bagKeys = Object.keys(State.recoveryBags || {});
+let sentryBusy = false;
 
-  // PART 1: ACTIVE BREAKOUT POSITIONS (NEVER CLOSE BELOW +0.35%)
-  for (const k of activeKeys) {
-    const pos = State.activePositions[k];
-    if (!pos) continue;
+function migrateLegacyPosition(k, pos) {
+  if (pos.strategyVersion === 5 && pos.initialStopPrice) return;
+  // v4 positions had sl ABOVE entry and no real stop. Give them the widest v5 stop.
+  const entry = Number(pos.entryPriceUSDT);
+  pos.initialStopPrice = entry * (1 - Strategy.CONFIG.maxStopPct / 100);
+  pos.sl = pos.tp1Secured ? Math.max(pos.initialStopPrice, entry * (1 + 2 * FEE_RATE)) : pos.initialStopPrice;
+  pos.ratchetStage = pos.tp1Secured ? 'RUNNER_TRAIL' : 'INITIAL';
+  pos.atrPct = pos.atrPct || 0.8;
+  pos.stopPct = Strategy.CONFIG.maxStopPct;
+  pos.qty = Number(pos.qty) || Number(pos.notionalUSDT) / entry;
+  const R = entry - pos.initialStopPrice;
+  pos.tp1Price = entry + Strategy.CONFIG.tp1AtR * R;
+  pos.targetPrice = entry + Strategy.CONFIG.finalTargetR * R;
+  pos.strategyVersion = 5;
+  logOperation('SENTRY', `${pos.pair}: migrated v4 position to v5 risk rules (stop $${formatPrecisePrice(pos.sl)}).`, 'warning');
+}
 
-    const livePrice = Number(State.universe[k]?.priceUSDT || pos.livePriceUSDT || pos.entryPriceUSDT);
-    const entryPrice = Number(pos.entryPriceUSDT || livePrice);
-    const gainPct = entryPrice > 0 ? Number((((livePrice - entryPrice) / entryPrice) * 100).toFixed(3)) : 0;
-    const holdMinutes = (Date.now() - (pos.openedAt || Date.now())) / 60000;
-
-    pos.livePriceUSDT = livePrice;
-    pos.peakGainPct = Math.max(pos.peakGainPct || 0, gainPct);
-    pos.peakHighPrice = Math.max(pos.peakHighPrice || entryPrice, livePrice);
-    const peakGain = pos.peakGainPct;
-
-    // Minimum Floor Constraint: Stop loss can NEVER be set below entry * 1.0035 (+0.35%)
-    const minExitPriceFloor = Number((entryPrice * 1.0035).toFixed(8));
-
-    // Ratchet 1: Breakeven / Min-Floor lock at +0.35%
-    if (peakGain >= 0.35 && (pos.ratchetStage === 'INITIAL' || !pos.ratchetStage)) {
-      pos.ratchetStage = 'BREAKEVEN_LOCKED';
-      pos.sl = minExitPriceFloor; // Strictly locked at >= +0.35%
-      logOperation('SENTRY', `${pos.pair}: Breakeven locked (+0.35% minimum floor). Peak: +${peakGain.toFixed(2)}%`, 'success');
-    }
-
-    // Ratchet 2: Profit lock at +0.70%
-    if (peakGain >= 0.70 && pos.ratchetStage !== 'PROFIT_LOCKED' && pos.ratchetStage !== 'DYNAMIC_TRAIL' && pos.ratchetStage !== 'RUNNER_TRAIL') {
-      pos.ratchetStage = 'PROFIT_LOCKED';
-      pos.sl = Math.max(minExitPriceFloor, Number((entryPrice * 1.0050).toFixed(8))); // +0.50% profit secured
-      logOperation('SENTRY', `${pos.pair}: Profit lock engaged (+0.50% secured).`, 'success');
-    }
-
-    // Ratchet 3: Dynamic apex trailing at +1.00%
-    if (peakGain >= 1.00 && peakGain < 1.80) {
-      pos.ratchetStage = 'DYNAMIC_TRAIL';
-      const trailFloor = Number((pos.peakHighPrice * 0.9965).toFixed(8)); // Trails 0.35% below peak
-      pos.sl = Math.max(minExitPriceFloor, pos.sl || 0, trailFloor);
-    }
-
-    // Candlestick Sentry Evaluation
-    const candleCheck = await checkCandlestickSentry(k);
-    if (candleCheck.patternName !== 'NONE') {
-      pos.candlestickPattern = candleCheck.patternName;
-    }
-
-    // CANDLESTICK APEX HARVEST (STRICTLY >= +0.35%)
-    if (gainPct >= 0.35 && candleCheck.isBearishReversal && livePrice >= minExitPriceFloor) {
-      logOperation('SENTRY_EXIT', `Japanese Candlestick Apex Harvest on ${pos.pair}: [${candleCheck.patternName}] detected at peak. Banked at +${gainPct.toFixed(2)}% ($${formatPrecisePrice(livePrice)}).`, 'success');
-      
-      const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-      const tradePayload = {
-        id: Date.now(),
-        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: `CANDLESTICK APEX HARVEST [${candleCheck.patternName}]`,
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: exitNotional,
-        pnlUSDT: realizedGain,
-        reason: `Candlestick reversal [${candleCheck.patternName}] at +${gainPct.toFixed(2)}% (>= +0.35% floor)`
-      };
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.activePositions[k];
-      saveDiskState();
-      broadcastStateUpdate();
-      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-      continue;
-    }
-
-    // Standard Order-Flow Self-Aware Apex Harvest (Backup check)
-    if (gainPct >= 0.35) {
-      const selfAware = await checkSelfAwareOrderFlow(k);
-      if (selfAware.isApexExhausted && livePrice >= minExitPriceFloor) {
-        logOperation('SENTRY_EXIT', `Self-Aware Peak Harvest on ${pos.pair}: Taker Buy ${selfAware.takerBuyRatio}% / Upper Wick ${Math.round(selfAware.upperWickRatio * 100)}% signaled apex. Banked at +${gainPct.toFixed(2)}% ($${formatPrecisePrice(livePrice)}).`, 'success');
-        
-        const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
-        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-        const tradePayload = {
-          id: Date.now(),
-          pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-          type: 'SELF-AWARE PEAK HARVEST',
-          entryPriceUSDT: entryPrice,
-          exitPriceUSDT: livePrice,
-          notionalUSDT: exitNotional,
-          pnlUSDT: realizedGain,
-          reason: `Self-aware peak harvest (+${gainPct.toFixed(2)}% >= +0.35% floor)`
-        };
-
-        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-        delete State.activePositions[k];
-        saveDiskState();
-        broadcastStateUpdate();
-        recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-        continue;
-      }
-    }
-
-    // Take Profit 1 (+1.80%): Bank 50%, runner trails
-    if (gainPct >= 1.80 && !pos.tp1Secured) {
-      pos.tp1Secured = true;
-      pos.tp1Price = livePrice;
-      pos.ratchetStage = 'RUNNER_TRAIL';
-      pos.sl = Math.max(minExitPriceFloor, Number((pos.peakHighPrice * 0.9950).toFixed(8))); // Trails 0.50% below peak
-      logOperation('SENTRY_EXIT', `TP1 BANKED on ${pos.pair}: 50% sold at +${gainPct.toFixed(2)}% ($${formatPrecisePrice(livePrice)}). Runner trailing.`, 'success');
-      await recordTradeToCloudLedger({
-        id: Date.now(),
-        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'TP1 BANKED',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: Number((pos.notionalUSDT * 0.5).toFixed(2)),
-        pnlUSDT: Number((((livePrice - entryPrice) / entryPrice) * (pos.notionalUSDT * 0.5)).toFixed(4)),
-        reason: 'TP1 secured: 50% banked at +1.80%'
-      });
-    }
-
-    // Trailing Stop Execution (Strictly >= +0.35%)
-    if (pos.sl && livePrice <= pos.sl && pos.ratchetStage !== 'INITIAL') {
-      if (gainPct >= 0.35 && livePrice >= minExitPriceFloor) {
-        const exitNotional = pos.tp1Secured ? (pos.notionalUSDT * 0.5) : pos.notionalUSDT;
-        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-        
-        logOperation('SENTRY_EXIT', `Trailing stop executed on ${pos.pair} at $${formatPrecisePrice(livePrice)} (+${gainPct.toFixed(2)}% >= +0.35%). Realized: +$${realizedGain.toFixed(2)} USDT.`, 'success');
-
-        const tradePayload = {
-          id: Date.now(),
-          pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-          type: pos.tp1Secured ? 'RUNNER EXIT' : 'TRAILING PROFIT LOCK (+0.35%+)',
-          entryPriceUSDT: entryPrice,
-          exitPriceUSDT: livePrice,
-          notionalUSDT: exitNotional,
-          pnlUSDT: realizedGain,
-          reason: `Trailing stop triggered at $${formatPrecisePrice(livePrice)} (Peak: +${peakGain.toFixed(2)}%)`
-        };
-
-        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-        delete State.activePositions[k];
-        saveDiskState();
-        broadcastStateUpdate();
-
-        recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-        continue;
-      }
-    }
-
-    // 45-Minute Alpha Velocity Scratch (Only if >= +0.35%)
-    if (holdMinutes >= 45 && gainPct >= 0.35) {
-      const exitNotional = pos.notionalUSDT;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * exitNotional).toFixed(4));
-
-      await recordTradeToCloudLedger({
-        id: Date.now(),
-        pair: pos.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'VELOCITY SCRATCH 45M',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: exitNotional,
-        pnlUSDT: realizedGain,
-        reason: `45m Velocity Scratch: Cleared stalled breakout at +${gainPct.toFixed(2)}% (>= +0.35%)`
-      });
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + exitNotional + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.activePositions[k];
-      continue;
-    }
-
-    // Demote to Spot Recovery Bag: NEVER CLOSE BELOW +0.35% IN BREAKOUT SLOT
-    if (!pos.tp1Secured && gainPct < 0.35) {
-      let shouldDemote = (gainPct <= -2.80);
-
-      // Widened demotion threshold to -1.50% and 25m so normal pullbacks aren't prematurely bagged
-      if (!shouldDemote && holdMinutes >= 25 && gainPct <= -1.50) {
-        const selfAwareCheck = await checkSelfAwareOrderFlow(k);
-        if (selfAwareCheck.isUpsideDead) {
-          shouldDemote = true;
-        }
-      }
-
-      if (shouldDemote) {
-        logOperation('SENTRY_DEMOTE', `${pos.pair}: Upside exhausted / retrace (${gainPct.toFixed(2)}%). Transferred to Spot Recovery Bag (Never closed below +0.35%).`, 'warning');
-
-        State.recoveryBags[k] = {
-          pair: pos.pair,
-          pairSymbol: pos.pairSymbol,
-          openedAt: pos.openedAt,
-          movedAt: Date.now(),
-          entryPriceUSDT: entryPrice,
-          livePriceUSDT: livePrice,
-          notionalUSDT: pos.notionalUSDT,
-          qty: pos.qty,
-          targetStep: 'STEP 1 (+0.30%)',
-          targetExitPriceUSDT: Number((entryPrice * 1.0030).toFixed(8)),
-          troughPrice: livePrice,
-          bouncePeakPrice: livePrice,
-          protectedTrailingActive: false,
-          exitInProgress: false,
-          candlestickPattern: 'MONITORING'
-        };
-
-        delete State.activePositions[k];
-        broadcastStateUpdate();
-        continue;
-      }
-    }
+async function livePriceFor(k, pos) {
+  const tickPrice = Number(pos.livePriceUSDT || State.universe[k]?.priceUSDT);
+  if (tickPrice > 0 && Date.now() - Number(pos.lastTickAt || 0) < 90000) return tickPrice;
+  // Stream went quiet for this symbol: never manage risk on a stale price.
+  const rest = await fetchTickerPrice(k);
+  if (rest) {
+    pos.livePriceUSDT = rest;
+    pos.lastTickAt = Date.now();
+    return rest;
   }
+  return tickPrice > 0 ? tickPrice : null;
+}
 
-  // PART 2: SPOT RECOVERY BAGS (TIME-DECAY RECOVERY STEPPING & BREAKTHROUGH TRAILING)
-  for (const k of bagKeys) {
-    const bag = State.recoveryBags[k];
-    if (!bag) continue;
-    if (bag.exitInProgress) continue;
+async function runPredictiveSentry() {
+  if (sentryBusy) return;
+  sentryBusy = true;
+  try {
+    // ---- active positions ----
+    for (const k of Object.keys(State.activePositions || {})) {
+      const pos = State.activePositions[k];
+      if (!pos) continue;
+      migrateLegacyPosition(k, pos);
+      const price = await livePriceFor(k, pos);
+      if (!price) continue;
+      pos.livePriceUSDT = price;
 
-    const livePrice = Number(State.universe[k]?.priceUSDT || bag.livePriceUSDT || bag.entryPriceUSDT);
-    const entryPrice = Number(bag.entryPriceUSDT || livePrice);
-    const gainPct = entryPrice > 0 ? Number((((livePrice - entryPrice) / entryPrice) * 100).toFixed(3)) : 0;
-    const holdHours = (Date.now() - (bag.movedAt || Date.now())) / 3600000;
+      const prevStage = pos.ratchetStage;
+      const r = Strategy.managePosition(pos, price);
+      if (pos.ratchetStage !== prevStage && pos.ratchetStage === 'BREAKEVEN') {
+        logOperation('SENTRY', `${pos.pair}: +1R reached — stop moved to breakeven + fees ($${formatPrecisePrice(pos.sl)}). This trade can no longer lose.`, 'success');
+      }
 
-    bag.livePriceUSDT = livePrice;
-    bag.troughPrice = Math.min(bag.troughPrice || livePrice, livePrice);
-    bag.bouncePeakPrice = Math.max(bag.bouncePeakPrice || livePrice, livePrice);
-
-    // Candlestick Pattern Sentinel on Recovery Bags
-    const candleCheck = await checkCandlestickSentry(k);
-    if (candleCheck.patternName !== 'NONE') {
-      bag.candlestickPattern = candleCheck.patternName;
-    }
-
-    // Time-Decay Recovery Stepping
-    let recoveryTargetRate = 0.0030;
-    let targetStepLabel = 'STEP 1 (+0.30%)';
-
-    if (holdHours >= 3.5) {
-      recoveryTargetRate = 0.0000;
-      targetStepLabel = 'STEP 3 (0.00% BREAKEVEN)';
-    } else if (holdHours >= 1.5) {
-      recoveryTargetRate = 0.0010;
-      targetStepLabel = 'STEP 2 (+0.10% FEE LOCK)';
-    }
-
-    const recoveryTargetPrice = Number((entryPrice * (1 + recoveryTargetRate)).toFixed(8));
-    bag.targetExitPriceUSDT = recoveryTargetPrice;
-    bag.targetStep = targetStepLabel;
-
-    // Breakthrough Trailing: Arms once price touches or calculated stop crosses target
-    const calculatedStop = Number((bag.bouncePeakPrice * 0.9970).toFixed(8));
-
-    if (livePrice >= recoveryTargetPrice || calculatedStop >= recoveryTargetPrice) {
-      if (!bag.protectedTrailingActive) {
-        bag.protectedTrailingActive = true;
-        logOperation('RECOVERY', `${bag.pair}: Target reached ($${formatPrecisePrice(livePrice)} >= ${targetStepLabel}). Breakthrough Trailing runner armed. Floor locked at $${formatPrecisePrice(recoveryTargetPrice)}.`, 'success');
+      if (r.action === 'PARTIAL') {
+        const sellValue = Number(pos.qty) * price * r.fraction;
+        if (sellValue < 10) {
+          logOperation('SENTRY', `${pos.pair}: ${r.reason} reached, position too small to split (<$10) — stop locked at $${formatPrecisePrice(pos.sl)}.`, 'success');
+        } else {
+          realizeExit('activePositions', k, r.fraction, price, r.reason, `${r.reason}: ${Math.round(r.fraction * 100)}% sold, runner trails`);
+        }
+      } else if (r.action === 'EXIT') {
+        realizeExit('activePositions', k, 1, price, r.reason,
+          `${r.reason} @ $${formatPrecisePrice(price)} (stop $${formatPrecisePrice(pos.sl)}, peak +${(pos.peakGainPct || 0).toFixed(2)}%)`);
       }
     }
 
-    if (bag.protectedTrailingActive) {
-      bag.recoverySl = Math.max(bag.recoverySl || 0, recoveryTargetPrice, calculatedStop);
-    }
-
-    // EXIT TRIGGER 1: Protected Trailing Stop Hit (At or Above Stepped Target Floor)
-    if (bag.protectedTrailingActive && bag.recoverySl && livePrice <= bag.recoverySl) {
-      bag.exitInProgress = true;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-      
-      logOperation('RECOVERY', `Protected Trailing Exit on ${bag.pair} at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}% >= ${targetStepLabel}). Peak was $${formatPrecisePrice(bag.bouncePeakPrice)}. Capital recycled in profit!`, 'success');
-
-      const tradePayload = {
-        id: Date.now(),
-        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: `RECOVERY PROTECTED TRAIL (${targetStepLabel})`,
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: realizedGain,
-        reason: `RPT Protected Trailing Exit at $${formatPrecisePrice(livePrice)} (Peak: $${formatPrecisePrice(bag.bouncePeakPrice)})`
-      };
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.recoveryBags[k];
-      saveDiskState();
-      broadcastStateUpdate();
-      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-      continue;
-    }
-
-    // EXIT TRIGGER 2: Candlestick or Self-Aware Apex Harvest at or above Recovery Target
-    if (livePrice >= recoveryTargetPrice && (candleCheck.isBearishReversal || (await checkSelfAwareOrderFlow(k)).isApexExhausted)) {
-      bag.exitInProgress = true;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-
-      logOperation('RECOVERY', `Recovery Apex Harvest on ${bag.pair} via [${candleCheck.patternName || 'Order Flow'}]: Exit at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}% >= ${targetStepLabel}). 100% capital banked.`, 'success');
-
-      const tradePayload = {
-        id: Date.now(),
-        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: `RECOVERY APEX HARVEST [${candleCheck.patternName || 'ORDER FLOW'}]`,
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: realizedGain,
-        reason: `Recovery Apex Harvest [${candleCheck.patternName}] at $${formatPrecisePrice(livePrice)}`
-      };
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.recoveryBags[k];
-      saveDiskState();
-      broadcastStateUpdate();
-      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-      continue;
-    }
-
-    // EXIT TRIGGER 3: Fallback Breakeven Fill (if trailing was not triggered)
-    if (livePrice >= recoveryTargetPrice && bag.recoverySl && livePrice <= bag.recoverySl) {
-      bag.exitInProgress = true;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-      
-      logOperation('RECOVERY', `Relief recovery target (${targetStepLabel}) filled on ${bag.pair} at $${formatPrecisePrice(livePrice)}! 100% capital recycled.`, 'success');
-
-      const tradePayload = {
-        id: Date.now(),
-        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: `RECOVERY FILLED (${targetStepLabel})`,
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: realizedGain,
-        reason: `Recovery filled on relief bounce (${targetStepLabel})`
-      };
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.recoveryBags[k];
-      saveDiskState();
-      broadcastStateUpdate();
-      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-      continue;
-    }
-
-    // EXIT TRIGGER 4: Near-Miss Relief Harvest (Option 2 & Option 3 & Candlestick Protected)
-    if (holdHours >= 1.0 && gainPct >= -0.15) {
-      const reliefCheck = await checkRecoveryReliefExhaustion(k, livePrice);
-
-      // If price is below VWAP AND a confirmed Candlestick Reversal or multi-bar exhaustion prints
-      if (!reliefCheck.isAboveVwap && (candleCheck.isBearishReversal || reliefCheck.isConfirmedExhausted)) {
-        bag.exitInProgress = true;
-        const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-
-        logOperation('RECOVERY', `Near-Miss Relief Harvest on ${bag.pair} at $${formatPrecisePrice(livePrice)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%). Pattern: [${candleCheck.patternName}]. Confirmed below 15m VWAP. Capital recycled.`, 'info');
-
-        const tradePayload = {
-          id: Date.now(),
-          pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-          type: `RECOVERY NEAR-MISS HARVEST [${candleCheck.patternName}]`,
-          entryPriceUSDT: entryPrice,
-          exitPriceUSDT: livePrice,
-          notionalUSDT: bag.notionalUSDT,
-          pnlUSDT: realizedGain,
-          reason: `Near-miss relief harvest: Below 15m VWAP with ${candleCheck.patternName || 'multi-bar exhaustion'}`
-        };
-
-        State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-        State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-        delete State.recoveryBags[k];
-        saveDiskState();
-        broadcastStateUpdate();
-        recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-        continue;
+    // ---- legacy v4 recovery bags (no new bags are ever created in v5) ----
+    for (const k of Object.keys(State.recoveryBags || {})) {
+      const bag = State.recoveryBags[k];
+      if (!bag || bag.exitInProgress) continue;
+      const price = await livePriceFor(k, bag);
+      if (!price) continue;
+      bag.livePriceUSDT = price;
+      const entry = Number(bag.entryPriceUSDT);
+      const gainPct = ((price - entry) / entry) * 100;
+      bag.targetExitPriceUSDT = entry * (1 + 2 * FEE_RATE + 0.0005);
+      bag.targetStep = 'LEGACY: EXIT AT BREAKEVEN + FEES';
+      if (price >= bag.targetExitPriceUSDT) {
+        realizeExit('recoveryBags', k, 1, price, 'LEGACY BAG RECOVERED', 'v4 bag closed at breakeven + fees');
+      } else if (gainPct <= -3.8) {
+        realizeExit('recoveryBags', k, 1, price, 'LEGACY BAG CUT (-3.80%)', 'v4 bag hit its original -3.80% cap');
       }
     }
-
-    // EXIT TRIGGER 5: Hard Disaster Floor Cut (-3.80% Asymmetric Tail Risk Cap)
-    if (gainPct <= -3.80) {
-      bag.exitInProgress = true;
-      const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * bag.notionalUSDT).toFixed(4));
-
-      logOperation('SENTRY_EXIT', `Hard disaster cut triggered on ${bag.pair} at -3.80%. Preserved cash capital.`, 'danger');
-
-      const tradePayload = {
-        id: Date.now(),
-        pair: bag.pair || `${k.replace('USDT', '')}/USDT`,
-        type: 'HARD DISASTER CUT (-3.80%)',
-        entryPriceUSDT: entryPrice,
-        exitPriceUSDT: livePrice,
-        notionalUSDT: bag.notionalUSDT,
-        pnlUSDT: realizedGain,
-        reason: 'Hard disaster floor (-3.80%): Capital preserved'
-      };
-
-      State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + bag.notionalUSDT + realizedGain).toFixed(4));
-      State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-      delete State.recoveryBags[k];
-      saveDiskState();
-      broadcastStateUpdate();
-      recordTradeToCloudLedger(tradePayload).catch(e => console.error('[Ledger Dispatch Notice]', e.message));
-      continue;
-    }
+  } finally {
+    sentryBusy = false;
   }
 }
 
@@ -2061,7 +1165,9 @@ app.get('/api/state', (req, res) => {
     usdtToInrRate: State.usdtToInrRate,
     masterLedgerUrl: State.masterLedgerUrl,
     learningSheetUrl: State.learningSheetUrl,
-    learningEngineState: learningEngine.state || {}
+    learningEngineState: learningEngine.state || {},
+    riskConfig: Strategy.CONFIG,
+    equityUSDT: computeEquity()
   });
 });
 
@@ -2177,27 +1283,10 @@ app.post('/api/positions/close', async (req, res) => {
   if (!pairKey) return res.status(400).json({ success: false, error: 'Missing pairKey' });
   const pos = State.activePositions[pairKey];
   if (!pos) return res.status(404).json({ success: false, error: 'Position not found' });
-  const livePrice = Number(State.universe[pairKey]?.priceUSDT || pos.livePriceUSDT || pos.entryPriceUSDT);
-  const entryPrice = Number(pos.entryPriceUSDT || livePrice);
-  const notional = Number(pos.notionalUSDT || 10.05);
-  const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * notional).toFixed(4));
-  const closeRecord = {
-    id: Date.now(),
-    pair: pos.pair || `${pairKey.replace('USDT', '')}/USDT`,
-    type: realizedGain >= 0 ? 'MANUAL PROFIT' : 'MANUAL EXIT',
-    entryPriceUSDT: entryPrice,
-    exitPriceUSDT: livePrice,
-    notionalUSDT: notional,
-    pnlUSDT: realizedGain,
-    reason: `Manual position close at $${formatPrecisePrice(livePrice)}`
-  };
-  delete State.activePositions[pairKey];
-  State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + notional + realizedGain).toFixed(4));
-  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-  saveDiskState();
-  broadcastStateUpdate();
-  await recordTradeToCloudLedger(closeRecord);
-  res.json({ success: true, trade: closeRecord });
+  const price = await livePriceFor(pairKey, pos);
+  if (!price) return res.status(503).json({ success: false, error: 'No live price available' });
+  const trade = realizeExit('activePositions', pairKey, 1, price, 'MANUAL EXIT', `Manual close at $${formatPrecisePrice(price)}`);
+  res.json({ success: Boolean(trade), trade });
 });
 
 app.post('/api/bags/close', async (req, res) => {
@@ -2205,27 +1294,20 @@ app.post('/api/bags/close', async (req, res) => {
   if (!pairKey) return res.status(400).json({ success: false, error: 'Missing pairKey' });
   const bag = State.recoveryBags[pairKey];
   if (!bag) return res.status(404).json({ success: false, error: 'Bag not found' });
-  const livePrice = Number(State.universe[pairKey]?.priceUSDT || bag.livePriceUSDT || bag.entryPriceUSDT);
-  const entryPrice = Number(bag.entryPriceUSDT || livePrice);
-  const notional = Number(bag.notionalUSDT || 10.05);
-  const realizedGain = Number((((livePrice - entryPrice) / entryPrice) * notional).toFixed(4));
-  const closeRecord = {
-    id: Date.now(),
-    pair: bag.pair || `${pairKey.replace('USDT', '')}/USDT`,
-    type: realizedGain >= 0 ? 'RECOVERY MANUAL EXIT' : 'BAG LIQUIDATION',
-    entryPriceUSDT: entryPrice,
-    exitPriceUSDT: livePrice,
-    notionalUSDT: notional,
-    pnlUSDT: realizedGain,
-    reason: `Manual bag liquidation at $${formatPrecisePrice(livePrice)}`
-  };
-  delete State.recoveryBags[pairKey];
-  State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT + notional + realizedGain).toFixed(4));
-  State.portfolio.realizedPnL = Number((State.portfolio.realizedPnL + realizedGain).toFixed(4));
-  saveDiskState();
-  broadcastStateUpdate();
-  await recordTradeToCloudLedger(closeRecord);
-  res.json({ success: true, trade: closeRecord });
+  const price = await livePriceFor(pairKey, bag);
+  if (!price) return res.status(503).json({ success: false, error: 'No live price available' });
+  const trade = realizeExit('recoveryBags', pairKey, 1, price, 'BAG MANUAL EXIT', `Manual bag close at $${formatPrecisePrice(price)}`);
+  res.json({ success: Boolean(trade), trade });
+});
+
+app.get('/api/risk', (req, res) => {
+  const equity = computeEquity();
+  res.json({
+    mode: 'PAPER',
+    equityUSDT: Number(equity.toFixed(2)),
+    guard: Strategy.portfolioGuard(State.tradeLogs, equity),
+    config: Strategy.CONFIG
+  });
 });
 
 // -------------------------------------------------------------
@@ -2242,7 +1324,9 @@ function broadcastStateUpdate() {
     recoveryBags: State.recoveryBags,
     tradeLogs: State.tradeLogs,
     subsystems: State.subsystems,
-    universe: State.universe
+    universe: State.universe,
+    riskConfig: Strategy.CONFIG,
+    equityUSDT: computeEquity()
   });
   wss.clients.forEach(c => {
     if (c.readyState === WebSocket.OPEN) c.send(msg);
@@ -2308,11 +1392,13 @@ function connectBinanceGlobalStream() {
 
           if (State.activePositions[sym]) {
             State.activePositions[sym].livePriceUSDT = closePrice;
+            State.activePositions[sym].lastTickAt = Date.now();
             activePriceChanged = true;
           }
 
           if (State.recoveryBags[sym]) {
             State.recoveryBags[sym].livePriceUSDT = closePrice;
+            State.recoveryBags[sym].lastTickAt = Date.now();
             activePriceChanged = true;
           }
         });
@@ -2417,9 +1503,8 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
   console.log(`Low-Latency Singapore Stream + Sentinel Active (<5ms)`);
-  console.log(`Tier-1 Nison Triad + Dual-EMA Macro Stack (v4.3.0)`);
-  console.log(`Base Ceiling Distance Calibrated to <= 2.50%`);
-  console.log(`Score Gate Calibrated to 65 • Batch Size 16`);
+  console.log(`Strategy v5.0 RISK-FIRST • PAPER TRADING (no real orders)`);
+  console.log(`Stop 0.6-1.5% • Risk ${Strategy.CONFIG.riskPerTradePct}%/trade • Daily limit -${Strategy.CONFIG.dailyLossLimitPct}%`);
   console.log(`====================================================`);
 
   runDynamicScreener().then(() => {
