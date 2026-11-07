@@ -55,6 +55,8 @@ const CONFIG = {
   minRvol: 1.3,              // breakout bar volume vs prior 20 bars
   breakoutLookback: 8,       // 8 x 15m = 2h range
   btcMax15mDropPct: -0.40,   // last closed BTC 15m bar must not be worse than this
+  btcEma50BufferPct: 1.0,    // BTC gate pauses only when BTC closes this far BELOW its 1h EMA50 ...
+                             // ... or when the 1h EMA20 is under the EMA50 and price under the EMA20
   maxChaseR: 0.5,            // skip if live price already ran > 0.5R past signal close
 
   // ---- portfolio guard ----
@@ -113,8 +115,14 @@ const reject = (reason) => ({ ok: false, reason });
 
 // ------------------------------------------------------------- BTC regime
 /**
- * BTC must be above its 1h EMA50 and its last closed 15m bar must not be a dump.
- * Altcoin longs opened while BTC is falling are the #1 source of stop-outs.
+ * Pauses altcoin buys only in a CLEAR BTC downtrend, or right after a 15m dump.
+ *
+ * v5.0 paused whenever BTC closed below its 1h EMA50 — 53% of the time over 180 days, often
+ * for an hour at a time while BTC hovered on the line. A 180-day replay showed the trades that
+ * rule blocked were no worse than the ones it allowed (-0.32R vs -0.34R per trade), so it now
+ * pauses only when the downtrend is clear (~37% of the time):
+ *   - the last 1h close is more than btcEma50BufferPct (1%) below the 1h EMA50, or
+ *   - the 1h EMA20 is below the EMA50 AND price is below the EMA20 (trend has rolled over).
  */
 function evaluateBtcRegime(btc1h, btc15, now = Date.now(), cfg = CONFIG) {
   const h = toBars(closedOnly(btc1h, now));
@@ -126,13 +134,18 @@ function evaluateBtcRegime(btc1h, btc15, now = Date.now(), cfg = CONFIG) {
   const last = closes[closes.length - 1];
   const lastM = m[m.length - 1];
   const chg15 = lastM.o > 0 ? ((lastM.c - lastM.o) / lastM.o) * 100 : 0;
-  if (last < e50[e50.length - 1]) {
-    return { ok: false, reason: `BTC $${last.toFixed(2)} below 1h EMA50 $${e50[e50.length - 1].toFixed(2)} (downtrend)`, chg15 };
+  const ema50 = e50[e50.length - 1], ema20 = e20[e20.length - 1];
+  const downtrendLine = ema50 * (1 - cfg.btcEma50BufferPct / 100);
+  if (last < downtrendLine) {
+    return { ok: false, reason: `BTC $${last.toFixed(2)} is more than ${cfg.btcEma50BufferPct}% below its 1h EMA50 ($${downtrendLine.toFixed(2)}) — clear downtrend`, chg15 };
+  }
+  if (ema20 < ema50 && last < ema20) {
+    return { ok: false, reason: `BTC 1h EMA20 below EMA50 and price $${last.toFixed(2)} below EMA20 $${ema20.toFixed(2)} — trend rolled over`, chg15 };
   }
   if (chg15 <= cfg.btcMax15mDropPct) {
     return { ok: false, reason: `BTC 15m bar ${chg15.toFixed(2)}% <= ${cfg.btcMax15mDropPct}%`, chg15 };
   }
-  return { ok: true, chg15, btcAboveEma20: last >= e20[e20.length - 1] };
+  return { ok: true, chg15, btcAboveEma20: last >= ema20 };
 }
 
 // ------------------------------------------------------------ entry check
