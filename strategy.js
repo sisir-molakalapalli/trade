@@ -61,7 +61,7 @@ const CONFIG = {
   riskPerTradePct: 0.50,     // a full stop-out costs 0.5% of equity
   maxAllocPct: 15,           // never more than 15% of equity in one position
   maxConcurrent: 3,
-  minNotional: 10.5,         // Binance min notional is $10
+  minNotional: 5.0,          // every position is at least $5 (Binance spot min notional is $5)
   dailyLossLimitPct: 2.0,    // stop trading for the day after -2% realized
   maxConsecutiveLosses: 3,   // ... or after 3 losses in a row
   lossStreakPauseMin: 120,   // pause length after the loss streak
@@ -127,7 +127,7 @@ function evaluateBtcRegime(btc1h, btc15, now = Date.now(), cfg = CONFIG) {
   const lastM = m[m.length - 1];
   const chg15 = lastM.o > 0 ? ((lastM.c - lastM.o) / lastM.o) * 100 : 0;
   if (last < e50[e50.length - 1]) {
-    return { ok: false, reason: `BTC below 1h EMA50 (downtrend)`, chg15 };
+    return { ok: false, reason: `BTC $${last.toFixed(2)} below 1h EMA50 $${e50[e50.length - 1].toFixed(2)} (downtrend)`, chg15 };
   }
   if (chg15 <= cfg.btcMax15mDropPct) {
     return { ok: false, reason: `BTC 15m bar ${chg15.toFixed(2)}% <= ${cfg.btcMax15mDropPct}%`, chg15 };
@@ -230,10 +230,13 @@ function planEntry(signal, livePrice, equityUSDT, freeCashUSDT, cfg = CONFIG) {
   const riskUSDT = equityUSDT * (cfg.riskPerTradePct / 100);
   let notional = Math.min(riskUSDT / (stopPct / 100), equityUSDT * (cfg.maxAllocPct / 100), freeCashUSDT);
   if (notional < cfg.minNotional) {
-    // Small account: allow the $10.50 minimum only if the risk stays <= 2x plan.
+    // Small account ($21): round the order UP to the $5 floor so no position is ever
+    // smaller than minNotional — only if the loss at the stop stays <= 2x plan and free
+    // cash covers the order plus the buy fee. Otherwise skip the trade.
     const minRisk = cfg.minNotional * (stopPct / 100);
-    if (freeCashUSDT >= cfg.minNotional && minRisk <= riskUSDT * 2) notional = cfg.minNotional;
-    else return reject(`size $${notional.toFixed(2)} below Binance minimum`);
+    const needCash = cfg.minNotional * (1 + cfg.feePct / 100);
+    if (freeCashUSDT >= needCash && minRisk <= riskUSDT * 2) notional = cfg.minNotional;
+    else return reject(`size $${notional.toFixed(2)} below the $${cfg.minNotional} minimum position`);
   }
   return {
     ok: true,
