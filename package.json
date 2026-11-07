@@ -1,10 +1,16 @@
 {
   "name": "sisir-cloud-engine",
-  "version": "1.0.0",
-  "description": "Sisir's 24/7 Cloud Quant Engine",
+  "version": "5.0.0",
+  "description": "Sisir's 24/7 Cloud Quant Engine (v5 risk-first, paper trading)",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test tests/*.test.js",
+    "backtest": "node backtest.js",
+    "compare-exits": "node tools/compare_exits.js 3000 4"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "cors": "^2.8.5",
