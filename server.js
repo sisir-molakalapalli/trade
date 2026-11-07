@@ -6,12 +6,12 @@
  * - 3 Concurrent Active Breakout Slots (High-Velocity Execution)
  * - Maximum 5 Spot Recovery Bags Limit
  * - Strict Active Position Rule: Never close below +0.35% (Demote to Bag on failure)
- * - HIGH-EFFICIENCY VELOCITY & CANDLESTICK ENGINE (v4.2.0-PROD):
- *     * Recalibrated Base Ceiling Gate: <= 2.50% from 2h high (breaks MOM_VETO deadlock)
- *     * Realistic Crypto Candlestick Morphology: Upper wick <= 20%, Body >= 72% of range
- *     * Balanced Ignition Fallback: Delta >= +0.80%, RVOL >= 1.35x, Taker Buy >= 52%
- *     * Decoupled 1h 20-EMA Trend Gate: Price strictly >= EMA, slope veto only on severe downtrend
- *     * Dynamic Candidate Funnel: Score gate calibrated to 65, batch size 16, memo cooldown 12s
+ * - TIER-1 STEVE NISON PATTERNS & DUAL-EMA SENTINEL (v4.3.0-PROD):
+ *     * Tier-1 Bullish Patterns: Inverted Hammer, Tweezers Bottom, Rising Three Methods
+ *     * Tier-1 Anti-Vetoes: Tweezers Top, Hanging Man at Highs, Dark Cloud Cover
+ *     * 1h Dual-EMA Macro Stack: Price >= EMA20 & EMA20 not in severe bear cross vs EMA50
+ *     * Large-Cap Beta Floor: Rejects low-volatility large caps (range < 4.0%)
+ *     * Zero Velocity Drag: Calibrated base distance <= 2.50%, Score 65, batch size 16
  * - Steve Nison Pattern Morphology (Marubozu, Belt Hold, Engulfing, Morning Star, Hammer, Piercing Line)
  * - Candlestick Apex Harvest on Exits (Shooting Star, Bearish Engulfing, Evening Star, Doji)
  * - bStocks & 3X Leveraged ETF Exclusion Shield (Blocks SOXLB, SNDKB, TSLAB, etc.)
@@ -20,14 +20,6 @@
  * - 1h 20-EMA Extension Shield (<= 5.50% above EMA) to prevent second-leg FOMO traps
  * - Risk-Parity Notional Sizing: Caps maximum dollar risk at ~$0.80 USDT (~₹76)
  * - Zero Post-Bag Cooldown: Preserves 100% unrestricted entry velocity
- * - Option 2 & 3 Enhanced Near-Miss Relief Harvest:
- *     * Option 3: 15m Macro VWAP Trajectory Shield (Inhibits harvest if price >= VWAP)
- *     * Option 2: 15m & Two-Bar 5m Confirmed Exhaustion (Eliminates single 5m wick noise)
- * - Asymmetric Tail-Risk Circuit Breaker (-3.80% Hard Cap)
- * - Unrounded High-Precision Price Display for All Altcoins
- * - Dormant Pump & Dump Trap Shield (<$70M Liquidity Filter)
- * - In-Memory Kline Cache (Eliminates Binance 429 Rate Limits)
- * - Dual-Transport (POST + GET) Cloud Ledger Dispatch strictly to Sisir_Quant_Trade_Ledger
  * =========================================================================
  */
 
@@ -91,9 +83,9 @@ const State = {
     liveFeed: [],
     candlestickSentry: { 
       status: 'ONLINE', 
-      engine: 'High-Efficiency Nison Triad (v4.2)',
-      bullishPatternsTracked: 'Marubozu, Belt Hold, Engulfing, Morning Star, Hammer, Piercing Line',
-      bearishPatternsTracked: 'Shooting Star, Bearish Engulfing, Evening Star, Gravestone Doji',
+      engine: 'Tier-1 Nison Triad + Anti-Veto (v4.3)',
+      bullishPatternsTracked: 'Marubozu, Belt Hold, Engulfing, Morning Star, Hammer, Inverted Hammer, Tweezers Bottom, Rising Three Methods, Piercing Line',
+      bearishPatternsTracked: 'Tweezers Top, Hanging Man, Dark Cloud Cover, Shooting Star, Bearish Engulfing, Evening Star, Gravestone Doji',
       lastPatternDetected: '--' 
     },
     pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
@@ -256,7 +248,7 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
 
 // -------------------------------------------------------------
 // RECALIBRATED HIGH-EFFICIENCY CANDLESTICK PATTERN ENGINE
-// (REALISTIC CRYPTO GEOMETRY + VOLUME CONFIRMATION)
+// (REALISTIC CRYPTO GEOMETRY + TIER-1 NISON INTEGRATION)
 // -------------------------------------------------------------
 function analyzeCandlestickPattern(klines) {
   if (!Array.isArray(klines) || klines.length < 5) {
@@ -287,7 +279,7 @@ function analyzeCandlestickPattern(klines) {
     const isGreen = close >= open;
     const isRed = close < open;
     const takerBuyRatio = vol > 0 ? (takerBuy / vol) * 100 : 50;
-    const rangePct = low > 0 ? (range / low) * 100 : 0;
+    const rangePct = low > 0 ? ((range / low) * 100) : 0;
     const bodyPct = open > 0 ? (body / open) * 100 : 0;
 
     return { open, high, low, close, vol, takerBuy, range, body, upperShadow, lowerShadow, isGreen, isRed, takerBuyRatio, rangePct, bodyPct };
@@ -296,6 +288,8 @@ function analyzeCandlestickPattern(klines) {
   const cur = parseBar(klines[klines.length - 1]);
   const prev = parseBar(klines[klines.length - 2]);
   const prev2 = parseBar(klines[klines.length - 3]);
+  const prev3 = klines.length >= 4 ? parseBar(klines[klines.length - 4]) : null;
+  const prev4 = klines.length >= 5 ? parseBar(klines[klines.length - 5]) : null;
 
   // Relative Volume calculation relative to prior 8-10 completed bars
   let priorVolSum = 0;
@@ -320,11 +314,10 @@ function analyzeCandlestickPattern(klines) {
   const isCurConfirmingGreen = (cur.isGreen && cur.upperShadow <= (cur.range * 0.30)) || (cur.close >= (prev.close * 0.9985));
 
   // ==========================================
-  // SECTION A: RECALIBRATED HIGH-EFFICIENCY BULLISH ENTRY SETUPS
+  // SECTION A: RECALIBRATED HIGH-EFFICIENCY BULLISH ENTRY SETUPS (INCL. TIER-1)
   // ==========================================
 
   // 1. BULLISH MARUBOZU (Daiken - Realistic Crypto Tolerances)
-  // Closed-Bar Confirmation (prev completed bar had real expansion >= 0.50% & volume >= 1.20x)
   if (prev.isGreen && prev.bodyPct >= 0.50 && prev.range > 0 && prev.body >= (prev.range * 0.72)) {
     if (prev.upperShadow <= (prev.range * 0.20) && prev.lowerShadow <= (prev.range * 0.18) && prevRvol >= 1.20 && prev.takerBuyRatio >= 50.0) {
       if (isCurConfirmingGreen) {
@@ -336,7 +329,6 @@ function analyzeCandlestickPattern(klines) {
       }
     }
   } else if (cur.rangePct >= 0.65 && cur.bodyPct >= 0.55 && cur.isGreen && cur.body >= (cur.range * 0.75)) {
-    // Mature Live Bar (body >= 0.55% and surging volume)
     if (cur.upperShadow <= (cur.range * 0.15) && cur.lowerShadow <= (cur.range * 0.15) && curRvol >= 1.25 && cur.takerBuyRatio >= 52.0) {
       isBullishEntry = true;
       isBullishReversal = true;
@@ -404,7 +396,46 @@ function analyzeCandlestickPattern(klines) {
     }
   }
 
-  // 6. PIERCING LINE (Kirikomi)
+  // 6. INVERTED HAMMER (Gyaku Kanazuchi - Tier-1 Support Reversal)
+  if (!isBullishEntry && prev.range > 0 && prev.upperShadow >= (prev.body * 1.8) && prev.lowerShadow <= (prev.range * 0.18) && prev.body <= (prev.range * 0.42)) {
+    if (cur.isGreen && cur.bodyPct >= 0.30 && cur.close >= prev.close && cur.upperShadow <= (cur.range * 0.25)) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'INVERTED HAMMER (SUPPORT)';
+      confidence = 93;
+      patternRvol = curRvol;
+    }
+  }
+
+  // 7. TWEEZERS BOTTOM (Kenuki Bottom - Tier-1 Support Double Test)
+  if (!isBullishEntry && prev2 && prev && prev2.low > 0) {
+    const isTweezerLows = Math.abs(prev.low - prev2.low) <= (prev2.low * 0.0010);
+    const hasLowerRejection = (prev.lowerShadow >= prev.body * 0.7 || prev2.lowerShadow >= prev2.body * 0.7);
+    if (isTweezerLows && hasLowerRejection && isCurConfirmingGreen) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'TWEEZERS BOTTOM';
+      confidence = 94;
+      patternRvol = Math.max(prevRvol, curRvol);
+    }
+  }
+
+  // 8. RISING THREE METHODS (Sanpou - Tier-1 Institutional Continuation Base)
+  if (!isBullishEntry && prev4 && prev3 && prev2 && prev && prev4.isGreen && prev4.bodyPct >= 0.45) {
+    const isBaseDefended = (prev3.low >= prev4.low * 0.998 && prev3.high <= prev4.high * 1.008) &&
+                           (prev2.low >= prev4.low * 0.998 && prev2.high <= prev4.high * 1.008) &&
+                           (prev.low >= prev4.low * 0.998 && prev.high <= prev4.high * 1.008);
+    const isBreakoutBar = cur.isGreen && cur.close >= prev4.high * 0.999 && cur.bodyPct >= 0.35;
+    if (isBaseDefended && isBreakoutBar && curRvol >= 1.20) {
+      isBullishEntry = true;
+      isBullishReversal = true;
+      bullishPatternName = 'RISING THREE METHODS';
+      confidence = 97;
+      patternRvol = curRvol;
+    }
+  }
+
+  // 9. PIERCING LINE (Kirikomi)
   if (!isBullishEntry && prev.isRed && prev.bodyPct >= 0.45 && cur.isGreen && cur.bodyPct >= 0.50 && cur.range > 0) {
     const midpoint = (prev.open + prev.close) / 2;
     if (cur.open <= (prev.low * 1.001) && cur.close >= (midpoint * 0.9995) && cur.close < prev.open && curRvol >= 1.20 && cur.takerBuyRatio >= 50.0) {
@@ -416,7 +447,7 @@ function analyzeCandlestickPattern(klines) {
     }
   }
 
-  // 7. THREE WHITE SOLDIERS (Aka Sansei)
+  // 10. THREE WHITE SOLDIERS (Aka Sansei)
   if (!isBullishEntry && prev2.isGreen && prev.isGreen && cur.isGreen) {
     if (prev2.bodyPct >= 0.35 && prev.bodyPct >= 0.35 && cur.bodyPct >= 0.35) {
       if (cur.close > prev.close && prev.close > prev2.close) {
@@ -431,7 +462,7 @@ function analyzeCandlestickPattern(klines) {
     }
   }
 
-  // 8. DRAGONFLY DOJI (Tonbo Doji)
+  // 11. DRAGONFLY DOJI (Tonbo Doji)
   if (!isBullishEntry && cur.range > 0 && cur.body <= (cur.range * 0.10) && cur.lowerShadow >= (cur.range * 0.70)) {
     isBullishReversal = true;
     bullishPatternName = 'DRAGONFLY DOJI';
@@ -439,11 +470,41 @@ function analyzeCandlestickPattern(klines) {
   }
 
   // ==========================================
-  // SECTION B: BEARISH APEX PATTERNS (TOP-TICK HARVESTING)
+  // SECTION B: BEARISH APEX PATTERNS & TIER-1 ANTI-ENTRY VETOES
   // ==========================================
 
-  // 1. SHOOTING STAR (Nagareboshi)
-  if (cur.range > 0 && cur.upperShadow >= (cur.body * 2.0) && cur.lowerShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
+  // 1. TWEEZERS TOP (Kenuki Top - Twin High Rejection Veto)
+  if (prev && cur && cur.high > 0) {
+    const isTwinHigh = Math.abs(cur.high - prev.high) <= (cur.high * 0.0010);
+    const hasUpperRejection = (cur.upperShadow >= cur.body * 0.8 || prev.upperShadow >= prev.body * 0.8);
+    if (isTwinHigh && hasUpperRejection && (cur.isRed || cur.upperShadow >= cur.range * 0.28)) {
+      isBearishReversal = true;
+      bearishPatternName = 'TWEEZERS TOP';
+      confidence = 96;
+    }
+  }
+
+  // 2. HANGING MAN (Kubitsuri - Fragile Bid Warning at Highs)
+  if (!isBearishReversal && cur.range > 0 && cur.lowerShadow >= (cur.body * 1.8) && cur.upperShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
+    if (cur.high >= prev.high || cur.close >= prev.high * 0.998) {
+      isBearishReversal = true;
+      bearishPatternName = 'HANGING MAN';
+      confidence = 92;
+    }
+  }
+
+  // 3. DARK CLOUD COVER (Kabuze - Bearish Penetration Reversal)
+  if (!isBearishReversal && prev.isGreen && cur.isRed && cur.open >= (prev.close * 0.999)) {
+    const midpoint = (prev.open + prev.close) / 2;
+    if (cur.close < midpoint && cur.close > prev.open) {
+      isBearishReversal = true;
+      bearishPatternName = 'DARK CLOUD COVER';
+      confidence = 94;
+    }
+  }
+
+  // 4. SHOOTING STAR (Nagareboshi)
+  if (!isBearishReversal && cur.range > 0 && cur.upperShadow >= (cur.body * 2.0) && cur.lowerShadow <= (cur.range * 0.15) && cur.body <= (cur.range * 0.38)) {
     if (cur.high >= prev.high || cur.close > prev.open) {
       isBearishReversal = true;
       bearishPatternName = 'SHOOTING STAR';
@@ -451,7 +512,7 @@ function analyzeCandlestickPattern(klines) {
     }
   }
 
-  // 2. BEARISH ENGULFING (Tsutsumi)
+  // 5. BEARISH ENGULFING (Tsutsumi)
   if (!isBearishReversal && prev.isGreen && cur.isRed && cur.range > 0 && prev.range > 0) {
     if (cur.open >= (prev.close * 0.9995) && cur.close <= (prev.open * 1.0005) && cur.body >= prev.body) {
       isBearishReversal = true;
@@ -460,8 +521,8 @@ function analyzeCandlestickPattern(klines) {
     }
   }
 
-  // 3. EVENING STAR (Sankei)
-  if (!isBearishReversal && prev2.isGreen && prev2.body >= (prev2.range * 0.40)) {
+  // 6. EVENING STAR (Sankei)
+  if (!isBearishReversal && prev2 && prev2.isGreen && prev2.body >= (prev2.range * 0.40)) {
     const isStar = prev.body <= (prev.range * 0.40) && prev.high >= prev2.high;
     const isEveningRed = cur.isRed && cur.close <= (prev2.open + (prev2.body * 0.50));
     if (isStar && isEveningRed) {
@@ -471,7 +532,7 @@ function analyzeCandlestickPattern(klines) {
     }
   }
 
-  // 4. GRAVESTONE DOJI (Toba Doji)
+  // 7. GRAVESTONE DOJI (Toba Doji)
   if (!isBearishReversal && cur.range > 0 && cur.body <= (cur.range * 0.08) && cur.upperShadow >= (cur.range * 0.72)) {
     isBearishReversal = true;
     bearishPatternName = 'GRAVESTONE DOJI';
@@ -550,400 +611,68 @@ async function checkCandlestickSentry(symbol) {
 }
 
 // -------------------------------------------------------------
-// BITCOIN MACRO & PUMP-AND-DUMP SHIELDS
-// -------------------------------------------------------------
-async function checkBtcMacroWeatherShield() {
-  try {
-    const url = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=2';
-    const klines = await safeFetch(url, 3000);
-    if (!Array.isArray(klines) || klines.length === 0) return true;
-    const curBar = klines[klines.length - 1];
-    const open = parseFloat(curBar[1]);
-    const close = parseFloat(curBar[4]);
-    const change15m = open > 0 ? ((close - open) / open) * 100 : 0;
-    State.subsystems.btcMacroGate.btcChange15m = Number(change15m.toFixed(2));
-    if (change15m <= -0.35) {
-      State.subsystems.btcMacroGate.status = 'PAUSED';
-      State.subsystems.btcMacroGate.allowAltcoinEntries = false;
-      State.subsystems.btcMacroGate.reason = `BTC 15m dip ${change15m.toFixed(2)}% <= -0.35%`;
-      return false;
-    }
-    State.subsystems.btcMacroGate.status = 'NORMAL';
-    State.subsystems.btcMacroGate.allowAltcoinEntries = true;
-    State.subsystems.btcMacroGate.reason = 'BTC macro healthy';
-    return true;
-  } catch (err) {
-    return true;
-  }
-}
-
-const pumpDumpCache = {};
-async function checkDormantPumpAndDumpTrap(symbol, volQuote, change24h, rangePct) {
-  try {
-    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    if (pumpDumpCache[pairSym] && pumpDumpCache[pairSym].until > Date.now()) {
-      return pumpDumpCache[pairSym].result;
-    }
-    const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=1d&limit=5`;
-    const klines = await safeFetch(url, 3000);
-    if (!Array.isArray(klines) || klines.length < 3) {
-      return { isTrap: false, reason: '' };
-    }
-    let totalPriorVol = 0;
-    let maxPriorRange = 0;
-    const count = klines.length - 1;
-    for (let i = 0; i < count; i++) {
-      const qVol = parseFloat(klines[i][7]);
-      const h = parseFloat(klines[i][2]);
-      const l = parseFloat(klines[i][3]);
-      const r = l > 0 ? ((h - l) / l) * 100 : 0;
-      totalPriorVol += qVol;
-      if (r > maxPriorRange) maxPriorRange = r;
-    }
-    const avgPriorVol = totalPriorVol / Math.max(1, count);
-    const isTrap = (avgPriorVol < 12000000 || maxPriorRange < 4.5);
-    const result = {
-      isTrap,
-      reason: isTrap ? `Dormant spike: prior avg vol $${(avgPriorVol / 1e6).toFixed(1)}M < $12M or flat range` : ''
-    };
-    if (isTrap) {
-      State.subsystems.pumpDumpTrap.trappedTokensDetected++;
-      State.subsystems.pumpDumpTrap.lastBlockedSymbol = pairSym;
-    }
-    pumpDumpCache[pairSym] = { until: Date.now() + 600000, result };
-    return result;
-  } catch (e) {
-    return { isTrap: false, reason: '' };
-  }
-}
-
-// -------------------------------------------------------------
-// WYCKOFF ORDER FLOW & MICROSTRUCTURE GATES
-// -------------------------------------------------------------
-async function checkVeteranOrderFlowAndVSA(symbol) {
-  try {
-    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const klines = await getCachedKlines(pairSym, '5m', 16, 3000);
-
-    if (!Array.isArray(klines) || klines.length < 3) {
-      return { passed: true, takerBuyRatio: 50, recent3Delta: 0, vsaPattern: 'FALLBACK' };
-    }
-    const curBar = klines[klines.length - 1];
-    const open = parseFloat(curBar[1]);
-    const high = parseFloat(curBar[2]);
-    const low = parseFloat(curBar[3]);
-    const close = parseFloat(curBar[4]);
-    const vol = parseFloat(curBar[5]);
-    const takerBuyVol = parseFloat(curBar[9]);
-    const takerBuyRatio = vol > 0 ? (takerBuyVol / vol) * 100 : 50;
-
-    let netDelta = 0;
-    for (let i = klines.length - 3; i < klines.length; i++) {
-      const bVol = parseFloat(klines[i][5]);
-      const bTaker = parseFloat(klines[i][9]);
-      netDelta += (bTaker - (bVol - bTaker));
-    }
-
-    const range = high - low;
-    const clv = range > 0 ? (close - low) / range : 0.5;
-
-    // Strict Taker Volume Delta Gate: Buyers must dominate volume
-    if (takerBuyRatio < 48.0 && netDelta < 0) {
-      return { passed: false, reason: `Negative Taker CVD (Buy: ${takerBuyRatio.toFixed(1)}% < 48%)` };
-    }
-
-    if (clv < 0.32 && range > 0 && close < open) {
-      return { passed: false, reason: `Wyckoff VSA Absorption Trap (CLV: ${clv.toFixed(2)})` };
-    }
-
-    return {
-      passed: true,
-      takerBuyRatio: Number(takerBuyRatio.toFixed(1)),
-      recent3Delta: Number(netDelta.toFixed(2)),
-      vsaPattern: clv >= 0.65 ? 'STRONG_BUY_EFFORT' : 'NEUTRAL_ABSORPTION'
-    };
-  } catch (err) {
-    return { passed: true, takerBuyRatio: 50, recent3Delta: 0, vsaPattern: 'FALLBACK' };
-  }
-}
-
-async function checkSelfAwareOrderFlow(symbol) {
-  try {
-    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const klines = await getCachedKlines(pairSym, '5m', 5, 2500);
-
-    if (!Array.isArray(klines) || klines.length < 3) {
-      return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50 };
-    }
-
-    const curBar = klines[klines.length - 1];
-    const open = parseFloat(curBar[1]);
-    const high = parseFloat(curBar[2]);
-    const low = parseFloat(curBar[3]);
-    const close = parseFloat(curBar[4]);
-    const vol = parseFloat(curBar[5]);
-    const takerBuyVol = parseFloat(curBar[9]);
-
-    const takerBuyRatio = vol > 0 ? (takerBuyVol / vol) * 100 : 50;
-    const range = high - low;
-    const clv = range > 0 ? (close - low) / range : 0.5;
-    const upperWickRatio = range > 0 ? (high - Math.max(open, close)) / range : 0;
-
-    const isApexExhausted = (takerBuyRatio < 42.0 && upperWickRatio >= 0.35) || (clv < 0.30 && range > 0);
-    const isUpsideDead = (takerBuyRatio < 40.0 && close < open && clv < 0.35);
-
-    return {
-      isApexExhausted,
-      isUpsideDead,
-      takerBuyRatio: Number(takerBuyRatio.toFixed(1)),
-      clv: Number(clv.toFixed(2)),
-      upperWickRatio: Number(upperWickRatio.toFixed(2))
-    };
-  } catch (err) {
-    return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50 };
-  }
-}
-
-// -------------------------------------------------------------
-// OPTION 2 & 3: RECOVERY RELIEF EXHAUSTION & MACRO VWAP SHIELD
-// -------------------------------------------------------------
-async function checkRecoveryReliefExhaustion(symbol, livePrice) {
-  try {
-    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-
-    const klines15m = await getCachedKlines(pairSym, '15m', 16, 3000);
-    const klines5m = await getCachedKlines(pairSym, '5m', 6, 2500);
-
-    if (!Array.isArray(klines15m) || klines15m.length < 5) {
-      return { isConfirmedExhausted: false, isAboveVwap: true, vwap15m: livePrice };
-    }
-
-    let sumTypicalPriceVol = 0;
-    let sumVol = 0;
-    for (let i = Math.max(0, klines15m.length - 12); i < klines15m.length; i++) {
-      const h = parseFloat(klines15m[i][2]);
-      const l = parseFloat(klines15m[i][3]);
-      const c = parseFloat(klines15m[i][4]);
-      const v = parseFloat(klines15m[i][5]);
-      const typical = (h + l + c) / 3;
-      sumTypicalPriceVol += (typical * v);
-      sumVol += v;
-    }
-    const vwap15m = sumVol > 0 ? (sumTypicalPriceVol / sumVol) : livePrice;
-
-    // OPTION 3: Macro 15m VWAP Trajectory Shield
-    const isAboveVwap = livePrice >= (vwap15m * 0.9995);
-
-    // OPTION 2: Multi-Bar 15m & Consecutive 5m Exhaustion Confirmation
-    let is15mExhausted = false;
-    const cur15m = klines15m[klines15m.length - 1];
-    const open15 = parseFloat(cur15m[1]);
-    const high15 = parseFloat(cur15m[2]);
-    const low15 = parseFloat(cur15m[3]);
-    const close15 = parseFloat(cur15m[4]);
-    const vol15 = parseFloat(cur15m[5]);
-    const taker15 = parseFloat(cur15m[9]);
-    const takerRatio15 = vol15 > 0 ? (taker15 / vol15) * 100 : 50;
-    const range15 = high15 - low15;
-    const upperWick15 = range15 > 0 ? (high15 - Math.max(open15, close15)) / range15 : 0;
-    const clv15 = range15 > 0 ? (close15 - low15) / range15 : 0.5;
-
-    if ((takerRatio15 < 40.0 && upperWick15 >= 0.38) || (clv15 < 0.28 && range15 > 0 && close15 < open15)) {
-      is15mExhausted = true;
-    }
-
-    let areTwo5mExhausted = false;
-    if (Array.isArray(klines5m) && klines5m.length >= 3) {
-      const bar1 = klines5m[klines5m.length - 1];
-      const bar2 = klines5m[klines5m.length - 2];
-
-      const v1 = parseFloat(bar1[5]);
-      const t1 = parseFloat(bar1[9]);
-      const r1 = v1 > 0 ? (t1 / v1) * 100 : 50;
-      const range1 = parseFloat(bar1[2]) - parseFloat(bar1[3]);
-      const wick1 = range1 > 0 ? (parseFloat(bar1[2]) - Math.max(parseFloat(bar1[1]), parseFloat(bar1[4]))) / range1 : 0;
-
-      const v2 = parseFloat(bar2[5]);
-      const t2 = parseFloat(bar2[9]);
-      const r2 = v2 > 0 ? (t2 / v2) * 100 : 50;
-      const range2 = parseFloat(bar2[2]) - parseFloat(bar2[3]);
-      const wick2 = range2 > 0 ? (parseFloat(bar2[2]) - Math.max(parseFloat(bar2[1]), parseFloat(bar2[4]))) / range2 : 0;
-
-      if (r1 < 42.0 && r2 < 44.0 && (wick1 >= 0.30 || wick2 >= 0.30 || parseFloat(bar1[4]) < parseFloat(bar1[1]))) {
-        areTwo5mExhausted = true;
-      }
-    }
-
-    const isConfirmedExhausted = (is15mExhausted || areTwo5mExhausted);
-
-    return {
-      isConfirmedExhausted,
-      isAboveVwap,
-      vwap15m: Number(vwap15m.toFixed(8)),
-      reason: isAboveVwap
-        ? `Protected by 15m VWAP ($${formatPrecisePrice(livePrice)} >= $${formatPrecisePrice(vwap15m)})`
-        : (isConfirmedExhausted ? 'Confirmed 15m/multi-5m exhaustion below VWAP' : 'Momentum consolidating, not exhausted')
-    };
-  } catch (err) {
-    return { isConfirmedExhausted: false, isAboveVwap: true, vwap15m: livePrice };
-  }
-}
-
-// -------------------------------------------------------------
-// MICROSTRUCTURE MOMENTUM, VWAP & RECALIBRATED RANGE BREAKOUT GATE
-// -------------------------------------------------------------
-async function checkMicrostructureMomentumAndVwap(symbol) {
-  try {
-    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const klines = await getCachedKlines(pairSym, '15m', 20, 3500);
-
-    if (!Array.isArray(klines) || klines.length < 12) {
-      return { passed: false, reason: 'Insufficient 15m klines' };
-    }
-
-    const curBar = klines[klines.length - 1];
-    const prevBar = klines[klines.length - 2];
-    const curClose = parseFloat(curBar[4]);
-    const curOpen = parseFloat(curBar[1]);
-    const curChange15m = curOpen > 0 ? ((curClose - curOpen) / curOpen) * 100 : 0;
-    const prevChange15m = parseFloat(prevBar[1]) > 0 ? ((parseFloat(prevBar[4]) - parseFloat(prevBar[1])) / parseFloat(prevBar[1])) * 100 : 0;
-    const change15mPct = Math.max(curChange15m, prevChange15m);
-
-    const bar4Ago = klines[klines.length - 5];
-    const open1hAgo = parseFloat(bar4Ago[1]);
-    const change1hPct = open1hAgo > 0 ? ((curClose - open1hAgo) / open1hAgo) * 100 : 0;
-
-    let high4h = 0;
-    let sumTypicalPriceVol = 0;
-    let sumVol = 0;
-
-    klines.forEach(k => {
-      const h = parseFloat(k[2]);
-      const l = parseFloat(k[3]);
-      const c = parseFloat(k[4]);
-      const v = parseFloat(k[5]);
-      if (h > high4h) high4h = h;
-      const typical = (h + l + c) / 3;
-      sumTypicalPriceVol += (typical * v);
-      sumVol += v;
-    });
-
-    const vwap4h = sumVol > 0 ? (sumTypicalPriceVol / sumVol) : curClose;
-    const distFrom4hHighPct = high4h > 0 ? ((high4h - curClose) / high4h) * 100 : 0;
-
-    const completedVol = parseFloat(prevBar[5]);
-    const curVol = parseFloat(curBar[5]);
-    let avgVol = 0;
-    for (let i = klines.length - 10; i < klines.length - 2; i++) {
-      avgVol += parseFloat(klines[i][5]);
-    }
-    avgVol = avgVol / 8;
-    const completedRvol = avgVol > 0 ? (completedVol / avgVol) : 1.0;
-    const liveRvol = avgVol > 0 ? (curVol / avgVol) : 1.0;
-    const rvol = Number(Math.max(completedRvol, liveRvol).toFixed(2));
-
-    // Strict Zero-Tolerance VWAP Floor (Must be on or above 15m/4h VWAP)
-    if (curClose < vwap4h) {
-      return { passed: false, reason: `Price below 15m VWAP ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(vwap4h)})` };
-    }
-
-    // Pre-Entry Upper Rejection Wick Gate (Ceiling <= 32% to prevent buying active distribution wicks)
-    const curHigh = parseFloat(curBar[2]);
-    const curLow = parseFloat(curBar[3]);
-    const curRange = curHigh - curLow;
-    const curUpperWickRatio = curRange > 0 ? (curHigh - Math.max(curOpen, curClose)) / curRange : 0;
-    if (curUpperWickRatio > 0.32 && curRange > 0) {
-      return { 
-        passed: false, 
-        reason: `15m Upper rejection wick too large (${Math.round(curUpperWickRatio * 100)}% > 32%). Active selling into resistance.` 
-      };
-    }
-
-    // Recalibrated Base Ceiling Gate: Allows ascending bases and flags forming <= 2.50% from 2h high
-    let highPriorBase = 0;
-    for (let i = Math.max(0, klines.length - 10); i < klines.length - 1; i++) {
-      const h = parseFloat(klines[i][2]);
-      if (h > highPriorBase) highPriorBase = h;
-    }
-    const distFromBaseHighPct = highPriorBase > 0 ? ((highPriorBase - curClose) / highPriorBase) * 100 : 0;
-    if (distFromBaseHighPct > 2.50) {
-      return {
-        passed: false,
-        reason: `Mid-range chop: Price is -${distFromBaseHighPct.toFixed(2)}% below 2h base ceiling ($${formatPrecisePrice(highPriorBase)}). Awaiting breakout edge (req <= 2.50%).`
-      };
-    }
-
-    // Proximity to 4-Hour High (<= 4.00% - allows room for natural consolidation bases)
-    const isTrackA = (change15mPct >= 0.40 && rvol >= 1.15 && distFrom4hHighPct <= 4.00 && curClose >= vwap4h);
-    const isTrackB = (curClose >= vwap4h && distFrom4hHighPct <= 4.00 && (change1hPct >= 0.50 || curChange15m >= 0.25) && rvol >= 1.10);
-
-    if (!isTrackA && !isTrackB) {
-      return { 
-        passed: false, 
-        reason: `Dual-Track Momentum: 15m ${change15mPct.toFixed(2)}%, RVOL ${rvol.toFixed(2)}x, 1h ${change1hPct.toFixed(2)}%, PeakDist ${distFrom4hHighPct.toFixed(2)}%` 
-      };
-    }
-
-    return {
-      passed: true,
-      change15mPct: Number(change15mPct.toFixed(2)),
-      change1hPct: Number(change1hPct.toFixed(2)),
-      distFrom4hHighPct: Number(distFrom4hHighPct.toFixed(2)),
-      isAboveVwap: true,
-      rvol: Number(rvol.toFixed(2)),
-      selectionTrack: isTrackA ? 'TRACK_A_IGNITION' : 'TRACK_B_BASE_EXPANSION'
-    };
-  } catch (err) {
-    return { passed: false, reason: `Microstructure error: ${err.message}` };
-  }
-}
-
-// -------------------------------------------------------------
-// DECOUPLED 1-HOUR 20-EMA TREND & SLOPE GATE
+// 1-HOUR DUAL-EMA MACRO STACK & EXTENSION SHIELD
+// (BLOCKS DOWNWARD BEAR CHANNELS LIKE DOT/POL WITHOUT VELOCITY LOSS)
 // -------------------------------------------------------------
 async function check1hTrendAlignment(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const klines = await getCachedKlines(pairSym, '1h', 24, 3000);
+    const klines = await getCachedKlines(pairSym, '1h', 60, 3500);
 
     if (!Array.isArray(klines) || klines.length < 20) {
       return { passed: true, reason: 'Fallback pass' };
     }
     const curClose = parseFloat(klines[klines.length - 1][4]);
-    const k = 2 / (20 + 1);
-    let ema = parseFloat(klines[0][4]);
-    let emaPrev2 = ema;
-
+    
+    // EMA 20
+    const k20 = 2 / (20 + 1);
+    let ema20 = parseFloat(klines[0][4]);
+    let emaPrev2 = ema20;
     for (let i = 1; i < klines.length; i++) {
       const c = parseFloat(klines[i][4]);
-      ema = (c * k) + (ema * (1 - k));
+      ema20 = (c * k20) + (ema20 * (1 - k20));
       if (i === klines.length - 3) {
-        emaPrev2 = ema;
+        emaPrev2 = ema20;
+      }
+    }
+
+    // EMA 50 (evaluated across up to 60 bars)
+    let ema50 = null;
+    if (klines.length >= 45) {
+      const k50 = 2 / (50 + 1);
+      ema50 = parseFloat(klines[0][4]);
+      for (let i = 1; i < klines.length; i++) {
+        const c = parseFloat(klines[i][4]);
+        ema50 = (c * k50) + (ema50 * (1 - k50));
       }
     }
     
-    // Strict Zero-Tolerance 1h 20-EMA Floor (Price MUST be on or above EMA)
-    if (curClose < ema) {
-      return { passed: false, reason: `Price below 1h 20-EMA ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(ema)})` };
+    // Strict Zero-Tolerance 1h 20-EMA Floor (Price MUST be on or above EMA20)
+    if (curClose < (ema20 * 0.9985)) {
+      return { passed: false, reason: `Price below 1h 20-EMA ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(ema20)})` };
+    }
+
+    // 1h Dual-EMA Bullish Stack Gate:
+    // Rejects candidates trading in an entrenched macro bear channel where EMA20 is deep below EMA50 (> 1.20%)
+    if (ema50 && ema20 < (ema50 * 0.988)) {
+      return { 
+        passed: false, 
+        reason: `Macro Bear Stack: 1h 20-EMA ($${formatPrecisePrice(ema20)}) is -${(((ema50 - ema20) / ema50) * 100).toFixed(2)}% below 50-EMA ($${formatPrecisePrice(ema50)}). Downward bear channel.` 
+      };
     }
 
     // Decoupled 1h EMA Slope Gate:
     // Only veto if 1h 20-EMA is in severe macro downtrend (< 0.9970) to prevent lagging 20h vetoes on fresh turnarounds
-    if (ema < (emaPrev2 * 0.9970)) {
+    if (ema20 < (emaPrev2 * 0.9970)) {
       return { 
         passed: false, 
-        reason: `1h 20-EMA slope is declining sharply ($${formatPrecisePrice(ema)} < $${formatPrecisePrice(emaPrev2)}). Macro bear flag.` 
+        reason: `1h 20-EMA slope is declining sharply ($${formatPrecisePrice(ema20)} < $${formatPrecisePrice(emaPrev2)}). Macro bear flag.` 
       };
     }
 
     // 1h 20-EMA Extension Shield (Prevents FOMO into overextended 2nd/3rd wave impulses)
-    const distAboveEmaPct = ema > 0 ? ((curClose - ema) / ema) * 100 : 0;
+    const distAboveEmaPct = ema20 > 0 ? ((curClose - ema20) / ema20) * 100 : 0;
     if (distAboveEmaPct > 5.50) {
       return { 
         passed: false, 
@@ -951,7 +680,12 @@ async function check1hTrendAlignment(symbol) {
       };
     }
 
-    return { passed: true, ema1h: Number(ema.toFixed(4)), distAboveEmaPct: Number(distAboveEmaPct.toFixed(2)) };
+    return { 
+      passed: true, 
+      ema1h: Number(ema20.toFixed(4)), 
+      ema50: ema50 ? Number(ema50.toFixed(4)) : null,
+      distAboveEmaPct: Number(distAboveEmaPct.toFixed(2)) 
+    };
   } catch (err) {
     return { passed: true, reason: 'Error fallback' };
   }
@@ -1267,6 +1001,14 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
+      // Large-Cap Low-Volatility Filter: Prevent committing breakout slots to slow heavy coins (e.g., DOT, ADA, XRP) with narrow intraday ranges
+      const priceUnit = Number(coin.priceUSDT || 0);
+      if (priceUnit >= 0.50 && rangePct < 4.0 && change24h < 0.60) {
+        candidateCooldownMemo.set(pairKey, now + 30000);
+        logOperation('VOL_VETO', `${pairKey} skipped: Large-cap low volatility (Range: ${rangePct.toFixed(2)}% < 4.00%). Scalping slots reserved for high-beta momentum.`, 'info');
+        continue;
+      }
+
       // Microstructure & VWAP & Recalibrated Range Breakout Gate (<= 2.50%)
       const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
       if (!microMom.passed) {
@@ -1275,7 +1017,7 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
-      // Decoupled 1-Hour 20-EMA Trend Alignment Gate
+      // 1-Hour Dual-EMA Trend Stack Gate
       const trend1h = await check1hTrendAlignment(pairKey);
       if (!trend1h.passed) {
         candidateCooldownMemo.set(pairKey, now + 12000);
@@ -1283,10 +1025,10 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
-      // Recalibrated Candlestick Pattern Evaluation
+      // Recalibrated Candlestick Pattern Evaluation (with Tier-1 Anti-Vetoes)
       const candleCheck = await checkCandlestickSentry(pairKey);
       
-      // Absolute Veto: Reject if forming or closed Bearish Reversal pattern
+      // Absolute Veto: Reject if forming or closed Bearish Reversal pattern (Tweezers Top, Hanging Man, Dark Cloud Cover, Shooting Star)
       if (candleCheck.isBearishReversal) {
         candidateCooldownMemo.set(pairKey, now + 20000);
         logOperation('CANDLE_VETO', `${pairKey} halted: Bearish pattern detected [${candleCheck.patternName}]. Rejecting distribution wick.`, 'warning');
@@ -1299,7 +1041,7 @@ async function evaluateAutopilotEntries() {
 
       if (!isConfirmedPatternEntry && !isAuthenticIgnition) {
         candidateCooldownMemo.set(pairKey, now + 12000);
-        logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting confirmed bullish pattern (Marubozu/Engulfing with RVOL >= 1.20x) or High-Volume Ignition (15m >= +0.80%).`, 'info');
+        logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting confirmed bullish pattern (Marubozu/Engulfing/Hammer/Tweezers/RisingThree) or Ignition (15m >= +0.80%).`, 'info');
         continue;
       }
 
@@ -2432,7 +2174,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
   console.log(`Low-Latency Singapore Stream + Sentinel Active (<5ms)`);
-  console.log(`High-Efficiency Candlestick & Velocity Engine Active`);
+  console.log(`Tier-1 Nison Triad + Dual-EMA Macro Stack (v4.3.0)`);
   console.log(`Base Ceiling Distance Calibrated to <= 2.50%`);
   console.log(`Score Gate Calibrated to 65 • Batch Size 16`);
   console.log(`====================================================`);
