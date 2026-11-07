@@ -1,4 +1,4 @@
-/**
+ /**
  * =========================================================================
  * SISIR QUANT TERMINAL - PRODUCTION BACKEND TRADING ENGINE
  * =========================================================================
@@ -607,6 +607,249 @@ async function checkCandlestickSentry(symbol) {
       confidence: 0,
       patternRvol: 1.0
     };
+  }
+}
+
+// -------------------------------------------------------------
+// BITCOIN MACRO WEATHER SHIELD (CIRCUIT BREAKER)
+// -------------------------------------------------------------
+async function checkBtcMacroWeatherShield() {
+  try {
+    const klines = await getCachedKlines('BTCUSDT', '15m', 3, 3000);
+    if (!Array.isArray(klines) || klines.length === 0) return true;
+    
+    const curBar = klines[klines.length - 1];
+    const open = parseFloat(curBar[1]);
+    const close = parseFloat(curBar[4]);
+    const change15m = open > 0 ? ((close - open) / open) * 100 : 0;
+
+    State.subsystems.btcMacroGate.btcChange15m = Number(change15m.toFixed(2));
+
+    if (change15m <= -0.35) {
+      State.subsystems.btcMacroGate.status = 'PAUSED';
+      State.subsystems.btcMacroGate.allowAltcoinEntries = false;
+      State.subsystems.btcMacroGate.reason = `BTC 15m dip ${change15m.toFixed(2)}% <= -0.35%`;
+      return false;
+    }
+
+    State.subsystems.btcMacroGate.status = 'NORMAL';
+    State.subsystems.btcMacroGate.allowAltcoinEntries = true;
+    State.subsystems.btcMacroGate.reason = 'BTC macro healthy';
+    return true;
+  } catch (err) {
+    return true;
+  }
+}
+
+// -------------------------------------------------------------
+// DORMANT PUMP & DUMP TRAP SHIELD
+// -------------------------------------------------------------
+async function checkDormantPumpAndDumpTrap(symbol, volQuote, change24, rangePct) {
+  try {
+    if (volQuote >= 70000000) return { isTrap: false };
+
+    const klines = await getCachedKlines(symbol, '1h', 24, 3000);
+    if (!Array.isArray(klines) || klines.length < 12) return { isTrap: false };
+
+    let priorVolSum = 0;
+    for (let i = 0; i < klines.length - 2; i++) {
+      priorVolSum += parseFloat(klines[i][5]);
+    }
+    const avgPriorVol = priorVolSum / (klines.length - 2);
+    const recentVol = parseFloat(klines[klines.length - 2][5]) + parseFloat(klines[klines.length - 1][5]);
+
+    if (avgPriorVol > 0 && (recentVol / 2) > (avgPriorVol * 8) && volQuote < 15000000) {
+      State.subsystems.pumpDumpTrap.trappedTokensDetected++;
+      State.subsystems.pumpDumpTrap.lastBlockedSymbol = symbol;
+      return { isTrap: true, reason: `Dormant Pump Spike (${((recentVol/2)/avgPriorVol).toFixed(1)}x vol spike on <$15M quote vol)` };
+    }
+    return { isTrap: false };
+  } catch (e) {
+    return { isTrap: false };
+  }
+}
+
+// -------------------------------------------------------------
+// WYCKOFF ORDER FLOW & TAKER CVD ANALYZER
+// -------------------------------------------------------------
+async function checkVeteranOrderFlowAndVSA(symbol) {
+  try {
+    const klines = await getCachedKlines(symbol, '5m', 8, 2500);
+    if (!Array.isArray(klines) || klines.length < 3) {
+      return { passed: true, takerBuyRatio: 52, reason: 'Fallback pass' };
+    }
+
+    let totalVol = 0;
+    let takerBuyVol = 0;
+    for (let i = klines.length - 3; i < klines.length; i++) {
+      totalVol += parseFloat(klines[i][5]);
+      takerBuyVol += parseFloat(klines[i][9]);
+    }
+
+    const takerBuyRatio = totalVol > 0 ? Number(((takerBuyVol / totalVol) * 100).toFixed(1)) : 50;
+    const curBar = klines[klines.length - 1];
+    const open = parseFloat(curBar[1]);
+    const high = parseFloat(curBar[2]);
+    const low = parseFloat(curBar[3]);
+    const close = parseFloat(curBar[4]);
+    const range = high - low;
+    const clv = range > 0 ? (close - low) / range : 0.5;
+
+    if (takerBuyRatio < 46.0 && clv < 0.35) {
+      return { passed: false, takerBuyRatio, reason: `Seller Absorption: Taker Buy ${takerBuyRatio}% (<46%) & CLV ${(clv*100).toFixed(0)}%` };
+    }
+
+    return { passed: true, takerBuyRatio, clv: Number(clv.toFixed(2)) };
+  } catch (e) {
+    return { passed: true, takerBuyRatio: 52, reason: 'Error fallback' };
+  }
+}
+
+// -------------------------------------------------------------
+// MICROSTRUCTURE MOMENTUM, VWAP & RANGE BREAKOUT GATE
+// -------------------------------------------------------------
+async function checkMicrostructureMomentumAndVwap(symbol) {
+  try {
+    const klines = await getCachedKlines(symbol, '15m', 16, 2500);
+    if (!Array.isArray(klines) || klines.length < 8) {
+      return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Fallback pass' };
+    }
+
+    const curBar = klines[klines.length - 1];
+    const curOpen = parseFloat(curBar[1]);
+    const curHigh = parseFloat(curBar[2]);
+    const curLow = parseFloat(curBar[3]);
+    const curClose = parseFloat(curBar[4]);
+    const curVol = parseFloat(curBar[5]);
+
+    const change15mPct = curOpen > 0 ? Number((((curClose - curOpen) / curOpen) * 100).toFixed(2)) : 0;
+    const range = curHigh - curLow;
+    const upperWickRatio = range > 0 ? (curHigh - Math.max(curOpen, curClose)) / range : 0;
+
+    // Upper Rejection Shadow Ceiling (<= 30%)
+    if (upperWickRatio > 0.30 && range > 0) {
+      return { passed: false, reason: `Upper rejection shadow too high (${(upperWickRatio * 100).toFixed(0)}% > 30%)` };
+    }
+
+    // Rolling 4h VWAP calculation
+    let volSum = 0;
+    let vwapSum = 0;
+    for (let i = Math.max(0, klines.length - 16); i < klines.length; i++) {
+      const h = parseFloat(klines[i][2]);
+      const l = parseFloat(klines[i][3]);
+      const c = parseFloat(klines[i][4]);
+      const v = parseFloat(klines[i][5]);
+      vwapSum += (((h + l + c) / 3) * v);
+      volSum += v;
+    }
+    const vwap4h = volSum > 0 ? (vwapSum / volSum) : curClose;
+
+    // Strict Zero-Tolerance VWAP Support: Price MUST be >= VWAP
+    if (curClose < vwap4h) {
+      return { passed: false, reason: `Below 15m/4h VWAP ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(vwap4h)})` };
+    }
+
+    // Relative Volume (RVOL)
+    let priorVolSum = 0;
+    for (let i = Math.max(0, klines.length - 10); i < klines.length - 1; i++) {
+      priorVolSum += parseFloat(klines[i][5]);
+    }
+    const avgVol = priorVolSum / 9;
+    const rvol = avgVol > 0 ? Number((curVol / avgVol).toFixed(2)) : 1.0;
+
+    // 2-Hour Base Ceiling Distance Gate (<= 2.50%)
+    let highPriorBase = 0;
+    for (let i = Math.max(0, klines.length - 9); i < klines.length - 1; i++) {
+      const h = parseFloat(klines[i][2]);
+      if (h > highPriorBase) highPriorBase = h;
+    }
+    const distFromBaseHighPct = highPriorBase > 0 ? ((highPriorBase - curClose) / highPriorBase) * 100 : 0;
+    if (distFromBaseHighPct > 2.50) {
+      return {
+        passed: false,
+        reason: `Mid-range chop: Price is -${distFromBaseHighPct.toFixed(2)}% below 2h base ceiling ($${formatPrecisePrice(highPriorBase)}). Max allowed 2.50%.`
+      };
+    }
+
+    return {
+      passed: true,
+      change15mPct,
+      rvol,
+      vwap4h: Number(vwap4h.toFixed(6)),
+      upperWickRatio: Number(upperWickRatio.toFixed(2))
+    };
+  } catch (e) {
+    return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Error fallback' };
+  }
+}
+
+// -------------------------------------------------------------
+// SELF-AWARE PEAK EXHAUSTION DETECTOR
+// -------------------------------------------------------------
+async function checkSelfAwareOrderFlow(symbol) {
+  try {
+    const klines = await getCachedKlines(symbol, '5m', 5, 2500);
+    if (!Array.isArray(klines) || klines.length === 0) {
+      return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50, upperWickRatio: 0.1 };
+    }
+    const cur = klines[klines.length - 1];
+    const open = parseFloat(cur[1]);
+    const high = parseFloat(cur[2]);
+    const low = parseFloat(cur[3]);
+    const close = parseFloat(cur[4]);
+    const vol = parseFloat(cur[5]);
+    const takerBuy = parseFloat(cur[9]);
+    const range = high - low;
+    const upperWick = range > 0 ? (high - Math.max(open, close)) : 0;
+    const upperWickRatio = range > 0 ? (upperWick / range) : 0;
+    const takerBuyRatio = vol > 0 ? (takerBuy / vol) * 100 : 50;
+    const clv = range > 0 ? (close - low) / range : 0.5;
+
+    const isApexExhausted = (takerBuyRatio < 42.0 && upperWickRatio >= 0.35) || (clv < 0.30 && range > 0);
+    const isUpsideDead = (takerBuyRatio < 40.0 && close < open && clv < 0.35);
+
+    return {
+      isApexExhausted,
+      isUpsideDead,
+      takerBuyRatio: Number(takerBuyRatio.toFixed(1)),
+      upperWickRatio: Number(upperWickRatio.toFixed(2))
+    };
+  } catch (e) {
+    return { isApexExhausted: false, isUpsideDead: false, takerBuyRatio: 50, upperWickRatio: 0.1 };
+  }
+}
+
+// -------------------------------------------------------------
+// RECOVERY RELIEF EXHAUSTION DETECTOR
+// -------------------------------------------------------------
+async function checkRecoveryReliefExhaustion(symbol, livePrice) {
+  try {
+    const klines = await getCachedKlines(symbol, '15m', 8, 2500);
+    if (!Array.isArray(klines) || klines.length === 0) {
+      return { isAboveVwap: true, isConfirmedExhausted: false };
+    }
+    let volSum = 0;
+    let vwapSum = 0;
+    for (let i = 0; i < klines.length; i++) {
+      const h = parseFloat(klines[i][2]);
+      const l = parseFloat(klines[i][3]);
+      const c = parseFloat(klines[i][4]);
+      const v = parseFloat(klines[i][5]);
+      vwapSum += (((h + l + c) / 3) * v);
+      volSum += v;
+    }
+    const vwap = volSum > 0 ? (vwapSum / volSum) : livePrice;
+    const isAboveVwap = livePrice >= vwap;
+
+    const lastBar = klines[klines.length - 1];
+    const tb = parseFloat(lastBar[9]);
+    const tv = parseFloat(lastBar[5]);
+    const ratio = tv > 0 ? (tb / tv) * 100 : 50;
+    const isConfirmedExhausted = ratio < 44.0;
+
+    return { isAboveVwap, isConfirmedExhausted };
+  } catch (e) {
+    return { isAboveVwap: true, isConfirmedExhausted: false };
   }
 }
 
