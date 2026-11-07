@@ -3,7 +3,7 @@
  * SISIR QUANT TERMINAL - BACKEND ENGINE v5.0 (RISK-FIRST REBUILD)
  * =========================================================================
  * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
- * No orders are sent to Binance from this file...
+ * No orders are sent to Binance from this file.
  *
  * What changed from v4.3 and why (full notes in CHANGES.md):
  *  - Every trade has a real stop (0.6%..1.5%) from the moment it opens.
@@ -61,6 +61,11 @@ const Strategy = require('./strategy');
 const PORT = process.env.PORT || 3000;
 const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 
+// Paper account size. On the first boot with a new CAPITAL_RESET_ID the saved account is
+// re-based so total value (cash + open positions) equals STARTING_EQUITY_USDT.
+const STARTING_EQUITY_USDT = Number(process.env.STARTING_EQUITY_USDT) || 21;
+const CAPITAL_RESET_ID = process.env.CAPITAL_RESET_ID || 'equity-21usd-2026-11-07';
+
 // In-memory trade dispatch deduplication
 const recentTradeDispatches = new Set();
 
@@ -70,13 +75,13 @@ const recentTradeDispatches = new Set();
 const State = {
   autopilotEnabled: true,
   portfolio: {
-    cashUSDT: 1000.00,
+    cashUSDT: STARTING_EQUITY_USDT,
     holdings: {},
     realizedPnL: 0.00,
     bagSubsidyPoolUSDT: 0.00,
     sizingMode: 'PERCENTAGE',
     allocationPct: 15.0,
-    fixedNotionalUSDT: 10.50
+    fixedNotionalUSDT: 5.00
   },
   activePositions: {},
   recoveryBags: {},
@@ -1088,7 +1093,8 @@ function saveDiskState() {
       recoveryBags: State.recoveryBags,
       tradeLogs: State.tradeLogs.slice(0, 150),
       masterLedgerUrl: State.masterLedgerUrl,
-      learningSheetUrl: State.learningSheetUrl
+      learningSheetUrl: State.learningSheetUrl,
+      capitalResetId: State.capitalResetId || CAPITAL_RESET_ID
     };
     fs.writeFileSync(DISK_STATE_FILE, JSON.stringify(data, null, 2), 'utf-8');
   } catch (e) {}
@@ -1112,8 +1118,22 @@ function loadDiskState() {
       } else {
         State.learningSheetUrl = 'https://script.google.com/macros/s/AKfycbwut72lTkCVcqIV2k7YlzlsIOwO3GXCKqlF-4UBxvTvJHckJApKKxzbfFp5JN0VLND8/exec';
       }
+      State.capitalResetId = parsed.capitalResetId;
     }
   } catch (e) {}
+  applyCapitalReset();
+}
+
+// One-time re-base of the paper account to STARTING_EQUITY_USDT ($21).
+// Open positions are kept; cash becomes whatever is left after their market value.
+function applyCapitalReset() {
+  if (State.capitalResetId === CAPITAL_RESET_ID) return;
+  const held = computeEquity() - (Number(State.portfolio.cashUSDT) || 0);
+  State.portfolio.cashUSDT = Number(Math.max(0, STARTING_EQUITY_USDT - held).toFixed(6));
+  State.portfolio.fixedNotionalUSDT = Strategy.CONFIG.minNotional;
+  State.capitalResetId = CAPITAL_RESET_ID;
+  console.log(`[Portfolio] Account re-based to $${STARTING_EQUITY_USDT}: cash $${State.portfolio.cashUSDT.toFixed(2)}, open positions $${held.toFixed(2)}.`);
+  saveDiskState();
 }
 
 // -------------------------------------------------------------
