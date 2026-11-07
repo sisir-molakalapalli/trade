@@ -29,6 +29,24 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const zlib = require('zlib');
+
+// Reuse TCP/TLS connections to Binance and Google instead of a fresh handshake per request.
+const keepAliveHttps = new https.Agent({ keepAlive: true, maxSockets: 8 });
+const keepAliveHttp = new http.Agent({ keepAlive: true, maxSockets: 8 });
+
+// Read a response body, inflating it when the server compressed it.
+function readBody(res, done) {
+  const enc = String(res.headers['content-encoding'] || '').toLowerCase();
+  let stream = res;
+  if (enc === 'gzip') stream = res.pipe(zlib.createGunzip());
+  else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
+  else if (enc === 'br') stream = res.pipe(zlib.createBrotliDecompress());
+  const chunks = [];
+  stream.on('data', (c) => chunks.push(c));
+  stream.on('end', () => done(null, Buffer.concat(chunks).toString('utf8')));
+  stream.on('error', (e) => done(e));
+}
 
 // Process-level crash resilience
 process.on('uncaughtException', (err) => {
@@ -160,12 +178,16 @@ function safeFetch(url, timeoutMs = 8000) {
       const isHttps = u.protocol === 'https:';
       const client = isHttps ? https : http;
       const req = client.get(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SisirQuant/4.2' },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SisirQuant/4.2',
+          // Binance's full ticker list is 1.9 MB plain vs ~0.28 MB gzipped
+          'Accept-Encoding': 'gzip, deflate'
+        },
+        agent: isHttps ? keepAliveHttps : keepAliveHttp,
         timeout: timeoutMs
       }, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
+        readBody(res, (err, data) => {
+          if (err) return reject(err);
           try {
             resolve(JSON.parse(data));
           } catch (e) {
@@ -193,13 +215,14 @@ function safePostJson(url, postData, timeoutMs = 12000) {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(bodyStr),
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SisirQuant/4.2'
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SisirQuant/4.2',
+          'Accept-Encoding': 'gzip, deflate'
         },
+        agent: isHttps ? keepAliveHttps : keepAliveHttp,
         timeout: timeoutMs
       }, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
+        readBody(res, (err, data) => {
+          if (err) return reject(err);
           try {
             resolve(JSON.parse(data));
           } catch (e) {
@@ -241,7 +264,9 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
   const now = Date.now();
   const cached = klineCache.get(cacheKey);
 
-  if (cached && (now - cached.timestamp) < 20000) {
+  // Valid until the open candle closes (so a newly CLOSED bar is picked up within ~1s,
+  // faster than the old fixed 20s), but never older than 5 minutes.
+  if (cached && now < cached.expiresAt) {
     return cached.data;
   }
 
@@ -249,7 +274,10 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
   const data = await safeFetch(url, timeoutMs);
 
   if (Array.isArray(data) && data.length > 0) {
-    klineCache.set(cacheKey, { timestamp: now, data });
+    const openBarCloseMs = Number(data[data.length - 1][6]) || 0;
+    const expiresAt = Math.min(now + 300000, Math.max(now + 1000, openBarCloseMs + 1000));
+    klineCache.set(cacheKey, { timestamp: now, expiresAt, data });
+    if (klineCache.size > 600) klineCache.delete(klineCache.keys().next().value);
   } else if (data && data.code && data.code < 0) {
     console.warn(`[Binance API Notice] ${pairSym} returned: ${data.msg || data.code}`);
   }
@@ -491,7 +519,7 @@ async function runDynamicScreener() {
     State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= (State.activeThresholds?.scoreThreshold || 65) && !c.isPumpAndDump).length;
 
     logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
-    broadcastStateUpdate();
+    broadcastStateUpdate({ withUniverse: true });
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
   }
@@ -1334,37 +1362,56 @@ app.get('/api/risk', (req, res) => {
 // WEBSOCKET SERVER & REAL-TIME BROADCASTS
 // -------------------------------------------------------------
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+// permessage-deflate: JSON state compresses 60-90%, so every message to the app costs less.
+// Browsers and the Android WebView negotiate it automatically.
+const wss = new WebSocket.Server({
+  server,
+  perMessageDeflate: { threshold: 256, zlibDeflateOptions: { level: 6 } }
+});
 
-function broadcastStateUpdate() {
-  const msg = JSON.stringify({
+const BROADCAST_TRADE_LOGS = 50; // the app keeps older trades and syncs the full ledger from the sheet
+const hasClients = () => [...wss.clients].some((c) => c.readyState === WebSocket.OPEN);
+const sendAll = (msg) => wss.clients.forEach((c) => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+// lastTickAt changes every tick but the app never reads it; leaving it out lets
+// unchanged price frames be skipped instead of re-sent.
+const omitTickStamps = (key, value) => (key === 'lastTickAt' ? undefined : value);
+let lastPriceFrame = '';
+
+// withUniverse: only the screener changes the radar list, so only it re-sends it.
+function broadcastStateUpdate({ withUniverse = false } = {}) {
+  if (!hasClients()) return;
+  const payload = {
     type: 'STATE_UPDATE',
     portfolio: State.portfolio,
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
-    tradeLogs: State.tradeLogs,
+    tradeLogs: State.tradeLogs.slice(0, BROADCAST_TRADE_LOGS),
     subsystems: State.subsystems,
-    universe: State.universe,
     riskConfig: Strategy.CONFIG,
     equityUSDT: computeEquity()
-  });
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) c.send(msg);
-  });
+  };
+  if (withUniverse) payload.universe = State.universe;
+  sendAll(JSON.stringify(payload, omitTickStamps));
+  lastPriceFrame = ''; // positions may have changed shape; let the next price frame through
 }
 
+// Still every 500 ms (low-latency display), but only the held coins' prices, and only
+// when something actually changed since the last frame.
 function broadcastPriceStream() {
+  if (!hasClients()) return;
   const prices = {};
-  Object.keys(State.universe).forEach(k => prices[k] = State.universe[k].priceUSDT);
+  [...Object.keys(State.activePositions || {}), ...Object.keys(State.recoveryBags || {})].forEach((k) => {
+    if (State.universe[k]) prices[k] = State.universe[k].priceUSDT;
+  });
   const msg = JSON.stringify({
     type: 'PRICE_STREAM',
     prices,
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags
-  });
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) c.send(msg);
-  });
+  }, omitTickStamps);
+  if (msg === lastPriceFrame) return;
+  lastPriceFrame = msg;
+  sendAll(msg);
 }
 
 // -------------------------------------------------------------
@@ -1374,9 +1421,13 @@ let binanceGlobalWs = null;
 let subscribedActiveStreams = new Set();
 let isSentryRunning = false;
 
+// Bandwidth: this used to stream !miniTicker@arr (every Binance pair, every second,
+// ~1.2 GB/day) although only held coins need live ticks — radar prices refresh with the
+// screener every minute. Now it subscribes <sym>@miniTicker for held coins only: same
+// 1-second cadence for the coins the sentry manages, ~1% of the data.
 function connectBinanceGlobalStream() {
-  const wsEndpoint = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
-  
+  const wsEndpoint = 'wss://stream.binance.com:9443/ws';
+
   try {
     if (binanceGlobalWs) {
       try { binanceGlobalWs.terminate(); } catch (e) {}
@@ -1386,14 +1437,17 @@ function connectBinanceGlobalStream() {
     binanceGlobalWs = new WebSocket(wsEndpoint);
 
     binanceGlobalWs.on('open', () => {
-      console.log('[Binance Stream] Connected to Binance Global miniTicker stream (<5ms Singapore latency).');
+      console.log('[Binance Stream] Connected. Live ticks for held coins only.');
+      subscribedActiveStreams = new Set(); // a fresh connection has no subscriptions
       syncActiveSymbolSubscriptions();
     });
 
     binanceGlobalWs.on('message', (data) => {
       try {
-        const tickers = JSON.parse(data);
-        if (!Array.isArray(tickers)) return;
+        const parsed = JSON.parse(data);
+        // per-symbol miniTicker events arrive one object at a time; ignore SUBSCRIBE acks
+        const tickers = Array.isArray(parsed) ? parsed : (parsed && parsed.e === '24hrMiniTicker' ? [parsed] : null);
+        if (!tickers) return;
 
         const rate = Number(State.usdtToInrRate) || 94.94;
         let activePriceChanged = false;
@@ -1451,39 +1505,33 @@ function syncActiveSymbolSubscriptions() {
     ...Object.keys(State.recoveryBags || {})
   ]);
 
-  const newStreams = [];
-  currentSymbols.forEach(sym => {
-    const s = `${sym.toLowerCase()}@bookTicker`;
-    if (!subscribedActiveStreams.has(s)) {
-      subscribedActiveStreams.add(s);
-      newStreams.push(s);
-    }
-  });
+  const wanted = new Set([...currentSymbols].map((sym) => `${sym.toLowerCase()}@miniTicker`));
+  const newStreams = [...wanted].filter((s) => !subscribedActiveStreams.has(s));
+  const oldStreams = [...subscribedActiveStreams].filter((s) => !wanted.has(s));
 
   if (newStreams.length > 0) {
-    binanceGlobalWs.send(JSON.stringify({
-      method: 'SUBSCRIBE',
-      params: newStreams,
-      id: Date.now()
-    }));
+    newStreams.forEach((s) => subscribedActiveStreams.add(s));
+    binanceGlobalWs.send(JSON.stringify({ method: 'SUBSCRIBE', params: newStreams, id: Date.now() }));
+  }
+  if (oldStreams.length > 0) {
+    // stop paying for ticks on coins that were sold
+    oldStreams.forEach((s) => subscribedActiveStreams.delete(s));
+    binanceGlobalWs.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: oldStreams, id: Date.now() + 1 }));
   }
 }
 
 wss.on('connection', (ws) => {
+  // Only what the dashboard reads (learning-engine state, regime etc. were never used by it).
   ws.send(JSON.stringify({
     type: 'INIT_STATE',
     portfolio: State.portfolio,
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
     universe: State.universe,
-    tradeLogs: State.tradeLogs,
+    tradeLogs: State.tradeLogs.slice(0, 150),
     subsystems: State.subsystems,
-    tradeFrequencyController: State.tradeFrequencyController,
-    activeThresholds: State.activeThresholds,
-    marketRegime: State.marketRegime,
-    usdtToInrRate: State.usdtToInrRate,
-    learningEngineState: learningEngine.state || {}
-  }));
+    riskConfig: Strategy.CONFIG
+  }, omitTickStamps));
 
   ws.on('message', (data) => {
     try {
@@ -1545,6 +1593,7 @@ setInterval(async () => {
   try {
     await runPredictiveSentry();
     await evaluateAutopilotEntries();
+    syncActiveSymbolSubscriptions(); // add ticks for new buys, drop them for sold coins
   } catch (e) {
     console.error('[Sentry Error]', e.message);
   }
