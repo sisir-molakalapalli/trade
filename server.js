@@ -310,7 +310,7 @@ async function refreshBtcRegime() {
   g.status = r.ok ? 'NORMAL' : 'PAUSED';
   g.allowAltcoinEntries = r.ok;
   g.btcChange15m = Number((r.chg15 || 0).toFixed(2));
-  g.reason = r.ok ? 'BTC above 1h EMA50, no 15m dump' : r.reason;
+  g.reason = r.ok ? 'BTC not in a clear downtrend, no 15m dump' : r.reason;
   btcRegimeCache = { at: Date.now(), result: r };
   return r;
 }
