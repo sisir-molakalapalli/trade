@@ -194,18 +194,28 @@ class LearningEngine {
 
     let multiplier = 1.0;
     let attributionReason = '';
+    const type = String(outcomeType || '').toUpperCase();
 
-    if (outcomeType.includes('TP1') || outcomeType.includes('RUNNER') || outcomeType.includes('VELOCITY') || outcomeType.includes('TRAILING')) {
-      multiplier = 1.12;
-      rep.wins++;
-      attributionReason = `Trailing / velocity win (+${pnl.toFixed(2)}$). Credit score boosted.`;
-    } else if (outcomeType.includes('HARD DISASTER') || outcomeType.includes('-6.50%') || pnl < -2.0) {
+    // v5: classify by the actual result, not by the label. In v4 a plain
+    // "STOP LOSS" matched no branch, so losing coins were never penalized.
+    if (type.includes('DISASTER') || type.includes('CUT') || pnl < -2.0) {
       multiplier = 0.50;
-      rep.disasters++;
-      attributionReason = `Catastrophic breakdown cut ($${pnl.toFixed(2)}). Severe penalty applied.`;
-    } else if (outcomeType.includes('RECOVERY') || outcomeType.includes('STEP') || outcomeType.includes('VWAP RELIEF')) {
-      multiplier = hours >= 12 ? 0.88 : 0.96;
-      attributionReason = `Routine bag resolution (${hours.toFixed(1)}h). Capital preserved.`;
+      rep.disasters = (rep.disasters || 0) + 1;
+      attributionReason = `Large loss ($${pnl.toFixed(2)}). Severe penalty applied.`;
+    } else if (pnl < 0) {
+      multiplier = 0.85;
+      rep.losses = (rep.losses || 0) + 1;
+      attributionReason = `Stopped out ($${pnl.toFixed(2)}). Reputation reduced.`;
+    } else if (pnl > 0 && (type.includes('TP1') || type.includes('TARGET') || type.includes('TRAIL'))) {
+      multiplier = 1.12;
+      rep.wins = (rep.wins || 0) + 1;
+      attributionReason = `Clean win (+${pnl.toFixed(2)}$). Credit score boosted.`;
+    } else if (pnl > 0) {
+      multiplier = 1.04;
+      rep.wins = (rep.wins || 0) + 1;
+      attributionReason = `Small win (+${pnl.toFixed(2)}$).`;
+    } else {
+      attributionReason = `Flat exit.`;
     }
 
     if (eff !== null) {
@@ -250,23 +260,28 @@ class LearningEngine {
     const cleanSym = String(sym).replace(/[^A-Z0-9]/g, '');
     const rep = this.getAssetReputation(cleanSym);
 
-    const repPenaltyOffset = rep.repScore < 1.0 
-      ? Math.round((1.0 - rep.repScore) * 12)
+    // Reputation slowly heals: +2% per day without a new trade, back toward 1.0
+    const idleDays = (Date.now() - Number(rep.lastUpdated || Date.now())) / 86400000;
+    const healed = rep.repScore < 1.0 ? Math.min(1.0, rep.repScore * Math.pow(1.02, idleDays)) : rep.repScore;
+
+    const repPenaltyOffset = healed < 1.0 
+      ? Math.round((1.0 - healed) * 12)
       : 0;
 
     const repBonus = rep.repScore > 1.15 ? -2 : 0;
     const netScoreHurdleOffset = this.state.dynamicHurdles.scoreOffset + repPenaltyOffset + repBonus;
 
-    if (rep.repScore <= 0.40 && rep.disasters >= 2) {
+    // v5: this check is now actually called by the server before every entry.
+    if (healed <= 0.55) {
       return {
         allowed: false,
-        reason: `Blacklist: ${cleanSym} Credit Rating too low (${rep.repScore.toFixed(2)})`
+        reason: `Blacklist: ${cleanSym} credit rating too low (${healed.toFixed(2)}) after repeated losses`
       };
     }
 
     return {
       allowed: true,
-      repScore: rep.repScore,
+      repScore: healed,
       netScoreHurdleOffset,
       effectiveWickCeiling: this.state.dynamicHurdles.wickCeiling,
       minRequiredOdds: this.state.dynamicHurdles.minOddsRequired
