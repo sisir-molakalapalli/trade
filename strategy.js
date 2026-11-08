@@ -766,6 +766,85 @@ function manageBag(bag, price, R = EXIT_RULES) {
   return price >= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
 }
 
+/* =========================================================================
+ * MARKET MODE + PAPER USD-M SHORTS (v5.9)
+ * BULL: spot longs only. BEAR: USD-M shorts only. Anything else: no new trades.
+ * Replaces the BTC gate. Read on CLOSED 1h candles, and both of the last two hours must agree.
+ * ========================================================================= */
+const MODE_RULES = { bullBreadth: 0.60, bearBreadth: 0.40, minCoins: 10, slopeBars: 6 };
+const FUTURES = { feePct: 0.05, leverage: 1, maintenancePct: 0.5 };
+
+function modeAt(btcBars, coins, back, R) {
+  const c = btcBars.map((b) => b.c), n = c.length - 1 - back;
+  const e20 = emaSeries(c, 20), e50 = emaSeries(c, 50);
+  const close = c[n], slope = e50[n] - e50[n - R.slopeBars];
+  let above = 0, seen = 0;
+  coins.forEach((bars) => {
+    if (bars.length < 55) return;
+    const closes = bars.map((b) => b.c), i = closes.length - 1 - back;
+    seen++;
+    if (closes[i] > emaSeries(closes, 50)[i]) above++;
+  });
+  const breadth = seen ? above / seen : null;
+  const btcUp = close > e50[n] && e20[n] > e50[n] && slope > 0;
+  const btcDown = close < e50[n] && e20[n] < e50[n] && slope < 0;
+  let mode = 'NEUTRAL';
+  if (seen >= R.minCoins && btcUp && breadth >= R.bullBreadth) mode = 'BULL';
+  if (seen >= R.minCoins && btcDown && breadth <= R.bearBreadth) mode = 'BEAR';
+  return { mode, breadth, seen, close, ema20: e20[n], ema50: e50[n], slope, btcUp, btcDown };
+}
+
+/** @param btc1h closed 1h klines for BTC (70+ bars). @param coins1h array of closed 1h klines. Missing data => NEUTRAL. */
+function evaluateMarketMode(btc1h, coins1h = [], R = MODE_RULES) {
+  const btc = Array.isArray(btc1h) ? toBars(btc1h) : [];
+  if (btc.length < 70) return { mode: 'NEUTRAL', side: 'NONE', reason: 'BTC 1h data unavailable, no new trades', breadth: null, seen: 0 };
+  const coins = (coins1h || []).filter(Array.isArray).map(toBars);
+  const now = modeAt(btc, coins, 0, R), prev = modeAt(btc, coins, 1, R);
+  const pct = now.breadth === null ? '--' : `${Math.round(now.breadth * 100)}%`;
+  const base = { breadth: now.breadth, seen: now.seen, btcClose: now.close, ema20: now.ema20, ema50: now.ema50, btcUp: now.btcUp, btcDown: now.btcDown };
+  if (now.seen < R.minCoins) return { ...base, mode: 'NEUTRAL', side: 'NONE', reason: `Only ${now.seen} coins readable, no new trades` };
+  if (now.mode === prev.mode && now.mode === 'BULL') return { ...base, mode: 'BULL', side: 'LONG', reason: `BTC uptrend and ${pct} of coins above their 1h EMA50` };
+  if (now.mode === prev.mode && now.mode === 'BEAR') return { ...base, mode: 'BEAR', side: 'SHORT', reason: `BTC downtrend and only ${pct} of coins above their 1h EMA50` };
+  const reason = now.mode !== 'NEUTRAL' ? `${now.mode === 'BULL' ? 'Bullish' : 'Bearish'} for one hour, waiting for a second hour` : `Mixed market: ${pct} of coins above their 1h EMA50`;
+  return { ...base, mode: 'NEUTRAL', side: 'NONE', reason };
+}
+
+function netPnlShort(qty, entryPrice, exitPrice, cfg = FUTURES) {
+  return qty * (entryPrice - exitPrice) - (qty * entryPrice + qty * exitPrice) * (cfg.feePct / 100);
+}
+
+/** Isolated-margin short: the price where margin is used up, less maintenance. */
+function shortLiquidationPrice(entryPrice, cfg = FUTURES) {
+  return (entryPrice * (1 + 1 / cfg.leverage)) / (1 + cfg.maintenancePct / 100);
+}
+
+/** Same no-loss rules as a long, run on the mirror image of the price (entry*2 - price), so gains and locks are identical. */
+function manageShort(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES) {
+  const entry = num(pos.entryPriceUSDT);
+  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
+  const mirror = (x) => 2 * entry - x;
+  const shadow = { ...pos, sl: mirror(num(pos.sl) || entry), peakHighPrice: mirror(num(pos.peakLowPrice) || entry) };
+  const r = manageNoLoss(shadow, mirror(price), signals, now, R);
+  pos.peakGainPct = shadow.peakGainPct;
+  pos.peakLowPrice = mirror(shadow.peakHighPrice);
+  pos.ratchetStage = shadow.ratchetStage;
+  pos.tp1Secured = shadow.tp1Secured;
+  pos.sl = mirror(shadow.sl);
+  return r;
+}
+
+/** A short bag closes at 0.30% below entry. Funding it has paid moves the target further, so the close is still not a loss. */
+function manageShortBag(bag, price, R = EXIT_RULES) {
+  const entry = num(bag.entryPriceUSDT);
+  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
+  const notional = num(bag.qty) * entry;
+  const fundingCostPct = notional > 0 ? Math.max(0, -(num(bag.fundingUSDT) || 0) / notional * 100) : 0;
+  bag.targetExitPriceUSDT = entry * (1 - (R.bagTargetPct + fundingCostPct) / 100);
+  bag.targetStep = 'CLOSES AT +0.30%';
+  bag.troughPrice = Math.max(num(bag.troughPrice) || price, price);
+  return price <= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
+}
+
 module.exports = {
   CONFIG,
   closedOnly,
@@ -783,6 +862,14 @@ module.exports = {
   analyzeCandlestickPattern,
   analyzeCandlestickPatternLegacy,
   assessCandles: Candles.assess,
+  assessShortCandles: Candles.assessShort,
+  MODE_RULES,
+  FUTURES,
+  evaluateMarketMode,
+  netPnlShort,
+  shortLiquidationPrice,
+  manageShort,
+  manageShortBag,
   majorTrendOf: Candles.majorTrendOf,
   EXIT_RULES,
   manageNoLoss,
