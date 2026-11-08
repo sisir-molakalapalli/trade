@@ -365,4 +365,22 @@ function assess(klines, opts = {}) {
   return res;
 }
 
-module.exports = { scan, assess, majorTrendOf, parse, CATALOG, ASSESS_DEFAULTS };
+/**
+ * The same checklist for a SHORT: completed/confirmed bearish pattern, no bullish signal,
+ * major trend not up. Second techniques are reported and scored, as they are for longs.
+ */
+function assessShort(klines, opts = {}) {
+  const r = scan(klines);
+  const res = { sell: false, bullish: r.bull.length > 0, pattern: 'NONE', bullPattern: r.bull[0] ? r.bull[0].name : 'NONE', status: '', score: 0,
+    convergence: [], stop: 0, rvol: 1, vetoes: [], major: opts.major || r.major, trend: r.trend, patterns: r.patterns };
+  if (!r.ctx) return res;
+  if (res.bullish) res.vetoes.push(`bullish ${r.bull[0].name}`);
+  if (res.major === 'up') res.vetoes.push('major trend up');
+  const best = r.bear.filter((f) => f.barsAgo <= 1)[0] || r.bear[0];
+  if (!best) { res.vetoes.push('no completed bearish pattern'); return res; }
+  res.pattern = best.name; res.status = best.status; res.score = best.strength; res.convergence = best.convergence; res.rvol = best.rvol; res.stop = best.patternHigh;
+  res.sell = res.vetoes.length === 0;
+  return res;
+}
+
+module.exports = { scan, assess, assessShort, majorTrendOf, parse, CATALOG, ASSESS_DEFAULTS };
