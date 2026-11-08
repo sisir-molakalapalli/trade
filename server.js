@@ -338,6 +338,21 @@ async function refreshPerpetuals() {
   Object.assign(f, { status: 'ONLINE', perpetuals: next.size, reason: `${next.size} USDT perpetuals available`, leverage: Strategy.FUTURES.leverage });
 }
 
+// What a market order would actually get: a long sells at the bid, a short buys back at the ask.
+const quoteMemo = new Map();
+async function executableExitPrice(k, pos) {
+  const short = isShort(pos);
+  const hit = quoteMemo.get(k);
+  let q = hit && Date.now() - hit.at < 250 ? hit.q : null;
+  if (!q) {
+    const url = short ? `${FAPI_BASE}/fapi/v1/ticker/bookTicker?symbol=${k}` : `https://api.binance.com/api/v3/ticker/bookTicker?symbol=${k}`;
+    q = await safeFetch(url, 1500).catch(() => null);
+    if (q) quoteMemo.set(k, { at: Date.now(), q });
+  }
+  const px = parseFloat(q && (short ? q.askPrice : q.bidPrice));
+  return px > 0 ? px : null;
+}
+
 async function fetchFuturesPrice(pairKey) {
   try {
     const d = await safeFetch(`${FAPI_BASE}/fapi/v1/ticker/price?symbol=${pairKey}`, 2500);
@@ -464,11 +479,30 @@ async function fetchRealOrderBookDepth(symbol, futures = false) {
   }
 }
 
+// Bandwidth: the full list is 0.28 MB gzipped. Pull a reduced full list every 15 minutes to learn
+// which coins are liquid, and only those coins (about 4 KB) on the other minutes.
+let liquidSymbols = [];
+let liquidAt = 0;
+const TICKER_URL = 'https://api.binance.com/api/v3/ticker/24hr?type=MINI';
+async function fetchScreenerTickers() {
+  let rows = null;
+  if (liquidSymbols.length && Date.now() - liquidAt < 900000) {
+    rows = await safeFetch(`${TICKER_URL}&symbols=${encodeURIComponent(JSON.stringify(liquidSymbols))}`, 4500).catch(() => null);
+  }
+  if (!Array.isArray(rows)) {
+    rows = await safeFetch(TICKER_URL, 6000);
+    if (!Array.isArray(rows)) return null;
+    liquidSymbols = rows.filter((t) => t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) >= 2500000).map((t) => t.symbol);
+    liquidAt = Date.now();
+  }
+  rows.forEach((t) => { const o = parseFloat(t.openPrice); t.priceChangePercent = o > 0 ? ((parseFloat(t.lastPrice) - o) / o) * 100 : 0; });
+  return rows;
+}
+
 async function runDynamicScreener() {
   try {
-    const url = 'https://api.binance.com/api/v3/ticker/24hr';
-    const tickers = await safeFetch(url, 4500);
-    if (!Array.isArray(tickers)) return;
+    const tickers = await fetchScreenerTickers();
+    if (!tickers) return;
 
     await refreshPerpetuals();
     const mode = await refreshMarketMode(tickers);
@@ -776,7 +810,7 @@ async function checkCandlestickSentry(symbol) {
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
     const [k15, k1h] = await Promise.all([
       getCachedKlines(pairSym, '15m', 100, 2500),
-      getCachedKlines(pairSym, '1h', 60, 3500, 20000)
+      getCachedKlines(pairSym, '1h', 60, 3500)
     ]);
     const closed15 = Strategy.closedOnly(k15);
     if (!Array.isArray(closed15) || closed15.length < 30) return none;
@@ -829,7 +863,7 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
 
 async function checkMicrostructureMomentumAndVwap(symbol) {
   try {
-    const klines = await getCachedKlines(symbol, '15m', 16, 2500, 20000);
+    const klines = await getCachedKlines(symbol, '15m', 16, 2500, 45000);
     if (!Array.isArray(klines) || klines.length < 8) {
       return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Fallback pass' };
     }
@@ -906,7 +940,7 @@ async function check1hTrendAlignment(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const klines = await getCachedKlines(pairSym, '1h', 60, 3500, 20000);
+    const klines = await getCachedKlines(pairSym, '1h', 60, 3500, 120000);
 
     if (!Array.isArray(klines) || klines.length < 20) {
       return { passed: true, reason: 'Fallback pass' };
@@ -995,7 +1029,7 @@ async function checkShortOrderFlow(symbol) {
 }
 
 async function checkShortMomentum(symbol) {
-  const k = await getCachedKlines(symbol, '15m', 16, 2500, 20000).catch(() => null);
+  const k = await getCachedKlines(symbol, '15m', 16, 2500, 45000).catch(() => null);
   if (!Array.isArray(k) || k.length < 8) return { passed: false, reason: '15m data unavailable' };
   const [o, h, l, c, v] = k[k.length - 1].slice(1, 6).map(parseFloat);
   const change15mPct = o > 0 ? Number((((c - o) / o) * 100).toFixed(2)) : 0;
@@ -1013,7 +1047,7 @@ async function checkShortMomentum(symbol) {
 }
 
 async function checkShort1hTrend(symbol) {
-  const k = await getCachedKlines(symbol, '1h', 60, 3500, 20000).catch(() => null);
+  const k = await getCachedKlines(symbol, '1h', 60, 3500, 120000).catch(() => null);
   if (!Array.isArray(k) || k.length < 45) return { passed: false, reason: '1h data unavailable' };
   const closes = k.map((b) => parseFloat(b[4])), n = closes.length - 1, c = closes[n];
   const e20 = Strategy.emaSeries(closes, 20), e50 = Strategy.emaSeries(closes, 50);
@@ -1056,26 +1090,26 @@ async function evaluateShortEntries(maxSlots, maxBagsLimit) {
       if (Number(coin.pricePositionInRange ?? 0.3) > 0.50) continue;
 
       const flow = await checkShortOrderFlow(pairKey);
-      if (!flow.passed) { veto(pairKey, 12000, 'FLOW_VETO', flow.reason); continue; }
+      if (!flow.passed) { veto(pairKey, 30000, 'FLOW_VETO', flow.reason); continue; }
       if (Number(coin.priceUSDT || 0) >= 0.50 && rangePct < 4.0 && change24h > -0.60) { veto(pairKey, 30000, 'VOL_VETO', `low volatility (range ${rangePct.toFixed(2)}%).`, 'info'); continue; }
       const mom = await checkShortMomentum(pairKey);
-      if (!mom.passed) { veto(pairKey, 12000, 'MOM_VETO', mom.reason); continue; }
+      if (!mom.passed) { veto(pairKey, 30000, 'MOM_VETO', mom.reason); continue; }
       const trend = await checkShort1hTrend(pairKey);
-      if (!trend.passed) { veto(pairKey, 12000, 'TREND_VETO', trend.reason); continue; }
+      if (!trend.passed) { veto(pairKey, 30000, 'TREND_VETO', trend.reason); continue; }
       const candle = await checkCandlestickSentry(pairKey);
       if (candle.isBullishSignal) { veto(pairKey, 20000, 'CANDLE_VETO', `bullish pattern [${candle.bullSignalName}].`); continue; }
       const breakdown = mom.change15mPct <= -0.80 && mom.rvol >= 1.35 && flow.takerBuyRatio <= 48;
-      if (!candle.isShortEntry && !breakdown) { veto(pairKey, 12000, 'CANDLE_WAIT', `waiting for a completed bearish pattern on 15m (1h trend ${candle.major}) or a breakdown (15m <= -0.80%).`, 'info'); continue; }
+      if (!candle.isShortEntry && !breakdown) { veto(pairKey, 30000, 'CANDLE_WAIT', `waiting for a completed bearish pattern on 15m (1h trend ${candle.major}) or a breakdown (15m <= -0.80%).`, 'info'); continue; }
       const label = candle.isShortEntry ? candle.shortPatternName : 'HIGH_VOL_BREAKDOWN';
 
       const book = await fetchRealOrderBookDepth(pairKey, true);
-      if (!book) { veto(pairKey, 12000, 'BOOK_VETO', 'futures order book unavailable.'); continue; }
-      if (book.obi > 0.55 || book.spreadPct > 0.20) { veto(pairKey, 12000, 'BOOK_VETO', `bid share ${Math.round(book.obi * 100)}% (req <= 55%) or spread ${book.spreadPct.toFixed(2)}%.`); continue; }
+      if (!book) { veto(pairKey, 30000, 'BOOK_VETO', 'futures order book unavailable.'); continue; }
+      if (book.obi > 0.55 || book.spreadPct > 0.20) { veto(pairKey, 30000, 'BOOK_VETO', `bid share ${Math.round(book.obi * 100)}% (req <= 55%) or spread ${book.spreadPct.toFixed(2)}%.`); continue; }
 
       // planEntry only uses the stop distance for sizing, so the distance is passed on the long side of the price.
       const px = book.bestBid, cfg = Strategy.CONFIG;
       let atr = NaN, structPct = cfg.minStopPct;
-      const k15 = await getCachedKlines(pairKey, '15m', 16, 2500, 20000).catch(() => null);
+      const k15 = await getCachedKlines(pairKey, '15m', 16, 2500, 45000).catch(() => null);
       if (Array.isArray(k15) && k15.length >= 15) {
         const bars = Strategy.toBars(k15);
         atr = Strategy.atrPct(bars, 14);
@@ -1084,7 +1118,7 @@ async function evaluateShortEntries(maxSlots, maxBagsLimit) {
       const stopPct = Math.min(cfg.maxStopPct, Math.max(structPct, (atr || 0) * cfg.atrStopMult, cfg.minStopPct));
       const signal = { ok: true, pattern: label, refPrice: px, stopPrice: px * (1 - stopPct / 100), stopPct, atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: mom.rvol };
       const plan = Strategy.planEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT));
-      if (!plan.ok) { veto(pairKey, 12000, 'CASH_GUARD', plan.reason); continue; }
+      if (!plan.ok) { veto(pairKey, 30000, 'CASH_GUARD', plan.reason); continue; }
       const minN = perpetuals.get(pairKey)?.minNotional || 5;
       if (plan.notional < minN) { veto(pairKey, 300000, 'CASH_GUARD', `Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
       logOperation('BOOK_CLEAR', `${pairKey} short confirmed [${label}]: bid share ${Math.round(book.obi * 100)}%, spread ${book.spreadPct.toFixed(2)}%, taker buy ${flow.takerBuyRatio}%. Entering...`, 'success');
@@ -1101,7 +1135,7 @@ async function buildEntrySignal(pairKey, price, pattern, microMom) {
   const cfg = Strategy.CONFIG;
   let atr = NaN, structPct = cfg.minStopPct;
   try {
-    const k = await getCachedKlines(pairKey, '15m', 16, 2500, 20000);
+    const k = await getCachedKlines(pairKey, '15m', 16, 2500, 45000);
     if (Array.isArray(k) && k.length >= 15) {
       const bars = Strategy.toBars(k);
       atr = Strategy.atrPct(bars, 14);
@@ -1198,7 +1232,7 @@ async function evaluateAutopilotEntries() {
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
         const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
         if (pdCheck.isTrap) {
-          candidateCooldownMemo.set(pairKey, now + 120000);
+          candidateCooldownMemo.set(pairKey, now + 300000);
           logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pdCheck.reason}`, 'danger');
           continue;
         }
@@ -1206,7 +1240,7 @@ async function evaluateAutopilotEntries() {
 
       const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
       if (!orderFlow.passed) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
+        candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('FLOW_VETO', `${pairKey} halted: ${orderFlow.reason || 'Negative Taker CVD'}`, 'warning');
         continue;
       }
@@ -1220,14 +1254,14 @@ async function evaluateAutopilotEntries() {
 
       const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
       if (!microMom.passed) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
+        candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('MOM_VETO', `${pairKey} halted: ${microMom.reason}`, 'warning');
         continue;
       }
 
       const trend1h = await check1hTrendAlignment(pairKey);
       if (!trend1h.passed) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
+        candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('TREND_VETO', `${pairKey} halted: ${trend1h.reason}`, 'warning');
         continue;
       }
@@ -1242,7 +1276,7 @@ async function evaluateAutopilotEntries() {
       const isConfirmedPatternEntry = candleCheck.isBullishEntry;
       const isAuthenticIgnition = (microMom.change15mPct >= 0.80 && microMom.rvol >= 1.35 && orderFlow.takerBuyRatio >= 52.0);
       if (!isConfirmedPatternEntry && !isAuthenticIgnition) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
+        candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting a completed Nison pattern on 15m (1h trend ${candleCheck.major}) or Ignition (15m >= +0.80%).`, 'info');
         continue;
       }
@@ -1256,7 +1290,7 @@ async function evaluateAutopilotEntries() {
         book = { obi: Number(coin.obi || 0.55), spreadPct: 0.05, bestBid: px, bestAsk: px * 1.0005 };
       }
       if (book.obi < 0.45 || book.spreadPct > 0.20) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
+        candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('BOOK_VETO', `${pairKey} halted: OBI ${Math.round(book.obi * 100)}% (req >= 45%) or Spread ${book.spreadPct.toFixed(2)}% (req <= 0.20%).`, 'warning');
         continue;
       }
@@ -1267,7 +1301,7 @@ async function evaluateAutopilotEntries() {
       const signal = await buildEntrySignal(pairKey, book.bestAsk, patternLabel, microMom);
       const plan = Strategy.planEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT));
       if (!plan.ok) {
-        candidateCooldownMemo.set(pairKey, now + 12000);
+        candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('CASH_GUARD', `${pairKey}: ${plan.reason}`, 'warning');
         continue;
       }
@@ -1331,7 +1365,7 @@ function demoteToBag(k, pos, price, reason) {
 
 async function livePriceFor(k, pos) {
   const tickPrice = Number(pos.livePriceUSDT || State.universe[k]?.priceUSDT);
-  if (tickPrice > 0 && Date.now() - Number(pos.lastTickAt || 0) < 90000) return tickPrice;
+  if (tickPrice > 0 && Date.now() - Number(pos.lastTickAt || 0) < 20000) return tickPrice;
   // Stream went quiet for this symbol: never manage risk on a stale price.
   const rest = (isShort(pos) && await fetchFuturesPrice(k)) || await fetchTickerPrice(k);
   if (rest) {
@@ -1340,6 +1374,45 @@ async function livePriceFor(k, pos) {
     return rest;
   }
   return tickPrice > 0 ? tickPrice : null;
+}
+
+// Exit signals need candle data, so they are refreshed here and the sentry only reads them.
+// A slow Binance reply can then never hold up a price tick.
+const exitSignals = new Map();
+let signalsBusy = false;
+async function refreshExitSignals() {
+  if (signalsBusy) return;
+  signalsBusy = true;
+  try {
+    for (const k of Object.keys(State.activePositions || {})) {
+      const pos = State.activePositions[k];
+      const entry = Number(pos.entryPriceUSDT), live = Number(pos.livePriceUSDT) || entry, short = isShort(pos);
+      const gainPct = (short ? entry - live : live - entry) / entry * 100;
+      const held = (Date.now() - Number(pos.openedAt || Date.now())) / 60000;
+      const R = Strategy.EXIT_RULES;
+      const s = {};
+      if (gainPct >= R.floorPct - 0.10) {
+        const candle = await checkCandlestickSentry(k);
+        const flow = await checkSelfAwareOrderFlow(k);
+        if (short ? candle.isBullishSignal : candle.isBearishReversal) s.bearishPattern = short ? candle.bullSignalName : candle.bearishPatternName;
+        s.peakExhausted = short ? flow.isBottomExhausted : flow.isApexExhausted;
+      } else if (held >= R.softDemoteMinutes && gainPct <= R.softDemotePct + 0.10) {
+        const flow = await checkSelfAwareOrderFlow(k);
+        s.upsideDead = short ? flow.isDownsideDead : flow.isUpsideDead;
+      }
+      exitSignals.set(k, s);
+    }
+    [...exitSignals.keys()].forEach((k) => { if (!State.activePositions[k]) exitSignals.delete(k); });
+  } finally { signalsBusy = false; }
+}
+
+// Ticks arriving during a pass are not dropped: one more pass runs with the newest price.
+let sentryPending = false;
+function kickSentry() {
+  if (sentryBusy) { sentryPending = true; return; }
+  runPredictiveSentry().catch((e) => console.error('[Sentry Error]', e.message)).finally(() => {
+    if (sentryPending) { sentryPending = false; setImmediate(kickSentry); }
+  });
 }
 
 async function runPredictiveSentry() {
@@ -1363,16 +1436,10 @@ async function runPredictiveSentry() {
       }
       const gainPct = (short ? entry - price : price - entry) / entry * 100;
       const held = (Date.now() - Number(pos.openedAt || Date.now())) / 60000;
-      const signals = {};
-      if (gainPct >= Strategy.EXIT_RULES.floorPct) {
-        const candle = await checkCandlestickSentry(k);
-        const flow = await checkSelfAwareOrderFlow(k);
-        if (short ? candle.isBullishSignal : candle.isBearishReversal) signals.bearishPattern = short ? candle.bullSignalName : candle.bearishPatternName;
-        signals.peakExhausted = short ? flow.isBottomExhausted : flow.isApexExhausted;
-      } else if (held >= Strategy.EXIT_RULES.softDemoteMinutes && gainPct <= Strategy.EXIT_RULES.softDemotePct) {
-        const flow = await checkSelfAwareOrderFlow(k);
-        signals.upsideDead = short ? flow.isDownsideDead : flow.isUpsideDead;
-      }
+      const cached = exitSignals.get(k) || {};
+      // Harvest signals count only in profit, the dead-flow signal only in the soft-demote window.
+      const signals = gainPct >= Strategy.EXIT_RULES.floorPct ? { bearishPattern: cached.bearishPattern, peakExhausted: cached.peakExhausted }
+        : (held >= Strategy.EXIT_RULES.softDemoteMinutes && gainPct <= Strategy.EXIT_RULES.softDemotePct ? { upsideDead: cached.upsideDead } : {});
 
       const prevStage = pos.ratchetStage;
       const r = short ? Strategy.manageShort(pos, price, signals) : Strategy.manageNoLoss(pos, price, signals);
@@ -1380,15 +1447,23 @@ async function runPredictiveSentry() {
         logOperation('SENTRY', `${pos.pair}: +0.35% minimum exit locked ($${formatPrecisePrice(pos.sl)}).`, 'success');
       }
 
+      // The trigger comes from the last trade; the fill must be what the book really pays.
+      let fill = price;
+      if (r.action === 'EXIT' || r.action === 'PARTIAL') {
+        fill = (await executableExitPrice(k, pos)) || price;
+        const fillGain = (short ? entry - fill : fill - entry) / entry * 100;
+        if (fillGain < Strategy.EXIT_RULES.floorPct) continue;
+      }
+
       if (r.action === 'PARTIAL') {
         const sellValue = Number(pos.qty) * price * r.fraction;
         if (sellValue < Strategy.EXIT_RULES.minPartialUSDT) {
           logOperation('SENTRY', `${pos.pair}: +1.80% reached. Position too small to split, trailing all of it.`, 'success');
         } else {
-          realizeExit('activePositions', k, r.fraction, price, r.reason, '50% banked at +1.80%, runner trails');
+          realizeExit('activePositions', k, r.fraction, fill, r.reason, '50% banked at +1.80%, runner trails');
         }
       } else if (r.action === 'EXIT') {
-        realizeExit('activePositions', k, 1, price, r.reason, `${r.reason} @ $${formatPrecisePrice(price)} (peak +${(pos.peakGainPct || 0).toFixed(2)}%)`);
+        realizeExit('activePositions', k, 1, fill, r.reason, `${r.reason} @ $${formatPrecisePrice(fill)} (peak +${(pos.peakGainPct || 0).toFixed(2)}%)`);
       } else if (r.action === 'DEMOTE') {
         demoteToBag(k, pos, price, r.reason);
       }
@@ -1406,7 +1481,11 @@ async function runPredictiveSentry() {
         continue;
       }
       const r = isShort(bag) ? Strategy.manageShortBag(bag, price) : Strategy.manageBag(bag, price);
-      if (r.action === 'EXIT') realizeExit('recoveryBags', k, 1, price, r.reason, `Recovery bag closed at +0.30% or better @ $${formatPrecisePrice(price)}`);
+      if (r.action === 'EXIT') {
+        const fill = (await executableExitPrice(k, bag)) || price;
+        const check = isShort(bag) ? Strategy.manageShortBag(bag, fill) : Strategy.manageBag(bag, fill);
+        if (check.action === 'EXIT') realizeExit('recoveryBags', k, 1, fill, r.reason, `Recovery bag closed at +0.30% or better @ $${formatPrecisePrice(fill)}`);
+      }
     }
   } finally {
     sentryBusy = false;
@@ -1881,7 +1960,8 @@ app.post('/api/positions/close', async (req, res) => {
   if (!pos) return res.status(404).json({ success: false, error: 'Position not found' });
   const price = await livePriceFor(pairKey, pos);
   if (!price) return res.status(503).json({ success: false, error: 'No live price available' });
-  const trade = realizeExit('activePositions', pairKey, 1, price, 'MANUAL EXIT', `Manual close at $${formatPrecisePrice(price)}`);
+  const fill = (await executableExitPrice(pairKey, pos)) || price;
+  const trade = realizeExit('activePositions', pairKey, 1, fill, 'MANUAL EXIT', `Manual close at $${formatPrecisePrice(fill)}`);
   res.json({ success: Boolean(trade), trade });
 });
 
@@ -1892,7 +1972,8 @@ app.post('/api/bags/close', async (req, res) => {
   if (!bag) return res.status(404).json({ success: false, error: 'Bag not found' });
   const price = await livePriceFor(pairKey, bag);
   if (!price) return res.status(503).json({ success: false, error: 'No live price available' });
-  const trade = realizeExit('recoveryBags', pairKey, 1, price, 'BAG MANUAL EXIT', `Manual bag close at $${formatPrecisePrice(price)}`);
+  const fill = (await executableExitPrice(pairKey, bag)) || price;
+  const trade = realizeExit('recoveryBags', pairKey, 1, fill, 'BAG MANUAL EXIT', `Manual bag close at $${formatPrecisePrice(fill)}`);
   res.json({ success: Boolean(trade), trade });
 });
 
@@ -1923,7 +2004,6 @@ const sendAll = (msg) => wss.clients.forEach((c) => { if (c.readyState === WebSo
 // lastTickAt changes every tick but the app never reads it; leaving it out lets
 // unchanged price frames be skipped instead of re-sent.
 const omitTickStamps = (key, value) => (key === 'lastTickAt' ? undefined : value);
-let lastPriceFrame = '';
 
 // withUniverse: only the screener changes the radar list, so only it re-sends it.
 function broadcastStateUpdate({ withUniverse = false } = {}) {
@@ -1940,26 +2020,30 @@ function broadcastStateUpdate({ withUniverse = false } = {}) {
   };
   if (withUniverse) payload.universe = State.universe;
   sendAll(JSON.stringify(payload, omitTickStamps));
-  lastPriceFrame = ''; // positions may have changed shape; let the next price frame through
+  lastDetailSig = JSON.stringify({ ...State.activePositions, ...State.recoveryBags }, omitLive); // this frame already carried them
+  lastSentPrices = Object.fromEntries(Object.entries({ ...State.activePositions, ...State.recoveryBags }).map(([k, p]) => [k, p.livePriceUSDT]));
 }
 
-// Still every 500 ms (low-latency display), but only the held coins' prices, and only
-// when something actually changed since the last frame.
+// Every 250 ms the app gets only the prices that moved (about 60 bytes). Position details such
+// as trail levels change far less often, so they go at most every 2 seconds, and only if changed.
+let lastSentPrices = {};
+let lastDetailSig = '';
+let lastDetailAt = 0;
+const omitLive = (key, value) => (key === 'lastTickAt' || key === 'livePriceUSDT' ? undefined : value);
 function broadcastPriceStream() {
   if (!hasClients()) return;
-  const prices = {};
-  [...Object.keys(State.activePositions || {}), ...Object.keys(State.recoveryBags || {})].forEach((k) => {
-    if (State.universe[k]) prices[k] = State.universe[k].priceUSDT;
-  });
-  const msg = JSON.stringify({
-    type: 'PRICE_STREAM',
-    prices,
-    activePositions: State.activePositions,
-    recoveryBags: State.recoveryBags
-  }, omitTickStamps);
-  if (msg === lastPriceFrame) return;
-  lastPriceFrame = msg;
-  sendAll(msg);
+  const held = { ...State.activePositions, ...State.recoveryBags };
+  const sig = JSON.stringify(held, omitLive);
+  if (sig !== lastDetailSig && Date.now() - lastDetailAt >= 2000) {
+    lastDetailSig = sig;
+    lastDetailAt = Date.now();
+    lastSentPrices = Object.fromEntries(Object.entries(held).map(([k, p]) => [k, p.livePriceUSDT]));
+    sendAll(JSON.stringify({ type: 'PRICE_STREAM', activePositions: State.activePositions, recoveryBags: State.recoveryBags }, omitTickStamps));
+    return;
+  }
+  const moved = {};
+  Object.entries(held).forEach(([k, p]) => { if (p.livePriceUSDT !== lastSentPrices[k]) moved[k] = lastSentPrices[k] = p.livePriceUSDT; });
+  if (Object.keys(moved).length) sendAll(JSON.stringify({ type: 'P', p: moved }));
 }
 
 // -------------------------------------------------------------
@@ -1967,11 +2051,10 @@ function broadcastPriceStream() {
 // -------------------------------------------------------------
 let binanceGlobalWs = null;
 let subscribedActiveStreams = new Set();
-let isSentryRunning = false;
 
 // Bandwidth: this used to stream !miniTicker@arr (every Binance pair, every second,
 // ~1.2 GB/day) although only held coins need live ticks — radar prices refresh with the
-// screener every minute. Now it subscribes <sym>@miniTicker for held coins only: same
+// screener every minute. Now it subscribes <sym>@aggTrade (every real trade, unlike miniTicker's 1s batches) for held coins only: same
 // 1-second cadence for the coins the sentry manages, ~1% of the data.
 function connectBinanceGlobalStream() {
   const wsEndpoint = 'wss://stream.binance.com:9443/ws';
@@ -1993,8 +2076,8 @@ function connectBinanceGlobalStream() {
     binanceGlobalWs.on('message', (data) => {
       try {
         const parsed = JSON.parse(data);
-        // per-symbol miniTicker events arrive one object at a time; ignore SUBSCRIBE acks
-        const tickers = Array.isArray(parsed) ? parsed : (parsed && parsed.e === '24hrMiniTicker' ? [parsed] : null);
+        // trades arrive one object at a time; ignore SUBSCRIBE acks
+        const tickers = parsed && parsed.e === 'aggTrade' ? [{ s: parsed.s, c: parsed.p }] : null;
         if (!tickers) return;
 
         const rate = Number(State.usdtToInrRate) || 94.94;
@@ -2025,12 +2108,7 @@ function connectBinanceGlobalStream() {
           }
         });
 
-        if (activePriceChanged && !isSentryRunning) {
-          isSentryRunning = true;
-          runPredictiveSentry().finally(() => {
-            isSentryRunning = false;
-          });
-        }
+        if (activePriceChanged) kickSentry();
       } catch (err) {}
     });
 
@@ -2052,7 +2130,7 @@ let futuresStreams = new Set();
 const heldShorts = () => [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isShort(p)).map(([k]) => k);
 
 function syncFuturesStream() {
-  const wanted = new Set(heldShorts().map((s) => `${s.toLowerCase()}@miniTicker`));
+  const wanted = new Set(heldShorts().map((s) => `${s.toLowerCase()}@aggTrade`));
   if (!wanted.size) {
     if (futuresWs) { const w = futuresWs; futuresWs = null; futuresStreams = new Set(); try { w.terminate(); } catch (e) {} }
     return;
@@ -2065,14 +2143,14 @@ function syncFuturesStream() {
     w.on('message', (data) => {
       try {
         const t = JSON.parse(data);
-        if (!t || t.e !== '24hrMiniTicker') return;
-        const price = parseFloat(t.c);
+        if (!t || t.e !== 'aggTrade') return;
+        const price = parseFloat(t.p);
         if (!(price > 0)) return;
         let changed = false;
         [State.activePositions[t.s], State.recoveryBags[t.s]].forEach((p) => {
           if (isShort(p)) { p.livePriceUSDT = price; p.lastTickAt = Date.now(); changed = true; }
         });
-        if (changed && !isSentryRunning) { isSentryRunning = true; runPredictiveSentry().finally(() => { isSentryRunning = false; }); }
+        if (changed) kickSentry();
       } catch (e) {}
     });
     w.on('error', (e) => console.warn('[Futures Stream Error]', e.message));
@@ -2094,7 +2172,7 @@ function syncActiveSymbolSubscriptions() {
     ...Object.keys(State.recoveryBags || {}).filter((k) => !isShort(State.recoveryBags[k]))
   ]);
 
-  const wanted = new Set([...currentSymbols].map((sym) => `${sym.toLowerCase()}@miniTicker`));
+  const wanted = new Set([...currentSymbols].map((sym) => `${sym.toLowerCase()}@aggTrade`));
   const newStreams = [...wanted].filter((s) => !subscribedActiveStreams.has(s));
   const oldStreams = [...subscribedActiveStreams].filter((s) => !wanted.has(s));
 
@@ -2174,9 +2252,10 @@ server.listen(PORT, '0.0.0.0', () => {
   connectBinanceGlobalStream();
 });
 
+// The engine writes its own trades, so this only picks up edits made in the sheet.
 setInterval(() => {
   syncTradesFromGoogleSheets().catch(() => {});
-}, 120000);
+}, 600000);
 
 setInterval(async () => {
   try {
@@ -2189,5 +2268,6 @@ setInterval(async () => {
 }, 1000);
 
 setInterval(() => { settleFunding().catch((e) => console.error('[Funding]', e.message)); }, 60000);
-setInterval(broadcastPriceStream, 500);
+setInterval(broadcastPriceStream, 250);
+setInterval(() => { refreshExitSignals().catch(() => {}); }, 3000);
 setInterval(runDynamicScreener, 60000);
