@@ -637,7 +637,7 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
 }
 
 // -------------------------------------------------------------
-// AUTOPILOT ENTRY EVALUATOR (v5: closed candles, fail-closed, risk-sized)
+// AUTOPILOT ENTRY EVALUATOR (shared state)
 // -------------------------------------------------------------
 let isEvaluatingEntries = false;
 const noticeTimes = {};
@@ -649,129 +649,419 @@ function throttledNotice(key, category, message, level = 'info', everyMs = 60000
   logOperation(category, message, level);
 }
 
-function vetoCategory(reason) {
-  const r = String(reason);
-  if (r.includes('bearish')) return 'CANDLE_VETO';
-  if (r.includes('no closed-bar trigger')) return 'CANDLE_WAIT';
-  if (r.includes('ATR') || r.includes('stop')) return 'VOL_VETO';
-  if (r.includes('EMA') || r.includes('uptrend') || r.includes('overextended')) return 'TREND_VETO';
-  return 'MOM_VETO';
+// -------------------------------------------------------------
+// AUTOPILOT ENTRY GATES (restored from v4 — see autopilot_engine_complete_logic_specification.md)
+// -------------------------------------------------------------
+async function checkCandlestickSentry(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+
+    const klines5m = await getCachedKlines(pairSym, '5m', 8, 2500, 20000);
+    const klines15m = await getCachedKlines(pairSym, '15m', 8, 2500, 20000);
+
+    const pat5m = Strategy.analyzeCandlestickPatternLegacy(klines5m);
+    const pat15m = Strategy.analyzeCandlestickPatternLegacy(klines15m);
+
+    const isBearish = pat5m.isBearishReversal || pat15m.isBearishReversal;
+    const isBullish = pat5m.isBullishReversal || pat15m.isBullishReversal;
+    const isBullishEntry = pat15m.isBullishEntry || pat5m.isBullishEntry;
+
+    const activeBullishPattern = pat15m.bullishPatternName !== 'NONE' 
+      ? `${pat15m.bullishPatternName} (15m)` 
+      : (pat5m.bullishPatternName !== 'NONE' ? `${pat5m.bullishPatternName} (5m)` : 'NONE');
+
+    const activeBearishPattern = pat15m.bearishPatternName !== 'NONE' 
+      ? `${pat15m.bearishPatternName} (15m)` 
+      : (pat5m.bearishPatternName !== 'NONE' ? `${pat5m.bearishPatternName} (5m)` : 'NONE');
+
+    const activePattern = activeBearishPattern !== 'NONE' ? activeBearishPattern : activeBullishPattern;
+
+    if (activePattern !== 'NONE') {
+      State.subsystems.candlestickSentry.lastPatternDetected = `${pairSym}: ${activePattern}`;
+    }
+
+    return {
+      isBearishReversal: isBearish,
+      isBullishReversal: isBullish,
+      isBullishEntry: isBullishEntry,
+      bullishPatternName: activeBullishPattern,
+      bearishPatternName: activeBearishPattern,
+      patternName: activePattern,
+      confidence: Math.max(pat5m.confidence, pat15m.confidence),
+      patternRvol: Math.max(pat5m.patternRvol || 1.0, pat15m.patternRvol || 1.0)
+    };
+  } catch (e) {
+    return { 
+      isBearishReversal: false, 
+      isBullishReversal: false, 
+      isBullishEntry: false, 
+      bullishPatternName: 'NONE', 
+      bearishPatternName: 'NONE', 
+      patternName: 'NONE', 
+      confidence: 0,
+      patternRvol: 1.0
+    };
+  }
+}
+
+async function checkVeteranOrderFlowAndVSA(symbol) {
+  try {
+    const klines = await getCachedKlines(symbol, '5m', 8, 2500, 20000);
+    if (!Array.isArray(klines) || klines.length < 3) {
+      return { passed: true, takerBuyRatio: 52, reason: 'Fallback pass' };
+    }
+
+    let totalVol = 0;
+    let takerBuyVol = 0;
+    for (let i = klines.length - 3; i < klines.length; i++) {
+      totalVol += parseFloat(klines[i][5]);
+      takerBuyVol += parseFloat(klines[i][9]);
+    }
+
+    const takerBuyRatio = totalVol > 0 ? Number(((takerBuyVol / totalVol) * 100).toFixed(1)) : 50;
+    const curBar = klines[klines.length - 1];
+    const open = parseFloat(curBar[1]);
+    const high = parseFloat(curBar[2]);
+    const low = parseFloat(curBar[3]);
+    const close = parseFloat(curBar[4]);
+    const range = high - low;
+    const clv = range > 0 ? (close - low) / range : 0.5;
+
+    if (takerBuyRatio < 46.0 && clv < 0.35) {
+      return { passed: false, takerBuyRatio, reason: `Seller Absorption: Taker Buy ${takerBuyRatio}% (<46%) & CLV ${(clv*100).toFixed(0)}%` };
+    }
+
+    return { passed: true, takerBuyRatio, clv: Number(clv.toFixed(2)) };
+  } catch (e) {
+    return { passed: true, takerBuyRatio: 52, reason: 'Error fallback' };
+  }
+}
+
+async function checkMicrostructureMomentumAndVwap(symbol) {
+  try {
+    const klines = await getCachedKlines(symbol, '15m', 16, 2500, 20000);
+    if (!Array.isArray(klines) || klines.length < 8) {
+      return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Fallback pass' };
+    }
+
+    const curBar = klines[klines.length - 1];
+    const curOpen = parseFloat(curBar[1]);
+    const curHigh = parseFloat(curBar[2]);
+    const curLow = parseFloat(curBar[3]);
+    const curClose = parseFloat(curBar[4]);
+    const curVol = parseFloat(curBar[5]);
+
+    const change15mPct = curOpen > 0 ? Number((((curClose - curOpen) / curOpen) * 100).toFixed(2)) : 0;
+    const range = curHigh - curLow;
+    const upperWickRatio = range > 0 ? (curHigh - Math.max(curOpen, curClose)) / range : 0;
+
+    // Upper Rejection Shadow Ceiling (<= 30%)
+    if (upperWickRatio > 0.30 && range > 0) {
+      return { passed: false, reason: `Upper rejection shadow too high (${(upperWickRatio * 100).toFixed(0)}% > 30%)` };
+    }
+
+    // Rolling 4h VWAP calculation
+    let volSum = 0;
+    let vwapSum = 0;
+    for (let i = Math.max(0, klines.length - 16); i < klines.length; i++) {
+      const h = parseFloat(klines[i][2]);
+      const l = parseFloat(klines[i][3]);
+      const c = parseFloat(klines[i][4]);
+      const v = parseFloat(klines[i][5]);
+      vwapSum += (((h + l + c) / 3) * v);
+      volSum += v;
+    }
+    const vwap4h = volSum > 0 ? (vwapSum / volSum) : curClose;
+
+    // Strict Zero-Tolerance VWAP Support: Price MUST be >= VWAP
+    if (curClose < vwap4h) {
+      return { passed: false, reason: `Below 15m/4h VWAP ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(vwap4h)})` };
+    }
+
+    // Relative Volume (RVOL)
+    let priorVolSum = 0;
+    for (let i = Math.max(0, klines.length - 10); i < klines.length - 1; i++) {
+      priorVolSum += parseFloat(klines[i][5]);
+    }
+    const avgVol = priorVolSum / 9;
+    const rvol = avgVol > 0 ? Number((curVol / avgVol).toFixed(2)) : 1.0;
+
+    // 2-Hour Base Ceiling Distance Gate (<= 2.50%)
+    let highPriorBase = 0;
+    for (let i = Math.max(0, klines.length - 9); i < klines.length - 1; i++) {
+      const h = parseFloat(klines[i][2]);
+      if (h > highPriorBase) highPriorBase = h;
+    }
+    const distFromBaseHighPct = highPriorBase > 0 ? ((highPriorBase - curClose) / highPriorBase) * 100 : 0;
+    if (distFromBaseHighPct > 2.50) {
+      return {
+        passed: false,
+        reason: `Mid-range chop: Price is -${distFromBaseHighPct.toFixed(2)}% below 2h base ceiling ($${formatPrecisePrice(highPriorBase)}). Max allowed 2.50%.`
+      };
+    }
+
+    return {
+      passed: true,
+      change15mPct,
+      rvol,
+      vwap4h: Number(vwap4h.toFixed(6)),
+      upperWickRatio: Number(upperWickRatio.toFixed(2))
+    };
+  } catch (e) {
+    return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Error fallback' };
+  }
+}
+
+async function check1hTrendAlignment(symbol) {
+  try {
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
+    const klines = await getCachedKlines(pairSym, '1h', 60, 3500, 20000);
+
+    if (!Array.isArray(klines) || klines.length < 20) {
+      return { passed: true, reason: 'Fallback pass' };
+    }
+    const curClose = parseFloat(klines[klines.length - 1][4]);
+    
+    // EMA 20
+    const k20 = 2 / (20 + 1);
+    let ema20 = parseFloat(klines[0][4]);
+    let emaPrev2 = ema20;
+    for (let i = 1; i < klines.length; i++) {
+      const c = parseFloat(klines[i][4]);
+      ema20 = (c * k20) + (ema20 * (1 - k20));
+      if (i === klines.length - 3) {
+        emaPrev2 = ema20;
+      }
+    }
+
+    // EMA 50 (evaluated across up to 60 bars)
+    let ema50 = null;
+    if (klines.length >= 45) {
+      const k50 = 2 / (50 + 1);
+      ema50 = parseFloat(klines[0][4]);
+      for (let i = 1; i < klines.length; i++) {
+        const c = parseFloat(klines[i][4]);
+        ema50 = (c * k50) + (ema50 * (1 - k50));
+      }
+    }
+    
+    // Strict Zero-Tolerance 1h 20-EMA Floor (Price MUST be on or above EMA20)
+    if (curClose < (ema20 * 0.9985)) {
+      return { passed: false, reason: `Price below 1h 20-EMA ($${formatPrecisePrice(curClose)} < $${formatPrecisePrice(ema20)})` };
+    }
+
+    // 1h Dual-EMA Bullish Stack Gate:
+    // Rejects candidates trading in an entrenched macro bear channel where EMA20 is deep below EMA50 (> 1.20%)
+    if (ema50 && ema20 < (ema50 * 0.988)) {
+      return { 
+        passed: false, 
+        reason: `Macro Bear Stack: 1h 20-EMA ($${formatPrecisePrice(ema20)}) is -${(((ema50 - ema20) / ema50) * 100).toFixed(2)}% below 50-EMA ($${formatPrecisePrice(ema50)}). Downward bear channel.` 
+      };
+    }
+
+    // Decoupled 1h EMA Slope Gate:
+    // Only veto if 1h 20-EMA is in severe macro downtrend (< 0.9970) to prevent lagging 20h vetoes on fresh turnarounds
+    if (ema20 < (emaPrev2 * 0.9970)) {
+      return { 
+        passed: false, 
+        reason: `1h 20-EMA slope is declining sharply ($${formatPrecisePrice(ema20)} < $${formatPrecisePrice(emaPrev2)}). Macro bear flag.` 
+      };
+    }
+
+    // 1h 20-EMA Extension Shield (Prevents FOMO into overextended 2nd/3rd wave impulses)
+    const distAboveEmaPct = ema20 > 0 ? ((curClose - ema20) / ema20) * 100 : 0;
+    if (distAboveEmaPct > 5.50) {
+      return { 
+        passed: false, 
+        reason: `Overextended above 1h 20-EMA (+${distAboveEmaPct.toFixed(2)}% > 5.50%). Awaiting base consolidation.` 
+      };
+    }
+
+    return { 
+      passed: true, 
+      ema1h: Number(ema20.toFixed(4)), 
+      ema50: ema50 ? Number(ema50.toFixed(4)) : null,
+      distAboveEmaPct: Number(distAboveEmaPct.toFixed(2)) 
+    };
+  } catch (err) {
+    return { passed: true, reason: 'Error fallback' };
+  }
+}
+
+// A v4-approved entry still needs a real stop for the position sentry: below the 3-bar swing low,
+// at least 1.2 x ATR, clamped to 0.6%..1.5%. Clamped, never rejected: sizing must not add a gate.
+async function buildEntrySignal(pairKey, price, pattern, microMom) {
+  const cfg = Strategy.CONFIG;
+  let atr = NaN, structPct = cfg.minStopPct;
+  try {
+    const k = await getCachedKlines(pairKey, '15m', 16, 2500, 20000);
+    if (Array.isArray(k) && k.length >= 15) {
+      const bars = Strategy.toBars(k);
+      atr = Strategy.atrPct(bars, 14);
+      structPct = ((price - Math.min(...bars.slice(-3).map((b) => b.l))) / price) * 100 + cfg.stopBufferPct;
+    }
+  } catch (e) {}
+  const stopPct = Math.min(cfg.maxStopPct, Math.max(structPct, (atr || 0) * cfg.atrStopMult, cfg.minStopPct));
+  return { ok: true, pattern, refPrice: price, stopPrice: price * (1 - stopPct / 100), stopPct,
+    atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: microMom.rvol };
 }
 
 async function evaluateAutopilotEntries() {
   if (!State.autopilotEnabled || isEvaluatingEntries) return;
-  const cfg = Strategy.CONFIG;
 
-  const openCount = Object.keys(State.activePositions || {}).length;
-  if (openCount >= cfg.maxConcurrent) {
-    throttledNotice('slots', 'AUTOPILOT', `All ${cfg.maxConcurrent} slots in use. Managing open positions.`);
+  const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 3;
+  const currentCount = Object.keys(State.activePositions || {}).length;
+  if (currentCount >= maxSlots) {
+    throttledNotice('slots', 'AUTOPILOT', `All ${maxSlots} breakout slots occupied (${currentCount}/${maxSlots}). Monitoring trailing sentry.`, 'info', 30000);
     return;
   }
 
+  const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
+  const maxBagsLimit = State.tradeFrequencyController?.maxRecoveryBagsLimit || 5;
+  if (activeBagsCount >= maxBagsLimit) {
+    throttledNotice('bags', 'AUTOPILOT', `Max recovery bags active (${activeBagsCount}/${maxBagsLimit}). Awaiting relief recoveries before opening fresh trades.`, 'warning', 30000);
+    return;
+  }
+
+  // The spec has no daily-loss / losing-streak stop, so this is status display only.
   const equity = computeEquity();
   const guard = Strategy.portfolioGuard(State.tradeLogs, equity);
   State.subsystems.riskGuard = {
-    status: guard.ok ? 'ARMED' : 'TRADING PAUSED',
-    reason: guard.ok ? `Day P&L ${guard.dayPnl >= 0 ? '+' : ''}$${(guard.dayPnl || 0).toFixed(2)}` : guard.reason,
+    status: 'ARMED',
+    reason: guard.ok ? `Day P&L ${guard.dayPnl >= 0 ? '+' : ''}$${(guard.dayPnl || 0).toFixed(2)}` : `Not enforced: ${guard.reason}`,
     equityUSDT: Number(equity.toFixed(2)),
-    riskPerTradePct: cfg.riskPerTradePct,
-    dailyLossLimitPct: cfg.dailyLossLimitPct
+    riskPerTradePct: Strategy.CONFIG.riskPerTradePct,
+    dailyLossLimitPct: Strategy.CONFIG.dailyLossLimitPct
   };
-  if (!guard.ok) {
-    throttledNotice('guard', 'CASH_GUARD', guard.reason, 'danger', 300000);
+
+  const btc = await refreshBtcRegime();
+  if (!btc.ok) {
+    throttledNotice('btc', 'BTC_WEATHER', `Entries paused: ${State.subsystems.btcMacroGate.reason}`, 'warning', 30000);
     return;
   }
 
+  if (learningEngine.recalculateDynamicHurdles) learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
+
+  const minScore = State.activeThresholds?.scoreThreshold || 65;
+  const keys = Object.keys(State.universe || {});
+  if (keys.length === 0) return;
+  const sorted = [...keys].sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
+
   isEvaluatingEntries = true;
   try {
-    const btc = await refreshBtcRegime();
-    if (!btc.ok) {
-      throttledNotice('btc', 'BTC_WEATHER', `Entries paused: ${btc.reason}`, 'warning');
-      return;
-    }
-
-    const minScore = State.activeThresholds?.scoreThreshold || 65;
+    let evaluatedCount = 0;
     const now = Date.now();
-    const sorted = Object.keys(State.universe || {})
-      .sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
 
-    let evaluated = 0;
     for (const k of sorted) {
-      if (Object.keys(State.activePositions).length >= cfg.maxConcurrent) break;
+      if (Object.keys(State.activePositions || {}).length >= maxSlots) break;
+      if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
       const coin = State.universe[k];
-      if (!coin || !coin.symbol || coin.isPumpAndDump) continue;
+      if (!coin || !coin.symbol) continue;
+
+      if (coin.isPumpAndDump) continue;
       if ((coin.score || 0) < minScore) break;
 
-      const pairKey = `${String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '')}USDT`;
-      if (pairKey === 'BTCUSDT') continue;
+      const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
+      const pairKey = `${baseSym}USDT`;
+
+      const blockedDerivatives = ['SOXLB', 'SNDKB', 'TSLAB', 'AAPLB', 'NVDB', 'MSFTB', 'AMZNB', 'SPYB', 'QQQB'];
+      if (blockedDerivatives.some(d => pairKey.startsWith(d))) continue;
+      if (Number(coin.priceUSDT || 0) > 350.0 && !['BTCUSDT', 'ETHUSDT'].includes(pairKey)) continue;
       if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
-      if ((candidateCooldownMemo.get(pairKey) || 0) > now) continue;
-      if (Strategy.inSymbolCooldown(State.tradeLogs, `${coin.symbol}/USDT`, now)) continue;
+      if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > now) continue;
 
-      const elig = learningEngine.evaluateCandidateEligibility
-        ? learningEngine.evaluateCandidateEligibility(pairKey)
-        : { allowed: true };
-      if (!elig.allowed) {
-        candidateCooldownMemo.set(pairKey, now + 30 * 60000);
-        throttledNotice(`rep_${pairKey}`, 'TRAP_GUARD', `${pairKey} skipped: ${elig.reason}`, 'warning', 600000);
-        continue;
-      }
+      const nextAllowed = candidateCooldownMemo.get(pairKey) || 0;
+      if (nextAllowed > now) continue;
 
-      if (++evaluated > 6) break; // keep Binance request weight low
-      // A signal is tied to a closed 15m bar, so re-checking a rejected coin
-      // more often than once a minute only burns rate limit.
-      candidateCooldownMemo.set(pairKey, now + 60000);
+      if (++evaluatedCount > 16) break;
 
-      const volQuote = (coin.volumeM || 0) * 1e6;
-      const change24h = Number(coin.change24h || 0);
+      const change24h = Number(coin.priceChangePct || coin.change24h || 0);
       const rangePct = Number(coin.intradayRangePct || 0);
-      if (change24h > 20) {
-        throttledNotice(`chase_${pairKey}`, 'TRAP_GUARD', `${pairKey} skipped: already +${change24h.toFixed(1)}% in 24h (late-stage pump).`, 'warning', 600000);
-        continue;
-      }
+      if (change24h < 0.20 && rangePct < 3.0) continue;
+
+      const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
+      if (posInRange < 0.50) continue;
+
+      const volQuote = (coin.volumeM || 0) * 1000000;
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
-        const pd = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
-        if (pd.isTrap) {
-          candidateCooldownMemo.set(pairKey, now + 30 * 60000);
-          logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pd.reason}`, 'danger');
+        const pdCheck = await checkDormantPumpAndDumpTrap(pairKey, volQuote, change24h, rangePct);
+        if (pdCheck.isTrap) {
+          candidateCooldownMemo.set(pairKey, now + 120000);
+          logOperation('TRAP_GUARD', `Avoided trap on ${pairKey}: ${pdCheck.reason}`, 'danger');
           continue;
         }
       }
 
-      const [k15, k1h] = await Promise.all([
-        getKlinesStrict(pairKey, '15m', 100),
-        getKlinesStrict(pairKey, '1h', 100)
-      ]);
-      if (!k15 || !k1h) continue; // fail closed
-
-      const flow = await checkTakerFlow(pairKey);
-      if (!flow.passed) {
-        throttledNotice(`flow_${pairKey}`, 'FLOW_VETO', `${pairKey}: ${flow.reason}`, 'warning', 300000);
+      const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
+      if (!orderFlow.passed) {
+        candidateCooldownMemo.set(pairKey, now + 12000);
+        logOperation('FLOW_VETO', `${pairKey} halted: ${orderFlow.reason || 'Negative Taker CVD'}`, 'warning');
         continue;
       }
 
-      const signal = Strategy.evaluateEntry({ k15, k1h, k5: flow.k5 });
-      if (!signal.ok) {
-        throttledNotice(`sig_${pairKey}`, vetoCategory(signal.reason), `${pairKey}: ${signal.reason}`, 'info', 300000);
+      const priceUnit = Number(coin.priceUSDT || 0);
+      if (priceUnit >= 0.50 && rangePct < 4.0 && change24h < 0.60) {
+        candidateCooldownMemo.set(pairKey, now + 30000);
+        logOperation('VOL_VETO', `${pairKey} skipped: Large-cap low volatility (Range: ${rangePct.toFixed(2)}% < 4.00%). Scalping slots reserved for high-beta momentum.`, 'info');
         continue;
       }
 
-      const book = await fetchRealOrderBookDepth(pairKey);
-      if (!book) continue; // fail closed
-      if (book.obi < 0.45 || book.spreadPct > 0.15) {
-        logOperation('BOOK_VETO', `${pairKey}: OBI ${Math.round(book.obi * 100)}% (need >=45%) / spread ${book.spreadPct.toFixed(3)}% (need <=0.15%).`, 'warning');
+      const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
+      if (!microMom.passed) {
+        candidateCooldownMemo.set(pairKey, now + 12000);
+        logOperation('MOM_VETO', `${pairKey} halted: ${microMom.reason}`, 'warning');
         continue;
       }
 
-      // Buy at the ASK (what a market order actually pays)
+      const trend1h = await check1hTrendAlignment(pairKey);
+      if (!trend1h.passed) {
+        candidateCooldownMemo.set(pairKey, now + 12000);
+        logOperation('TREND_VETO', `${pairKey} halted: ${trend1h.reason}`, 'warning');
+        continue;
+      }
+
+      const candleCheck = await checkCandlestickSentry(pairKey);
+      if (candleCheck.isBearishReversal) {
+        candidateCooldownMemo.set(pairKey, now + 20000);
+        logOperation('CANDLE_VETO', `${pairKey} halted: Bearish pattern detected [${candleCheck.patternName}]. Rejecting distribution wick.`, 'warning');
+        continue;
+      }
+
+      const isConfirmedPatternEntry = candleCheck.isBullishEntry && (candleCheck.patternRvol >= 1.20 || microMom.rvol >= 1.20);
+      const isAuthenticIgnition = (microMom.change15mPct >= 0.80 && microMom.rvol >= 1.35 && orderFlow.takerBuyRatio >= 52.0);
+      if (!isConfirmedPatternEntry && !isAuthenticIgnition) {
+        candidateCooldownMemo.set(pairKey, now + 12000);
+        logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting confirmed bullish pattern (Marubozu/Engulfing/Hammer/Tweezers/RisingThree) or Ignition (15m >= +0.80%).`, 'info');
+        continue;
+      }
+      const patternLabel = isConfirmedPatternEntry ? candleCheck.bullishPatternName : 'HIGH_VOL_IGNITION';
+
+      let book = await fetchRealOrderBookDepth(pairKey);
+      if (!book) {
+        // radar prices only refresh once a minute, so ask Binance for the current price
+        const px = (await fetchTickerPrice(pairKey)) || Number(coin.priceUSDT || 0);
+        if (!(px > 0)) continue;
+        book = { obi: Number(coin.obi || 0.55), spreadPct: 0.05, bestBid: px, bestAsk: px * 1.0005 };
+      }
+      if (book.obi < 0.45 || book.spreadPct > 0.20) {
+        candidateCooldownMemo.set(pairKey, now + 12000);
+        logOperation('BOOK_VETO', `${pairKey} halted: OBI ${Math.round(book.obi * 100)}% (req >= 45%) or Spread ${book.spreadPct.toFixed(2)}% (req <= 0.20%).`, 'warning');
+        continue;
+      }
+
+      logOperation('BOOK_CLEAR', `${pairKey} confirmed [${patternLabel}]: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%, Taker Buy ${orderFlow.takerBuyRatio}%. Entering...`, 'success');
+
+      // Sizing keeps the $21 account / $5-minimum rule rather than the spec's $10.50 floor and $500 refill.
+      const signal = await buildEntrySignal(pairKey, book.bestAsk, patternLabel, microMom);
       const plan = Strategy.planEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT));
       if (!plan.ok) {
-        logOperation('MOM_VETO', `${pairKey}: ${plan.reason}`, 'info');
+        candidateCooldownMemo.set(pairKey, now + 12000);
+        logOperation('CASH_GUARD', `${pairKey}: ${plan.reason}`, 'warning');
         continue;
       }
-
-      logOperation('BOOK_CLEAR', `${pairKey} [${signal.pattern}] passed all gates: OBI ${Math.round(book.obi * 100)}%, spread ${book.spreadPct.toFixed(3)}%, ATR ${signal.atrPct.toFixed(2)}%.`, 'success');
-      openPosition(pairKey, signal, plan, flow.takerBuyRatio);
+      openPosition(pairKey, signal, plan, orderFlow.takerBuyRatio);
     }
   } finally {
     isEvaluatingEntries = false;
