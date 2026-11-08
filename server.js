@@ -257,7 +257,9 @@ function logOperation(category, message, level = 'info') {
 // IN-MEMORY ZERO-LATENCY KLINE CACHE (ELIMINATES BINANCE RATE LIMITS)
 // -------------------------------------------------------------
 const klineCache = new Map();
-async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
+// maxAgeMs: callers that read the LIVE (still open) candle — e.g. the BTC gate — pass 20000 so the
+// open bar is never more than 20s old.
+async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500, maxAgeMs = 0) {
   const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
   const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
   const cacheKey = `${pairSym}_${interval}_${limit}`;
@@ -266,7 +268,7 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500) {
 
   // Valid until the open candle closes (so a newly CLOSED bar is picked up within ~1s,
   // faster than the old fixed 20s), but never older than 5 minutes.
-  if (cached && now < cached.expiresAt) {
+  if (cached && now < cached.expiresAt && (!maxAgeMs || now - cached.timestamp < maxAgeMs)) {
     return cached.data;
   }
 
@@ -299,18 +301,18 @@ async function getKlinesStrict(symbol, interval, limit) {
 }
 
 let btcRegimeCache = { at: 0, result: null };
+// BTC Macro Weather Gate (see strategy.evaluateBtcRegime): live BTCUSDT 15m candle,
+// klines limit 3 through a 20-second memo cache, sampled by the 1s autopilot loop. Fail-open.
 async function refreshBtcRegime() {
-  if (btcRegimeCache.result && Date.now() - btcRegimeCache.at < 15000) return btcRegimeCache.result;
-  const [h, m] = await Promise.all([
-    getKlinesStrict('BTCUSDT', '1h', 100),
-    getKlinesStrict('BTCUSDT', '15m', 10)
-  ]);
-  const r = (h && m) ? Strategy.evaluateBtcRegime(h, m) : { ok: false, reason: 'BTC data unavailable' };
+  let m = null;
+  try { m = await getCachedKlines('BTCUSDT', '15m', 3, 3000, 20000); } catch (e) { m = null; }
+  const r = Strategy.evaluateBtcRegime(null, Array.isArray(m) ? m : null);
   const g = State.subsystems.btcMacroGate;
   g.status = r.ok ? 'NORMAL' : 'PAUSED';
   g.allowAltcoinEntries = r.ok;
   g.btcChange15m = Number((r.chg15 || 0).toFixed(2));
-  g.reason = r.ok ? 'BTC not in a clear downtrend, no 15m dump' : r.reason;
+  g.btcOpen15m = r.btcOpen15 || null;
+  g.reason = r.ok ? (r.failOpen ? 'BTC data unavailable (gate fails open)' : 'BTC macro healthy') : r.reason;
   btcRegimeCache = { at: Date.now(), result: r };
   return r;
 }
