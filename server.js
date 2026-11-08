@@ -107,7 +107,8 @@ const State = {
     bStockShield: { status: 'ACTIVE', blockedAssets: ['SOXLB', 'SNDKB', 'TSLAB', 'NVDB'], maxUnitPrice: '$350.00' },
     screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 22, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M+)' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
-    btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
+    marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
+    futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% floor • Candlestick harvest • Trail • Failing trades move to recovery bags' },
@@ -288,21 +289,83 @@ async function getKlinesStrict(symbol, interval, limit) {
   }
 }
 
-let btcRegimeCache = { at: 0, result: null };
-// BTC Macro Weather Gate (see strategy.evaluateBtcRegime): live BTCUSDT 15m candle,
-// klines limit 3 through a 20-second memo cache, sampled by the 1s autopilot loop. Fail-open.
-async function refreshBtcRegime() {
-  let m = null;
-  try { m = await getCachedKlines('BTCUSDT', '15m', 3, 3000, 20000); } catch (e) { m = null; }
-  const r = Strategy.evaluateBtcRegime(null, Array.isArray(m) ? m : null);
-  const g = State.subsystems.btcMacroGate;
-  g.status = r.ok ? 'NORMAL' : 'PAUSED';
-  g.allowAltcoinEntries = r.ok;
-  g.btcChange15m = Number((r.chg15 || 0).toFixed(2));
-  g.btcOpen15m = r.btcOpen15 || null;
-  g.reason = r.ok ? (r.failOpen ? 'BTC data unavailable (gate fails open)' : 'BTC macro healthy') : r.reason;
-  btcRegimeCache = { at: Date.now(), result: r };
+// -------------------------------------------------------------
+// MARKET MODE (replaces the BTC gate): see strategy.evaluateMarketMode
+// -------------------------------------------------------------
+async function refreshMarketMode(tickers) {
+  const top = tickers
+    .filter((t) => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && !/^(USDC|FDUSD|TUSD|EUR|USD1|RLUSD|PAXG)/.test(t.symbol))
+    .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume)).slice(0, 30).map((t) => t.symbol);
+  const [btc, ...coins] = await Promise.all(['BTCUSDT', ...top].map((s) => getKlinesStrict(s, '1h', 120)));
+  const r = Strategy.evaluateMarketMode(btc ? Strategy.closedOnly(btc) : null, coins.filter(Boolean).map((k) => Strategy.closedOnly(k)));
+  const before = State.subsystems.marketMode.mode;
+  State.subsystems.marketMode = { ...r, breadth: r.breadth === null || r.breadth === undefined ? null : Number(r.breadth.toFixed(2)), updatedAt: Date.now() };
+  if (before !== r.mode) {
+    logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${r.side === 'LONG' ? 'Autopilot opens spot longs.' : r.side === 'SHORT' ? 'Autopilot opens USD-M shorts.' : 'No new trades.'} Open positions keep their exits.`, 'warning');
+  }
   return r;
+}
+
+// -------------------------------------------------------------
+// USD-M FUTURES DATA (paper only: nothing here places an order)
+// -------------------------------------------------------------
+const FAPI_BASE = process.env.FAPI_BASE || 'https://fapi.binance.com';
+const FSTREAM_URL = process.env.FSTREAM_URL || 'wss://fstream.binance.com/ws';
+const FUT_FEE_RATE = Strategy.FUTURES.feePct / 100;
+const isShort = (p) => Boolean(p) && p.side === 'SHORT';
+let perpetuals = new Map();
+let perpetualsAt = 0;
+
+async function refreshPerpetuals() {
+  if (perpetuals.size && Date.now() - perpetualsAt < 6 * 3600000) return;
+  const f = State.subsystems.futures;
+  let info = null;
+  try { info = await safeFetch(`${FAPI_BASE}/fapi/v1/exchangeInfo`, 8000); } catch (e) { info = null; }
+  if (!info || !Array.isArray(info.symbols)) {
+    f.status = perpetuals.size ? 'STALE' : 'UNAVAILABLE';
+    f.reason = 'Binance Futures API is not responding from this server. Shorts stay off.';
+    throttledNotice('fapi', 'FUTURES', f.reason, 'danger', 300000);
+    return;
+  }
+  const next = new Map();
+  info.symbols.forEach((s) => {
+    if (s.contractType !== 'PERPETUAL' || s.status !== 'TRADING' || s.quoteAsset !== 'USDT') return;
+    const mn = (s.filters || []).find((x) => x.filterType === 'MIN_NOTIONAL');
+    next.set(s.symbol, { minNotional: parseFloat(mn && mn.notional) || 5 });
+  });
+  perpetuals = next;
+  perpetualsAt = Date.now();
+  Object.assign(f, { status: 'ONLINE', perpetuals: next.size, reason: `${next.size} USDT perpetuals available`, leverage: Strategy.FUTURES.leverage });
+}
+
+async function fetchFuturesPrice(pairKey) {
+  try {
+    const d = await safeFetch(`${FAPI_BASE}/fapi/v1/ticker/price?symbol=${pairKey}`, 2500);
+    const p = parseFloat(d && d.price);
+    return p > 0 ? p : null;
+  } catch (e) { return null; }
+}
+
+// Funding is booked per position when each settlement passes. Positive rate: shorts receive it.
+let fundingBusy = false;
+async function settleFunding() {
+  if (fundingBusy) return;
+  fundingBusy = true;
+  try {
+    const held = [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isShort(p));
+    for (const [k, p] of held) {
+      if (Date.now() < Number(p.nextFundingAt || 0)) continue;
+      let d = null;
+      try { d = await safeFetch(`${FAPI_BASE}/fapi/v1/premiumIndex?symbol=${k}`, 2500); } catch (e) { d = null; }
+      if (!d || !(parseFloat(d.markPrice) > 0)) continue;
+      if (p.nextFundingAt) {
+        const amount = Number(p.qty) * parseFloat(d.markPrice) * (parseFloat(d.lastFundingRate) || 0);
+        p.fundingUSDT = Number(((Number(p.fundingUSDT) || 0) + amount).toFixed(6));
+        logOperation('FUNDING', `${p.pair}: funding ${amount >= 0 ? 'received' : 'paid'} $${Math.abs(amount).toFixed(4)}.`, 'info');
+      }
+      p.nextFundingAt = Number(d.nextFundingTime) || Date.now() + 3600000;
+    }
+  } finally { fundingBusy = false; }
 }
 
 // Taker buy ratio on the last 3 CLOSED 5m bars. Fails closed.
@@ -333,7 +396,7 @@ function computeEquity() {
   const add = (p) => {
     const px = Number(p.livePriceUSDT || p.entryPriceUSDT) || 0;
     const qty = Number(p.qty) || (Number(p.notionalUSDT) / Number(p.entryPriceUSDT || 1));
-    eq += qty * px;
+    eq += isShort(p) ? qty * (2 * Number(p.entryPriceUSDT) - px) + (Number(p.fundingUSDT) || 0) : qty * px;
   };
   Object.values(State.activePositions || {}).forEach(add);
   Object.values(State.recoveryBags || {}).forEach(add);
@@ -368,11 +431,11 @@ async function checkDormantPumpAndDumpTrap(symbol, volQuote, change24, rangePct)
   }
 }
 
-async function fetchRealOrderBookDepth(symbol) {
+async function fetchRealOrderBookDepth(symbol, futures = false) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const url = `https://api.binance.com/api/v3/depth?symbol=${pairSym}&limit=20`;
+    const url = futures ? `${FAPI_BASE}/fapi/v1/depth?symbol=${pairSym}&limit=20` : `https://api.binance.com/api/v3/depth?symbol=${pairSym}&limit=20`;
     const data = await safeFetch(url, 2500);
     if (!data || !Array.isArray(data.bids) || !Array.isArray(data.asks) || data.bids.length === 0 || data.asks.length === 0) {
       return null;
@@ -406,6 +469,10 @@ async function runDynamicScreener() {
     const url = 'https://api.binance.com/api/v3/ticker/24hr';
     const tickers = await safeFetch(url, 4500);
     if (!Array.isArray(tickers)) return;
+
+    await refreshPerpetuals();
+    const mode = await refreshMarketMode(tickers);
+    const bearMode = mode.side === 'SHORT';
 
     const universe = {};
     const candidateKlinesQueue = [];
@@ -447,11 +514,15 @@ async function runDynamicScreener() {
         }
       }
 
-      let score = 60 + (posInRange * 22) + (Math.min(change24, 15) * 0.9);
+      // In a bear market the best candidates are the weakest coins that can be shorted.
+      const canShort = perpetuals.has(sym);
+      let score = bearMode
+        ? 60 + ((1 - posInRange) * 22) + (Math.min(-change24, 15) * 0.9)
+        : 60 + (posInRange * 22) + (Math.min(change24, 15) * 0.9);
       if (volQuote >= 10000000) score += 5;
       if (rangePct >= 5.0) score += 3;
 
-      if (isPumpDump) {
+      if (isPumpDump || (bearMode && !canShort)) {
         score = 0;
       }
 
@@ -464,13 +535,15 @@ async function runDynamicScreener() {
         pricePositionInRange: Number(posInRange.toFixed(2)),
         score: Math.min(99, Math.round(score)),
         volumeM: Math.round(volQuote / 1000000),
+        side: bearMode ? 'SHORT' : 'LONG',
+        canShort,
         obi: 0.55,
         isPumpAndDump: isPumpDump,
         pumpDumpReason: pumpDumpReason,
         candlestickPattern: 'WATCH'
       };
 
-      if (!isPumpDump && score >= 60 && candidateKlinesQueue.length < 35) {
+      if (!isPumpDump && score >= 60 && (!bearMode || canShort) && candidateKlinesQueue.length < 35) {
         candidateKlinesQueue.push(sym);
       }
     }
@@ -480,8 +553,26 @@ async function runDynamicScreener() {
       try {
         // 100 bars = same cache key the entry evaluator uses; patterns on CLOSED bars only
         const klines15m = await getCachedKlines(topSym, '15m', 100, 2000);
-        const pat = Strategy.assessCandles(Strategy.closedOnly(klines15m));
-        if (universe[topSym]) {
+        const closed15m = Strategy.closedOnly(klines15m);
+        const pat = bearMode ? null : Strategy.assessCandles(closed15m);
+        if (universe[topSym] && bearMode) {
+          // Mirror of the long scoring: penalize weak-24h coins that are bouncing hard in the last hour.
+          if (Array.isArray(klines15m) && klines15m.length >= 5) {
+            const open1h = parseFloat(klines15m[klines15m.length - 5][1]);
+            const closeNow = parseFloat(klines15m[klines15m.length - 1][4]);
+            if (open1h > 0 && ((closeNow - open1h) / open1h) * 100 > 0.30) universe[topSym].score = Math.max(0, universe[topSym].score - 12);
+          }
+          const sp = Strategy.assessShortCandles(closed15m);
+          if (sp.bullish) {
+            universe[topSym].candlestickPattern = `⚠️ ${sp.bullPattern}`;
+            universe[topSym].score = Math.max(0, universe[topSym].score - 18);
+          } else if (sp.sell) {
+            universe[topSym].candlestickPattern = sp.pattern;
+            universe[topSym].score = Math.min(99, universe[topSym].score + 10 + Math.min(6, sp.convergence.length * 2));
+          } else if (sp.pattern !== 'NONE') {
+            universe[topSym].candlestickPattern = `${sp.pattern} (against trend)`;
+          }
+        } else if (universe[topSym]) {
           // Penalize stale 24h gainers that are actively bleeding in the 1h timeframe
           if (Array.isArray(klines15m) && klines15m.length >= 5) {
             const open1h = parseFloat(klines15m[klines15m.length - 5][1]);
@@ -509,7 +600,7 @@ async function runDynamicScreener() {
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
     State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= (State.activeThresholds?.scoreThreshold || 65) && !c.isPumpAndDump).length;
 
-    logOperation('RADAR_SCREENER', `Scanned ${Object.keys(universe).length} pairs. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
+    logOperation('RADAR_SCREENER', `[${mode.mode}] Scanned ${Object.keys(universe).length} pairs for ${bearMode ? 'shorts' : 'spot longs'}. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
     broadcastStateUpdate({ withUniverse: true });
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
@@ -571,6 +662,33 @@ function openPosition(pairKey, signal, plan, takerBuyRatio) {
   return true;
 }
 
+function openShort(pairKey, signal, plan, takerBuyRatio) {
+  const sym = pairKey.replace(/USDT$/, '');
+  const entry = plan.entryPrice;
+  const R = Strategy.EXIT_RULES;
+  const cost = plan.notional * (1 + FUT_FEE_RATE); // 1x margin plus the opening fee
+  if (State.portfolio.cashUSDT < cost) {
+    logOperation('CASH_GUARD', `Cannot short ${sym}/USDT: need $${cost.toFixed(2)}, free cash $${State.portfolio.cashUSDT.toFixed(2)}.`, 'danger');
+    return false;
+  }
+  State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT - cost).toFixed(6));
+  const bagAt = entry * (1 - R.demotePct / 100);
+  State.activePositions[pairKey] = {
+    pair: `${sym}/USDT`, pairSymbol: sym, side: 'SHORT', leverage: Strategy.FUTURES.leverage, strategyVersion: 6,
+    openedAt: Date.now(), entryPriceUSDT: entry, livePriceUSDT: entry, lastTickAt: Date.now(),
+    qty: plan.qty, notionalUSDT: plan.notional, initialNotionalUSDT: plan.notional,
+    initialStopPrice: bagAt, sl: bagAt, stopPct: Number(plan.stopPct.toFixed(3)), riskUSDT: plan.riskUSDT, atrPct: Number(signal.atrPct.toFixed(3)),
+    breakevenPrice: entry * (1 - R.floorPct / 100), tp1Price: entry * (1 - R.tp1Pct / 100), targetPrice: entry * 0.97,
+    liquidationPrice: Strategy.shortLiquidationPrice(entry), fundingUSDT: 0, nextFundingAt: 0,
+    peakGainPct: 0, peakLowPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern
+  };
+  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper) via [${signal.pattern}] • Min exit +0.35% • Moves to recovery bag at -2.80% • Taker buy ${takerBuyRatio}%`, 'success');
+  saveDiskState();
+  syncActiveSymbolSubscriptions();
+  broadcastStateUpdate();
+  return true;
+}
+
 /**
  * Sells `fraction` of a position/bag at `price`. Credits cash with proceeds
  * minus fee, records net P&L (both fees), deletes the position when fully closed.
@@ -582,14 +700,17 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
 
   const entry = Number(pos.entryPriceUSDT);
   // Hard rule: only the user's own manual close can realize a loss.
-  if (!/MANUAL/.test(typeLabel) && price < entry) {
+  const short = isShort(pos);
+  if (!/MANUAL|LIQUIDATED/.test(typeLabel) && (short ? price > entry : price < entry)) {
     logOperation('SENTRY', `${pos.pair}: blocked ${typeLabel} below entry. Position stays open.`, 'warning');
     return null;
   }
   const totalQty = Number(pos.qty) || (Number(pos.notionalUSDT) / entry);
   const qtySold = fraction >= 1 ? totalQty : totalQty * fraction;
-  const proceeds = qtySold * price * (1 - FEE_RATE);
-  const pnl = Strategy.netPnl(qtySold, entry, price);
+  const fundingShare = short ? (Number(pos.fundingUSDT) || 0) * (fraction >= 1 ? 1 : fraction) : 0;
+  const proceeds = short ? qtySold * (2 * entry - price) - qtySold * price * FUT_FEE_RATE + fundingShare : qtySold * price * (1 - FEE_RATE);
+  const pnl = short ? Strategy.netPnlShort(qtySold, entry, price) + fundingShare : Strategy.netPnl(qtySold, entry, price);
+  if (short && fraction < 1) pos.fundingUSDT = Number(((Number(pos.fundingUSDT) || 0) - fundingShare).toFixed(6));
 
   State.portfolio.cashUSDT = Number((Number(State.portfolio.cashUSDT) + proceeds).toFixed(6));
   State.portfolio.realizedPnL = Number((Number(State.portfolio.realizedPnL || 0) + pnl).toFixed(6));
@@ -604,11 +725,13 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
     pos.notionalUSDT = Number((remainingQty * entry).toFixed(4));
   }
 
-  const gainPct = ((price - entry) / entry) * 100;
+  const gainPct = (short ? entry - price : price - entry) / entry * 100;
   const tradePayload = {
     id: Date.now(),
     pair: pos.pair || `${key.replace('USDT', '')}/USDT`,
-    type: typeLabel,
+    type: short ? `SHORT ${typeLabel}` : typeLabel,
+    side: short ? 'SHORT' : 'LONG',
+    fundingUSDT: short ? Number(fundingShare.toFixed(4)) : 0,
     entryPriceUSDT: entry,
     exitPriceUSDT: price,
     notionalUSDT: Number((qtySold * entry).toFixed(4)),
@@ -620,7 +743,7 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   };
 
   logOperation(pnl >= 0 ? 'SENTRY_EXIT' : 'RISK_STOP',
-    `${typeLabel} on ${tradePayload.pair} @ $${formatPrecisePrice(price)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%) • ` +
+    `${tradePayload.type} on ${tradePayload.pair} @ $${formatPrecisePrice(price)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%) • ` +
     `Net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} after fees${fullyClosed ? '' : ' • runner continues'}`,
     pnl >= 0 ? 'success' : 'warning');
 
@@ -647,7 +770,7 @@ function throttledNotice(key, category, message, level = 'info', everyMs = 60000
 // AUTOPILOT ENTRY GATES (restored from v4 — see autopilot_engine_complete_logic_specification.md)
 // -------------------------------------------------------------
 async function checkCandlestickSentry(symbol) {
-  const none = { isBearishReversal: false, isBullishEntry: false, bullishPatternName: 'NONE', bearishPatternName: 'NONE', patternName: 'NONE', confidence: 0, patternRvol: 1.0, convergence: [], major: 'flat' };
+  const none = { isShortEntry: false, shortPatternName: 'NONE', isBullishSignal: false, isBearishReversal: false, isBullishEntry: false, bullishPatternName: 'NONE', bearishPatternName: 'NONE', patternName: 'NONE', confidence: 0, patternRvol: 1.0, convergence: [], major: 'flat' };
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
@@ -662,7 +785,9 @@ async function checkCandlestickSentry(symbol) {
     const bear = a.bearPattern !== 'NONE' ? `${a.bearPattern} (15m)` : 'NONE';
     const patternName = bear !== 'NONE' ? bear : bull;
     if (patternName !== 'NONE') State.subsystems.candlestickSentry.lastPatternDetected = `${pairSym}: ${patternName}`;
-    return { isBearishReversal: a.bearish, isBullishEntry: a.buy, bullishPatternName: bull, bearishPatternName: bear, patternName,
+    const sh = Strategy.assessShortCandles(closed15, { major: a.major });
+    return { isShortEntry: sh.sell, shortPatternName: sh.pattern !== 'NONE' ? `${sh.pattern} (15m)` : 'NONE', isBullishSignal: sh.bullish, bullSignalName: sh.bullPattern !== 'NONE' ? `${sh.bullPattern} (15m)` : 'NONE',
+      isBearishReversal: a.bearish, isBullishEntry: a.buy, bullishPatternName: bull, bearishPatternName: bear, patternName,
       confidence: a.score, patternRvol: a.rvol, convergence: a.convergence, major: a.major, vetoes: a.vetoes };
   } catch (e) {
     return none;
@@ -854,6 +979,122 @@ async function check1hTrendAlignment(symbol) {
   }
 }
 
+// -------------------------------------------------------------
+// SHORT ENTRY GATES: the long gates mirrored. These fail closed: no data, no short.
+// -------------------------------------------------------------
+async function checkShortOrderFlow(symbol) {
+  const k = await getCachedKlines(symbol, '5m', 8, 2500, 20000).catch(() => null);
+  if (!Array.isArray(k) || k.length < 3) return { passed: false, reason: '5m data unavailable' };
+  let vol = 0, buy = 0;
+  k.slice(-3).forEach((b) => { vol += parseFloat(b[5]); buy += parseFloat(b[9]); });
+  const takerBuyRatio = vol > 0 ? Number(((buy / vol) * 100).toFixed(1)) : 50;
+  const [h, l, c] = [k[k.length - 1][2], k[k.length - 1][3], k[k.length - 1][4]].map(parseFloat);
+  const clv = h - l > 0 ? (c - l) / (h - l) : 0.5;
+  if (takerBuyRatio > 54 && clv > 0.65) return { passed: false, takerBuyRatio, reason: `Buyer absorption: taker buy ${takerBuyRatio}% (>54%) and CLV ${(clv * 100).toFixed(0)}%` };
+  return { passed: true, takerBuyRatio };
+}
+
+async function checkShortMomentum(symbol) {
+  const k = await getCachedKlines(symbol, '15m', 16, 2500, 20000).catch(() => null);
+  if (!Array.isArray(k) || k.length < 8) return { passed: false, reason: '15m data unavailable' };
+  const [o, h, l, c, v] = k[k.length - 1].slice(1, 6).map(parseFloat);
+  const change15mPct = o > 0 ? Number((((c - o) / o) * 100).toFixed(2)) : 0;
+  const lowerWick = h - l > 0 ? (Math.min(o, c) - l) / (h - l) : 0;
+  if (lowerWick > 0.30) return { passed: false, reason: `Lower rejection shadow too long (${(lowerWick * 100).toFixed(0)}% > 30%)` };
+  let vs = 0, ps = 0;
+  k.slice(-16).forEach((b) => { const vol = parseFloat(b[5]); ps += ((parseFloat(b[2]) + parseFloat(b[3]) + parseFloat(b[4])) / 3) * vol; vs += vol; });
+  const vw = vs > 0 ? ps / vs : c;
+  if (c > vw) return { passed: false, reason: `Above 4h VWAP ($${formatPrecisePrice(c)} > $${formatPrecisePrice(vw)})` };
+  const prior = k.slice(-10, -1), avg = prior.reduce((s, b) => s + parseFloat(b[5]), 0) / prior.length;
+  const floor = Math.min(...k.slice(-9, -1).map((b) => parseFloat(b[3])));
+  const dist = floor > 0 ? ((c - floor) / floor) * 100 : 0;
+  if (dist > 2.5) return { passed: false, reason: `Mid-range chop: +${dist.toFixed(2)}% above the 2h floor. Max 2.50%.` };
+  return { passed: true, change15mPct, rvol: avg > 0 ? Number((v / avg).toFixed(2)) : 1 };
+}
+
+async function checkShort1hTrend(symbol) {
+  const k = await getCachedKlines(symbol, '1h', 60, 3500, 20000).catch(() => null);
+  if (!Array.isArray(k) || k.length < 45) return { passed: false, reason: '1h data unavailable' };
+  const closes = k.map((b) => parseFloat(b[4])), n = closes.length - 1, c = closes[n];
+  const e20 = Strategy.emaSeries(closes, 20), e50 = Strategy.emaSeries(closes, 50);
+  if (c > e20[n] * 1.0015) return { passed: false, reason: 'Price above the 1h 20-EMA' };
+  if (e20[n] > e50[n] * 1.012) return { passed: false, reason: '1h 20-EMA well above the 50-EMA, bull channel' };
+  if (e20[n] > e20[n - 2] * 1.003) return { passed: false, reason: '1h 20-EMA rising sharply' };
+  const below = e20[n] > 0 ? ((e20[n] - c) / e20[n]) * 100 : 0;
+  if (below > 5.5) return { passed: false, reason: `Overextended below the 1h 20-EMA (-${below.toFixed(2)}% > 5.50%)` };
+  return { passed: true };
+}
+
+async function evaluateShortEntries(maxSlots, maxBagsLimit) {
+  if (!perpetuals.size) {
+    throttledNotice('noperps', 'FUTURES', 'Market is bearish, but Binance Futures data is unavailable. No shorts opened.', 'danger', 60000);
+    return;
+  }
+  const minScore = State.activeThresholds?.scoreThreshold || 65;
+  const sorted = Object.keys(State.universe || {}).sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
+  isEvaluatingEntries = true;
+  try {
+    let evaluated = 0;
+    const now = Date.now();
+    const veto = (pairKey, ms, cat, msg, lvl = 'warning') => { candidateCooldownMemo.set(pairKey, now + ms); logOperation(cat, `${pairKey} short: ${msg}`, lvl); };
+    for (const k of sorted) {
+      if (Object.keys(State.activePositions || {}).length >= maxSlots) break;
+      if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
+      const coin = State.universe[k];
+      if (!coin || !coin.symbol || coin.isPumpAndDump || coin.side !== 'SHORT' || !coin.canShort) continue;
+      if ((coin.score || 0) < minScore) break;
+      const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const pairKey = `${baseSym}USDT`;
+      if (Number(coin.priceUSDT || 0) > 350 && !['BTCUSDT', 'ETHUSDT'].includes(pairKey)) continue;
+      if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
+      if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > now) continue;
+      if ((candidateCooldownMemo.get(pairKey) || 0) > now) continue;
+      if (++evaluated > 16) break;
+
+      const change24h = Number(coin.change24h || 0), rangePct = Number(coin.intradayRangePct || 0);
+      if (change24h > -0.20 && rangePct < 3.0) continue;
+      if (Number(coin.pricePositionInRange ?? 0.3) > 0.50) continue;
+
+      const flow = await checkShortOrderFlow(pairKey);
+      if (!flow.passed) { veto(pairKey, 12000, 'FLOW_VETO', flow.reason); continue; }
+      if (Number(coin.priceUSDT || 0) >= 0.50 && rangePct < 4.0 && change24h > -0.60) { veto(pairKey, 30000, 'VOL_VETO', `low volatility (range ${rangePct.toFixed(2)}%).`, 'info'); continue; }
+      const mom = await checkShortMomentum(pairKey);
+      if (!mom.passed) { veto(pairKey, 12000, 'MOM_VETO', mom.reason); continue; }
+      const trend = await checkShort1hTrend(pairKey);
+      if (!trend.passed) { veto(pairKey, 12000, 'TREND_VETO', trend.reason); continue; }
+      const candle = await checkCandlestickSentry(pairKey);
+      if (candle.isBullishSignal) { veto(pairKey, 20000, 'CANDLE_VETO', `bullish pattern [${candle.bullSignalName}].`); continue; }
+      const breakdown = mom.change15mPct <= -0.80 && mom.rvol >= 1.35 && flow.takerBuyRatio <= 48;
+      if (!candle.isShortEntry && !breakdown) { veto(pairKey, 12000, 'CANDLE_WAIT', `waiting for a completed bearish pattern on 15m (1h trend ${candle.major}) or a breakdown (15m <= -0.80%).`, 'info'); continue; }
+      const label = candle.isShortEntry ? candle.shortPatternName : 'HIGH_VOL_BREAKDOWN';
+
+      const book = await fetchRealOrderBookDepth(pairKey, true);
+      if (!book) { veto(pairKey, 12000, 'BOOK_VETO', 'futures order book unavailable.'); continue; }
+      if (book.obi > 0.55 || book.spreadPct > 0.20) { veto(pairKey, 12000, 'BOOK_VETO', `bid share ${Math.round(book.obi * 100)}% (req <= 55%) or spread ${book.spreadPct.toFixed(2)}%.`); continue; }
+
+      // planEntry only uses the stop distance for sizing, so the distance is passed on the long side of the price.
+      const px = book.bestBid, cfg = Strategy.CONFIG;
+      let atr = NaN, structPct = cfg.minStopPct;
+      const k15 = await getCachedKlines(pairKey, '15m', 16, 2500, 20000).catch(() => null);
+      if (Array.isArray(k15) && k15.length >= 15) {
+        const bars = Strategy.toBars(k15);
+        atr = Strategy.atrPct(bars, 14);
+        structPct = ((Math.max(...bars.slice(-3).map((b) => b.h)) - px) / px) * 100 + cfg.stopBufferPct;
+      }
+      const stopPct = Math.min(cfg.maxStopPct, Math.max(structPct, (atr || 0) * cfg.atrStopMult, cfg.minStopPct));
+      const signal = { ok: true, pattern: label, refPrice: px, stopPrice: px * (1 - stopPct / 100), stopPct, atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: mom.rvol };
+      const plan = Strategy.planEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT));
+      if (!plan.ok) { veto(pairKey, 12000, 'CASH_GUARD', plan.reason); continue; }
+      const minN = perpetuals.get(pairKey)?.minNotional || 5;
+      if (plan.notional < minN) { veto(pairKey, 300000, 'CASH_GUARD', `Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
+      logOperation('BOOK_CLEAR', `${pairKey} short confirmed [${label}]: bid share ${Math.round(book.obi * 100)}%, spread ${book.spreadPct.toFixed(2)}%, taker buy ${flow.takerBuyRatio}%. Entering...`, 'success');
+      openShort(pairKey, signal, plan, flow.takerBuyRatio);
+    }
+  } finally {
+    isEvaluatingEntries = false;
+  }
+}
+
 // A v4-approved entry still needs a real stop for the position sentry: below the 3-bar swing low,
 // at least 1.2 x ATR, clamped to 0.6%..1.5%. Clamped, never rejected: sizing must not add a gate.
 async function buildEntrySignal(pairKey, price, pattern, microMom) {
@@ -900,9 +1141,14 @@ async function evaluateAutopilotEntries() {
     dailyLossLimitPct: Strategy.CONFIG.dailyLossLimitPct
   };
 
-  const btc = await refreshBtcRegime();
-  if (!btc.ok) {
-    throttledNotice('btc', 'BTC_WEATHER', `Entries paused: ${State.subsystems.btcMacroGate.reason}`, 'warning', 30000);
+  // Market mode decides which side may trade. Open positions are managed either way.
+  const mode = State.subsystems.marketMode;
+  if (mode.side === 'NONE') {
+    throttledNotice('mode', 'MARKET_MODE', `No new trades: ${mode.reason}.`, 'info', 120000);
+    return;
+  }
+  if (mode.side === 'SHORT') {
+    await evaluateShortEntries(maxSlots, maxBagsLimit);
     return;
   }
 
@@ -1053,7 +1299,7 @@ function migrateLegacyPosition(k, pos) {
 
 // Live 5m candle read, same thresholds as the original Self-Aware detector.
 async function checkSelfAwareOrderFlow(symbol) {
-  const quiet = { isApexExhausted: false, isUpsideDead: false };
+  const quiet = { isApexExhausted: false, isUpsideDead: false, isBottomExhausted: false, isDownsideDead: false };
   try {
     const k = await getCachedKlines(symbol, '5m', 5, 2500, 20000);
     if (!Array.isArray(k) || !k.length) return quiet;
@@ -1063,7 +1309,8 @@ async function checkSelfAwareOrderFlow(symbol) {
     const wick = range > 0 ? (h - Math.max(o, c)) / range : 0;
     const taker = vol > 0 ? (tb / vol) * 100 : 50;
     const clv = range > 0 ? (c - l) / range : 0.5;
-    return { isApexExhausted: (taker < 42 && wick >= 0.35) || (clv < 0.30 && range > 0), isUpsideDead: taker < 40 && c < o && clv < 0.35 };
+    return { isApexExhausted: (taker < 42 && wick >= 0.35) || (clv < 0.30 && range > 0), isUpsideDead: taker < 40 && c < o && clv < 0.35,
+      isBottomExhausted: (taker > 58 && (range > 0 ? (Math.min(o, c) - l) / range : 0) >= 0.35) || (clv > 0.70 && range > 0), isDownsideDead: taker > 60 && c > o && clv > 0.65 };
   } catch (e) { return quiet; }
 }
 
@@ -1072,11 +1319,12 @@ function demoteToBag(k, pos, price, reason) {
     pair: pos.pair, pairSymbol: pos.pairSymbol, openedAt: pos.openedAt, movedAt: Date.now(),
     entryPriceUSDT: Number(pos.entryPriceUSDT), livePriceUSDT: price, lastTickAt: Date.now(),
     notionalUSDT: pos.notionalUSDT, qty: pos.qty,
-    targetStep: 'CLOSES AT +0.30%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + Strategy.EXIT_RULES.bagTargetPct / 100),
+    side: isShort(pos) ? 'SHORT' : 'LONG', fundingUSDT: pos.fundingUSDT || 0, nextFundingAt: pos.nextFundingAt || 0, liquidationPrice: pos.liquidationPrice,
+    targetStep: 'CLOSES AT +0.30%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + (isShort(pos) ? -1 : 1) * Strategy.EXIT_RULES.bagTargetPct / 100),
     troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6
   };
   delete State.activePositions[k];
-  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to Spot Recovery Bag, closes at +0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
+  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : 'Spot'} Recovery Bag, closes at +0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
 }
@@ -1085,7 +1333,7 @@ async function livePriceFor(k, pos) {
   const tickPrice = Number(pos.livePriceUSDT || State.universe[k]?.priceUSDT);
   if (tickPrice > 0 && Date.now() - Number(pos.lastTickAt || 0) < 90000) return tickPrice;
   // Stream went quiet for this symbol: never manage risk on a stale price.
-  const rest = await fetchTickerPrice(k);
+  const rest = (isShort(pos) && await fetchFuturesPrice(k)) || await fetchTickerPrice(k);
   if (rest) {
     pos.livePriceUSDT = rest;
     pos.lastTickAt = Date.now();
@@ -1108,19 +1356,26 @@ async function runPredictiveSentry() {
       pos.livePriceUSDT = price;
 
       const entry = Number(pos.entryPriceUSDT);
-      const gainPct = ((price - entry) / entry) * 100;
+      const short = isShort(pos);
+      if (short && price >= Number(pos.liquidationPrice)) {
+        realizeExit('activePositions', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
+        continue;
+      }
+      const gainPct = (short ? entry - price : price - entry) / entry * 100;
       const held = (Date.now() - Number(pos.openedAt || Date.now())) / 60000;
       const signals = {};
       if (gainPct >= Strategy.EXIT_RULES.floorPct) {
         const candle = await checkCandlestickSentry(k);
-        if (candle.isBearishReversal) signals.bearishPattern = candle.bearishPatternName;
-        signals.peakExhausted = (await checkSelfAwareOrderFlow(k)).isApexExhausted;
+        const flow = await checkSelfAwareOrderFlow(k);
+        if (short ? candle.isBullishSignal : candle.isBearishReversal) signals.bearishPattern = short ? candle.bullSignalName : candle.bearishPatternName;
+        signals.peakExhausted = short ? flow.isBottomExhausted : flow.isApexExhausted;
       } else if (held >= Strategy.EXIT_RULES.softDemoteMinutes && gainPct <= Strategy.EXIT_RULES.softDemotePct) {
-        signals.upsideDead = (await checkSelfAwareOrderFlow(k)).isUpsideDead;
+        const flow = await checkSelfAwareOrderFlow(k);
+        signals.upsideDead = short ? flow.isDownsideDead : flow.isUpsideDead;
       }
 
       const prevStage = pos.ratchetStage;
-      const r = Strategy.manageNoLoss(pos, price, signals);
+      const r = short ? Strategy.manageShort(pos, price, signals) : Strategy.manageNoLoss(pos, price, signals);
       if (pos.ratchetStage !== prevStage && pos.ratchetStage === 'BREAKEVEN_LOCKED') {
         logOperation('SENTRY', `${pos.pair}: +0.35% minimum exit locked ($${formatPrecisePrice(pos.sl)}).`, 'success');
       }
@@ -1146,7 +1401,11 @@ async function runPredictiveSentry() {
       const price = await livePriceFor(k, bag);
       if (!price) continue;
       bag.livePriceUSDT = price;
-      const r = Strategy.manageBag(bag, price);
+      if (isShort(bag) && price >= Number(bag.liquidationPrice)) {
+        realizeExit('recoveryBags', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
+        continue;
+      }
+      const r = isShort(bag) ? Strategy.manageShortBag(bag, price) : Strategy.manageBag(bag, price);
       if (r.action === 'EXIT') realizeExit('recoveryBags', k, 1, price, r.reason, `Recovery bag closed at +0.30% or better @ $${formatPrecisePrice(price)}`);
     }
   } finally {
@@ -1753,13 +2012,13 @@ function connectBinanceGlobalStream() {
             State.universe[sym].priceINR = Number((closePrice * rate).toFixed(2));
           }
 
-          if (State.activePositions[sym]) {
+          if (State.activePositions[sym] && !isShort(State.activePositions[sym])) {
             State.activePositions[sym].livePriceUSDT = closePrice;
             State.activePositions[sym].lastTickAt = Date.now();
             activePriceChanged = true;
           }
 
-          if (State.recoveryBags[sym]) {
+          if (State.recoveryBags[sym] && !isShort(State.recoveryBags[sym])) {
             State.recoveryBags[sym].livePriceUSDT = closePrice;
             State.recoveryBags[sym].lastTickAt = Date.now();
             activePriceChanged = true;
@@ -1787,11 +2046,52 @@ function connectBinanceGlobalStream() {
   }
 }
 
+// Shorts are marked on the futures price. This socket exists only while a short is held.
+let futuresWs = null;
+let futuresStreams = new Set();
+const heldShorts = () => [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isShort(p)).map(([k]) => k);
+
+function syncFuturesStream() {
+  const wanted = new Set(heldShorts().map((s) => `${s.toLowerCase()}@miniTicker`));
+  if (!wanted.size) {
+    if (futuresWs) { const w = futuresWs; futuresWs = null; futuresStreams = new Set(); try { w.terminate(); } catch (e) {} }
+    return;
+  }
+  if (!futuresWs) {
+    const w = new WebSocket(FSTREAM_URL);
+    futuresWs = w;
+    futuresStreams = new Set();
+    w.on('open', syncFuturesStream);
+    w.on('message', (data) => {
+      try {
+        const t = JSON.parse(data);
+        if (!t || t.e !== '24hrMiniTicker') return;
+        const price = parseFloat(t.c);
+        if (!(price > 0)) return;
+        let changed = false;
+        [State.activePositions[t.s], State.recoveryBags[t.s]].forEach((p) => {
+          if (isShort(p)) { p.livePriceUSDT = price; p.lastTickAt = Date.now(); changed = true; }
+        });
+        if (changed && !isSentryRunning) { isSentryRunning = true; runPredictiveSentry().finally(() => { isSentryRunning = false; }); }
+      } catch (e) {}
+    });
+    w.on('error', (e) => console.warn('[Futures Stream Error]', e.message));
+    w.on('close', () => { if (futuresWs === w) { futuresWs = null; setTimeout(syncFuturesStream, 2500); } });
+    return;
+  }
+  if (futuresWs.readyState !== WebSocket.OPEN) return;
+  const add = [...wanted].filter((s) => !futuresStreams.has(s));
+  const drop = [...futuresStreams].filter((s) => !wanted.has(s));
+  if (add.length) { add.forEach((s) => futuresStreams.add(s)); futuresWs.send(JSON.stringify({ method: 'SUBSCRIBE', params: add, id: Date.now() })); }
+  if (drop.length) { drop.forEach((s) => futuresStreams.delete(s)); futuresWs.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: drop, id: Date.now() + 1 })); }
+}
+
 function syncActiveSymbolSubscriptions() {
+  syncFuturesStream();
   if (!binanceGlobalWs || binanceGlobalWs.readyState !== WebSocket.OPEN) return;
   const currentSymbols = new Set([
-    ...Object.keys(State.activePositions || {}),
-    ...Object.keys(State.recoveryBags || {})
+    ...Object.keys(State.activePositions || {}).filter((k) => !isShort(State.activePositions[k])),
+    ...Object.keys(State.recoveryBags || {}).filter((k) => !isShort(State.recoveryBags[k]))
   ]);
 
   const wanted = new Set([...currentSymbols].map((sym) => `${sym.toLowerCase()}@miniTicker`));
@@ -1888,5 +2188,6 @@ setInterval(async () => {
   }
 }, 1000);
 
+setInterval(() => { settleFunding().catch((e) => console.error('[Funding]', e.message)); }, 60000);
 setInterval(broadcastPriceStream, 500);
 setInterval(runDynamicScreener, 60000);
