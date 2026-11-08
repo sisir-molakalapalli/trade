@@ -27,6 +27,7 @@
  * =========================================================================
  */
 'use strict';
+const Candles = require('./candles');
 
 const CONFIG = {
   feePct: 0.10,              // Binance spot taker fee per side, in %
@@ -54,9 +55,7 @@ const CONFIG = {
   maxExtensionPct: 3.0,      // max distance above the 1h EMA20 (no FOMO)
   minRvol: 1.3,              // breakout bar volume vs prior 20 bars
   breakoutLookback: 8,       // 8 x 15m = 2h range
-  btcMax15mDropPct: -0.40,   // last closed BTC 15m bar must not be worse than this
-  btcEma50BufferPct: 1.0,    // BTC gate pauses only when BTC closes this far BELOW its 1h EMA50 ...
-                             // ... or when the 1h EMA20 is under the EMA50 and price under the EMA20
+  btcMax15mDropPct: -0.35,   // BTC Macro Weather Gate: pause entries when the LIVE 15m candle is <= this
   maxChaseR: 0.5,            // skip if live price already ran > 0.5R past signal close
 
   // ---- portfolio guard ----
@@ -115,37 +114,27 @@ const reject = (reason) => ({ ok: false, reason });
 
 // ------------------------------------------------------------- BTC regime
 /**
- * Pauses altcoin buys only in a CLEAR BTC downtrend, or right after a 15m dump.
+ * BTC MACRO WEATHER GATE (exchange-wide circuit breaker) — per the
+ * "Bitcoin Macro Weather Gate" specification:
+ *   Δ = (close_cur - open_cur) / open_cur × 100 on the CURRENT (live) BTCUSDT 15m candle.
+ *   Δ <= btcMax15mDropPct (-0.35%) -> PAUSED: no new altcoin entries.
+ *   Δ >  -0.35%                    -> NORMAL.
+ * Resets on its own: a new 15m candle opens with Δ = 0. Exits are never affected.
+ * FAIL-OPEN: missing/failed BTC data returns ok (spec §5), so a network blip can't freeze entries.
  *
- * v5.0 paused whenever BTC closed below its 1h EMA50 — 53% of the time over 180 days, often
- * for an hour at a time while BTC hovered on the line. A 180-day replay showed the trades that
- * rule blocked were no worse than the ones it allowed (-0.32R vs -0.34R per trade), so it now
- * pauses only when the downtrend is clear (~37% of the time):
- *   - the last 1h close is more than btcEma50BufferPct (1%) below the 1h EMA50, or
- *   - the 1h EMA20 is below the EMA50 AND price is below the EMA20 (trend has rolled over).
+ * (btc1h is accepted only so older callers keep working; the gate no longer uses the 1h trend.)
  */
 function evaluateBtcRegime(btc1h, btc15, now = Date.now(), cfg = CONFIG) {
-  const h = toBars(closedOnly(btc1h, now));
-  const m = toBars(closedOnly(btc15, now));
-  if (h.length < 55 || m.length < 2) return { ok: false, reason: 'BTC data unavailable' };
-  const closes = h.map((b) => b.c);
-  const e50 = emaSeries(closes, 50);
-  const e20 = emaSeries(closes, 20);
-  const last = closes[closes.length - 1];
-  const lastM = m[m.length - 1];
-  const chg15 = lastM.o > 0 ? ((lastM.c - lastM.o) / lastM.o) * 100 : 0;
-  const ema50 = e50[e50.length - 1], ema20 = e20[e20.length - 1];
-  const downtrendLine = ema50 * (1 - cfg.btcEma50BufferPct / 100);
-  if (last < downtrendLine) {
-    return { ok: false, reason: `BTC $${last.toFixed(2)} is more than ${cfg.btcEma50BufferPct}% below its 1h EMA50 ($${downtrendLine.toFixed(2)}) — clear downtrend`, chg15 };
+  const live = Array.isArray(btc15) && btc15.length ? toBars(btc15.filter((k) => Array.isArray(k) && num(k[0]) <= now)) : [];
+  const cur = live[live.length - 1];
+  if (!cur || !(cur.o > 0) || !(cur.c > 0)) {
+    return { ok: true, chg15: 0, failOpen: true, reason: 'BTC data unavailable — gate fails open' };
   }
-  if (ema20 < ema50 && last < ema20) {
-    return { ok: false, reason: `BTC 1h EMA20 below EMA50 and price $${last.toFixed(2)} below EMA20 $${ema20.toFixed(2)} — trend rolled over`, chg15 };
-  }
+  const chg15 = ((cur.c - cur.o) / cur.o) * 100;
   if (chg15 <= cfg.btcMax15mDropPct) {
-    return { ok: false, reason: `BTC 15m bar ${chg15.toFixed(2)}% <= ${cfg.btcMax15mDropPct}%`, chg15 };
+    return { ok: false, chg15, btcOpen15: cur.o, reason: `BTC 15m dip ${chg15.toFixed(2)}% <= ${cfg.btcMax15mDropPct}%` };
   }
-  return { ok: true, chg15, btcAboveEma20: last >= ema20 };
+  return { ok: true, chg15, btcOpen15: cur.o };
 }
 
 // ------------------------------------------------------------ entry check
@@ -373,9 +362,9 @@ function inSymbolCooldown(trades, pair, now = Date.now(), cfg = CONFIG) {
     now - num(t.id) < cfg.symbolCooldownMin * 60000);
 }
 
-// ------------------------------------------------ Nison candlestick analyzer
-// (unchanged from v4.3; now always fed CLOSED candles so it cannot repaint)
-function analyzeCandlestickPattern(klines) {
+// ------------------------------------------------ legacy candlestick analyzer (v4.3)
+// Kept only for comparison tests. The engine now uses the Nison engine in candles.js.
+function analyzeCandlestickPatternLegacy(klines) {
   if (!Array.isArray(klines) || klines.length < 5) {
     return { 
       isBearishReversal: false, 
@@ -682,6 +671,37 @@ function analyzeCandlestickPattern(klines) {
   };
 }
 
+// ------------------------------------------------ Nison candlestick analyzer (v5.5)
+/**
+ * Full pattern set from Nison's "Japanese Candlestick Charting Techniques" (candles.js), with
+ * the book's rules: required prior trend for reversals, next-candle confirmation for the weaker
+ * signals, and convergence with volume / support-resistance / RSI. Returns the same fields the
+ * screener and evaluateEntry always used, plus the full list of detected patterns.
+ * Feed CLOSED candles only (oldest first).
+ */
+function analyzeCandlestickPattern(klines) {
+  const r = Candles.scan(klines);
+  const last = Array.isArray(klines) && klines.length ? klines[klines.length - 1] : null;
+  const o = last ? num(last[1]) : 0, c = last ? num(last[4]) : 0;
+  const bull = r.bull[0], bear = r.bear[0];
+  const bullishPatternName = bull ? bull.name : 'NONE';
+  const bearishPatternName = bear ? bear.name : 'NONE';
+  return {
+    isBearishReversal: !!bear,
+    isBullishReversal: r.bull.some((p) => p.kind === 'reversal'),
+    isBullishEntry: !!bull && !bear,
+    bullishPatternName,
+    bearishPatternName,
+    patternName: bear ? bearishPatternName : bullishPatternName,
+    confidence: (bear || bull || {}).strength || 0,
+    patternRvol: (bull || bear || {}).rvol || 1.0,
+    bodyPct: o > 0 ? (Math.abs(c - o) / o) * 100 : 0,
+    trend: r.trend,
+    patterns: r.patterns,       // everything detected, incl. warnings and signals awaiting confirmation
+    warnings: r.warnings
+  };
+}
+
 module.exports = {
   CONFIG,
   closedOnly,
@@ -696,5 +716,6 @@ module.exports = {
   netPnl,
   portfolioGuard,
   inSymbolCooldown,
-  analyzeCandlestickPattern
+  analyzeCandlestickPattern,
+  analyzeCandlestickPatternLegacy
 };
