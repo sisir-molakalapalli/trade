@@ -1,24 +1,12 @@
 /**
  * =========================================================================
- * SISIR QUANT TERMINAL - BACKEND ENGINE v5.0 (RISK-FIRST REBUILD)
+ * SISIR QUANT TERMINAL - BACKEND ENGINE v5.8 (v4 ENTRIES, NO-LOSS EXITS, RECOVERY BAGS)
  * =========================================================================
  * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
  * No orders are sent to Binance from this file.
  *
- * What changed from v4.3 and why (full notes in CHANGES.md):
- *  - Every trade has a real stop (0.6%..1.5%) from the moment it opens.
- *    v4 never sold below +0.35%, parked losers as "recovery bags" and only cut
- *    them at -3.80% -> that rule is what produced the hard-disaster cuts.
- *  - The v4 breakeven/profit locks could not fire (zero-width trigger window).
- *  - Size is set from the stop: one stop-out = 0.5% of equity.
- *  - Exits in R: breakeven at +1R, 50% off at +1.5R, trail, full exit at +3R,
- *    time-stop if a trade does nothing for 90 minutes.
- *  - Entries use CLOSED candles only, require a 1h uptrend + healthy BTC,
- *    skip coins too volatile for the stop, never chase. Missing data = no trade.
- *  - Daily loss limit (-2%), pause after 3 losses in a row, 4h cooldown on a
- *    coin after it loses, learning-engine blacklist actually enforced.
- *  - Fixed: double-run sentry, TP1 cash leak, fake $500 cash refills,
- *    fees missing from P&L.
+ * Exits: the engine never sells below +0.35%. A failing position moves to a Spot
+ * Recovery Bag, which closes only at +0.30%. See CHANGES.md v5.8.
  * Strategy logic lives in strategy.js (shared with backtest.js).
  * =========================================================================
  */
@@ -122,8 +110,8 @@ const State = {
     btcMacroGate: { status: 'NORMAL', allowAltcoinEntries: true, btcChange15m: 0, reason: 'BTC macro healthy' },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
-    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'v5: Hard stop 0.6-1.5% • BE at +1R • TP1 50% at +1.5R • Trail • Exit +3R • 90m time-stop' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'v5: no new bags. Legacy bags exit at breakeven+fees or -3.80%', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% floor • Candlestick harvest • Trail • Failing trades move to recovery bags' },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at +0.30% only', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -492,7 +480,7 @@ async function runDynamicScreener() {
       try {
         // 100 bars = same cache key the entry evaluator uses; patterns on CLOSED bars only
         const klines15m = await getCachedKlines(topSym, '15m', 100, 2000);
-        const pat = Strategy.analyzeCandlestickPattern(Strategy.closedOnly(klines15m));
+        const pat = Strategy.assessCandles(Strategy.closedOnly(klines15m));
         if (universe[topSym]) {
           // Penalize stale 24h gainers that are actively bleeding in the 1h timeframe
           if (Array.isArray(klines15m) && klines15m.length >= 5) {
@@ -504,13 +492,14 @@ async function runDynamicScreener() {
             }
           }
 
-          if (pat.bullishPatternName !== 'NONE') {
-            universe[topSym].candlestickPattern = pat.bullishPatternName;
-            const rvolBonus = (pat.patternRvol >= 1.25) ? 5 : 0;
-            universe[topSym].score = Math.min(99, universe[topSym].score + 10 + rvolBonus);
-          } else if (pat.bearishPatternName !== 'NONE') {
-            universe[topSym].candlestickPattern = `⚠️ ${pat.bearishPatternName}`;
+          if (pat.bearish) {
+            universe[topSym].candlestickPattern = `⚠️ ${pat.bearPattern}`;
             universe[topSym].score = Math.max(0, universe[topSym].score - 18);
+          } else if (pat.buy) {
+            universe[topSym].candlestickPattern = pat.pattern;
+            universe[topSym].score = Math.min(99, universe[topSym].score + 10 + Math.min(6, pat.convergence.length * 2));
+          } else if (pat.pattern !== 'NONE') {
+            universe[topSym].candlestickPattern = `${pat.pattern} (against trend)`;
           }
         }
       } catch (err) {}
@@ -536,7 +525,8 @@ const FEE_RATE = Strategy.CONFIG.feePct / 100;
 function openPosition(pairKey, signal, plan, takerBuyRatio) {
   const sym = pairKey.replace(/USDT$/, '');
   const entry = plan.entryPrice;
-  const R = entry - plan.stopPrice;
+  const bagAt = entry * (1 + Strategy.EXIT_RULES.demotePct / 100);
+  const tp1 = entry * (1 + Strategy.EXIT_RULES.tp1Pct / 100);
   const cost = plan.notional * (1 + FEE_RATE);
   if (State.portfolio.cashUSDT < cost) {
     logOperation('CASH_GUARD', `Cannot open ${sym}/USDT: need $${cost.toFixed(2)}, free cash $${State.portfolio.cashUSDT.toFixed(2)}.`, 'danger');
@@ -547,7 +537,7 @@ function openPosition(pairKey, signal, plan, takerBuyRatio) {
   State.activePositions[pairKey] = {
     pair: `${sym}/USDT`,
     pairSymbol: sym,
-    strategyVersion: 5,
+    strategyVersion: 6,
     openedAt: Date.now(),
     entryPriceUSDT: entry,
     livePriceUSDT: entry,
@@ -555,14 +545,14 @@ function openPosition(pairKey, signal, plan, takerBuyRatio) {
     qty: plan.qty,
     notionalUSDT: plan.notional,
     initialNotionalUSDT: plan.notional,
-    initialStopPrice: plan.stopPrice,
-    sl: plan.stopPrice,
+    initialStopPrice: bagAt,
+    sl: bagAt,
     stopPct: Number(plan.stopPct.toFixed(3)),
     riskUSDT: plan.riskUSDT,
     atrPct: Number(signal.atrPct.toFixed(3)),
-    breakevenPrice: entry + Strategy.CONFIG.breakevenAtR * R,
-    tp1Price: entry + Strategy.CONFIG.tp1AtR * R,
-    targetPrice: entry + Strategy.CONFIG.finalTargetR * R,
+    breakevenPrice: entry * (1 + Strategy.EXIT_RULES.floorPct / 100),
+    tp1Price: tp1,
+    targetPrice: entry * 1.03,
     peakGainPct: 0,
     peakHighPrice: entry,
     ratchetStage: 'INITIAL',
@@ -572,10 +562,9 @@ function openPosition(pairKey, signal, plan, takerBuyRatio) {
 
   logOperation('EXECUTION',
     `BOUGHT ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}) via [${signal.pattern}] • ` +
-    `Stop $${formatPrecisePrice(plan.stopPrice)} (-${plan.stopPct.toFixed(2)}%, risk $${plan.riskUSDT.toFixed(2)}) • ` +
-    `TP1 $${formatPrecisePrice(entry + 1.5 * R)} • Target $${formatPrecisePrice(entry + 3 * R)} • RVOL ${signal.rvol}x • Taker ${takerBuyRatio}%`,
+    `Min exit +0.35% • Moves to recovery bag at -2.80% • RVOL ${signal.rvol}x • Taker ${takerBuyRatio}%`,
     'success');
-  console.log(`[Order] BUY ${pairKey} @ ${entry} notional ${plan.notional} stop ${plan.stopPrice}`);
+  console.log(`[Order] BUY ${pairKey} @ ${entry} notional ${plan.notional}`);
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -592,6 +581,11 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   if (!pos || pos.exitInProgress) return null;
 
   const entry = Number(pos.entryPriceUSDT);
+  // Hard rule: only the user's own manual close can realize a loss.
+  if (!/MANUAL/.test(typeLabel) && price < entry) {
+    logOperation('SENTRY', `${pos.pair}: blocked ${typeLabel} below entry. Position stays open.`, 'warning');
+    return null;
+  }
   const totalQty = Number(pos.qty) || (Number(pos.notionalUSDT) / entry);
   const qtySold = fraction >= 1 ? totalQty : totalQty * fraction;
   const proceeds = qtySold * price * (1 - FEE_RATE);
@@ -621,7 +615,7 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
     pnlUSDT: Number(pnl.toFixed(4)),
     holdMinutes: Math.round((Date.now() - Number(pos.openedAt || Date.now())) / 60000),
     feesIncluded: true, // v5 P&L is already net of both 0.10% fees
-    strategyVersion: 5,
+    strategyVersion: 6,
     reason: reasonText
   };
 
@@ -653,55 +647,25 @@ function throttledNotice(key, category, message, level = 'info', everyMs = 60000
 // AUTOPILOT ENTRY GATES (restored from v4 — see autopilot_engine_complete_logic_specification.md)
 // -------------------------------------------------------------
 async function checkCandlestickSentry(symbol) {
+  const none = { isBearishReversal: false, isBullishEntry: false, bullishPatternName: 'NONE', bearishPatternName: 'NONE', patternName: 'NONE', confidence: 0, patternRvol: 1.0, convergence: [], major: 'flat' };
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-
-    const klines5m = await getCachedKlines(pairSym, '5m', 8, 2500, 20000);
-    const klines15m = await getCachedKlines(pairSym, '15m', 8, 2500, 20000);
-
-    const pat5m = Strategy.analyzeCandlestickPatternLegacy(klines5m);
-    const pat15m = Strategy.analyzeCandlestickPatternLegacy(klines15m);
-
-    const isBearish = pat5m.isBearishReversal || pat15m.isBearishReversal;
-    const isBullish = pat5m.isBullishReversal || pat15m.isBullishReversal;
-    const isBullishEntry = pat15m.isBullishEntry || pat5m.isBullishEntry;
-
-    const activeBullishPattern = pat15m.bullishPatternName !== 'NONE' 
-      ? `${pat15m.bullishPatternName} (15m)` 
-      : (pat5m.bullishPatternName !== 'NONE' ? `${pat5m.bullishPatternName} (5m)` : 'NONE');
-
-    const activeBearishPattern = pat15m.bearishPatternName !== 'NONE' 
-      ? `${pat15m.bearishPatternName} (15m)` 
-      : (pat5m.bearishPatternName !== 'NONE' ? `${pat5m.bearishPatternName} (5m)` : 'NONE');
-
-    const activePattern = activeBearishPattern !== 'NONE' ? activeBearishPattern : activeBullishPattern;
-
-    if (activePattern !== 'NONE') {
-      State.subsystems.candlestickSentry.lastPatternDetected = `${pairSym}: ${activePattern}`;
-    }
-
-    return {
-      isBearishReversal: isBearish,
-      isBullishReversal: isBullish,
-      isBullishEntry: isBullishEntry,
-      bullishPatternName: activeBullishPattern,
-      bearishPatternName: activeBearishPattern,
-      patternName: activePattern,
-      confidence: Math.max(pat5m.confidence, pat15m.confidence),
-      patternRvol: Math.max(pat5m.patternRvol || 1.0, pat15m.patternRvol || 1.0)
-    };
+    const [k15, k1h] = await Promise.all([
+      getCachedKlines(pairSym, '15m', 100, 2500),
+      getCachedKlines(pairSym, '1h', 60, 3500, 20000)
+    ]);
+    const closed15 = Strategy.closedOnly(k15);
+    if (!Array.isArray(closed15) || closed15.length < 30) return none;
+    const a = Strategy.assessCandles(closed15, { major: Strategy.majorTrendOf(Strategy.closedOnly(k1h)) });
+    const bull = a.pattern !== 'NONE' ? `${a.pattern} (15m)` : 'NONE';
+    const bear = a.bearPattern !== 'NONE' ? `${a.bearPattern} (15m)` : 'NONE';
+    const patternName = bear !== 'NONE' ? bear : bull;
+    if (patternName !== 'NONE') State.subsystems.candlestickSentry.lastPatternDetected = `${pairSym}: ${patternName}`;
+    return { isBearishReversal: a.bearish, isBullishEntry: a.buy, bullishPatternName: bull, bearishPatternName: bear, patternName,
+      confidence: a.score, patternRvol: a.rvol, convergence: a.convergence, major: a.major, vetoes: a.vetoes };
   } catch (e) {
-    return { 
-      isBearishReversal: false, 
-      isBullishReversal: false, 
-      isBullishEntry: false, 
-      bullishPatternName: 'NONE', 
-      bearishPatternName: 'NONE', 
-      patternName: 'NONE', 
-      confidence: 0,
-      patternRvol: 1.0
-    };
+    return none;
   }
 }
 
@@ -1029,11 +993,11 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
-      const isConfirmedPatternEntry = candleCheck.isBullishEntry && (candleCheck.patternRvol >= 1.20 || microMom.rvol >= 1.20);
+      const isConfirmedPatternEntry = candleCheck.isBullishEntry;
       const isAuthenticIgnition = (microMom.change15mPct >= 0.80 && microMom.rvol >= 1.35 && orderFlow.takerBuyRatio >= 52.0);
       if (!isConfirmedPatternEntry && !isAuthenticIgnition) {
         candidateCooldownMemo.set(pairKey, now + 12000);
-        logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting confirmed bullish pattern (Marubozu/Engulfing/Hammer/Tweezers/RisingThree) or Ignition (15m >= +0.80%).`, 'info');
+        logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting a completed Nison pattern on 15m (1h trend ${candleCheck.major}) or Ignition (15m >= +0.80%).`, 'info');
         continue;
       }
       const patternLabel = isConfirmedPatternEntry ? candleCheck.bullishPatternName : 'HIGH_VOL_IGNITION';
@@ -1069,25 +1033,52 @@ async function evaluateAutopilotEntries() {
 }
 
 // -------------------------------------------------------------
-// POSITION SENTRY (v5): one runner at a time, unconditional stops
+// POSITION SENTRY: never sells below +0.35%, failing trades move to recovery bags
 // -------------------------------------------------------------
 let sentryBusy = false;
 
 function migrateLegacyPosition(k, pos) {
-  if (pos.strategyVersion === 5 && pos.initialStopPrice) return;
-  // v4 positions had sl ABOVE entry and no real stop. Give them the widest v5 stop.
+  if (pos.strategyVersion === 6) return;
+  // Older positions carried real stops. Those stops no longer apply.
   const entry = Number(pos.entryPriceUSDT);
-  pos.initialStopPrice = entry * (1 - Strategy.CONFIG.maxStopPct / 100);
-  pos.sl = pos.tp1Secured ? Math.max(pos.initialStopPrice, entry * (1 + 2 * FEE_RATE)) : pos.initialStopPrice;
-  pos.ratchetStage = pos.tp1Secured ? 'RUNNER_TRAIL' : 'INITIAL';
-  pos.atrPct = pos.atrPct || 0.8;
-  pos.stopPct = Strategy.CONFIG.maxStopPct;
+  pos.initialStopPrice = entry * (1 + Strategy.EXIT_RULES.demotePct / 100);
+  pos.sl = pos.initialStopPrice;
+  pos.ratchetStage = 'INITIAL';
   pos.qty = Number(pos.qty) || Number(pos.notionalUSDT) / entry;
-  const R = entry - pos.initialStopPrice;
-  pos.tp1Price = entry + Strategy.CONFIG.tp1AtR * R;
-  pos.targetPrice = entry + Strategy.CONFIG.finalTargetR * R;
-  pos.strategyVersion = 5;
-  logOperation('SENTRY', `${pos.pair}: migrated v4 position to v5 risk rules (stop $${formatPrecisePrice(pos.sl)}).`, 'warning');
+  pos.tp1Price = entry * (1 + Strategy.EXIT_RULES.tp1Pct / 100);
+  pos.targetPrice = entry * 1.03;
+  pos.strategyVersion = 6;
+  logOperation('SENTRY', `${pos.pair}: moved to no-loss rules (never sold below +0.35%, failing trades go to a recovery bag).`, 'warning');
+}
+
+// Live 5m candle read, same thresholds as the original Self-Aware detector.
+async function checkSelfAwareOrderFlow(symbol) {
+  const quiet = { isApexExhausted: false, isUpsideDead: false };
+  try {
+    const k = await getCachedKlines(symbol, '5m', 5, 2500, 20000);
+    if (!Array.isArray(k) || !k.length) return quiet;
+    const cur = k[k.length - 1];
+    const [o, h, l, c, vol, tb] = [cur[1], cur[2], cur[3], cur[4], cur[5], cur[9]].map(parseFloat);
+    const range = h - l;
+    const wick = range > 0 ? (h - Math.max(o, c)) / range : 0;
+    const taker = vol > 0 ? (tb / vol) * 100 : 50;
+    const clv = range > 0 ? (c - l) / range : 0.5;
+    return { isApexExhausted: (taker < 42 && wick >= 0.35) || (clv < 0.30 && range > 0), isUpsideDead: taker < 40 && c < o && clv < 0.35 };
+  } catch (e) { return quiet; }
+}
+
+function demoteToBag(k, pos, price, reason) {
+  State.recoveryBags[k] = {
+    pair: pos.pair, pairSymbol: pos.pairSymbol, openedAt: pos.openedAt, movedAt: Date.now(),
+    entryPriceUSDT: Number(pos.entryPriceUSDT), livePriceUSDT: price, lastTickAt: Date.now(),
+    notionalUSDT: pos.notionalUSDT, qty: pos.qty,
+    targetStep: 'CLOSES AT +0.30%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + Strategy.EXIT_RULES.bagTargetPct / 100),
+    troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6
+  };
+  delete State.activePositions[k];
+  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to Spot Recovery Bag, closes at +0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
 }
 
 async function livePriceFor(k, pos) {
@@ -1116,41 +1107,47 @@ async function runPredictiveSentry() {
       if (!price) continue;
       pos.livePriceUSDT = price;
 
+      const entry = Number(pos.entryPriceUSDT);
+      const gainPct = ((price - entry) / entry) * 100;
+      const held = (Date.now() - Number(pos.openedAt || Date.now())) / 60000;
+      const signals = {};
+      if (gainPct >= Strategy.EXIT_RULES.floorPct) {
+        const candle = await checkCandlestickSentry(k);
+        if (candle.isBearishReversal) signals.bearishPattern = candle.bearishPatternName;
+        signals.peakExhausted = (await checkSelfAwareOrderFlow(k)).isApexExhausted;
+      } else if (held >= Strategy.EXIT_RULES.softDemoteMinutes && gainPct <= Strategy.EXIT_RULES.softDemotePct) {
+        signals.upsideDead = (await checkSelfAwareOrderFlow(k)).isUpsideDead;
+      }
+
       const prevStage = pos.ratchetStage;
-      const r = Strategy.managePosition(pos, price);
-      if (pos.ratchetStage !== prevStage && pos.ratchetStage === 'BREAKEVEN') {
-        logOperation('SENTRY', `${pos.pair}: +1R reached — stop moved to breakeven + fees ($${formatPrecisePrice(pos.sl)}). This trade can no longer lose.`, 'success');
+      const r = Strategy.manageNoLoss(pos, price, signals);
+      if (pos.ratchetStage !== prevStage && pos.ratchetStage === 'BREAKEVEN_LOCKED') {
+        logOperation('SENTRY', `${pos.pair}: +0.35% minimum exit locked ($${formatPrecisePrice(pos.sl)}).`, 'success');
       }
 
       if (r.action === 'PARTIAL') {
         const sellValue = Number(pos.qty) * price * r.fraction;
-        if (sellValue < 10) {
-          logOperation('SENTRY', `${pos.pair}: ${r.reason} reached, position too small to split (<$10) — stop locked at $${formatPrecisePrice(pos.sl)}.`, 'success');
+        if (sellValue < Strategy.EXIT_RULES.minPartialUSDT) {
+          logOperation('SENTRY', `${pos.pair}: +1.80% reached. Position too small to split, trailing all of it.`, 'success');
         } else {
-          realizeExit('activePositions', k, r.fraction, price, r.reason, `${r.reason}: ${Math.round(r.fraction * 100)}% sold, runner trails`);
+          realizeExit('activePositions', k, r.fraction, price, r.reason, '50% banked at +1.80%, runner trails');
         }
       } else if (r.action === 'EXIT') {
-        realizeExit('activePositions', k, 1, price, r.reason,
-          `${r.reason} @ $${formatPrecisePrice(price)} (stop $${formatPrecisePrice(pos.sl)}, peak +${(pos.peakGainPct || 0).toFixed(2)}%)`);
+        realizeExit('activePositions', k, 1, price, r.reason, `${r.reason} @ $${formatPrecisePrice(price)} (peak +${(pos.peakGainPct || 0).toFixed(2)}%)`);
+      } else if (r.action === 'DEMOTE') {
+        demoteToBag(k, pos, price, r.reason);
       }
     }
 
-    // ---- legacy v4 recovery bags (no new bags are ever created in v5) ----
+    // ---- spot recovery bags: close at +0.30%, never in loss ----
     for (const k of Object.keys(State.recoveryBags || {})) {
       const bag = State.recoveryBags[k];
       if (!bag || bag.exitInProgress) continue;
       const price = await livePriceFor(k, bag);
       if (!price) continue;
       bag.livePriceUSDT = price;
-      const entry = Number(bag.entryPriceUSDT);
-      const gainPct = ((price - entry) / entry) * 100;
-      bag.targetExitPriceUSDT = entry * (1 + 2 * FEE_RATE + 0.0005);
-      bag.targetStep = 'LEGACY: EXIT AT BREAKEVEN + FEES';
-      if (price >= bag.targetExitPriceUSDT) {
-        realizeExit('recoveryBags', k, 1, price, 'LEGACY BAG RECOVERED', 'v4 bag closed at breakeven + fees');
-      } else if (gainPct <= -3.8) {
-        realizeExit('recoveryBags', k, 1, price, 'LEGACY BAG CUT (-3.80%)', 'v4 bag hit its original -3.80% cap');
-      }
+      const r = Strategy.manageBag(bag, price);
+      if (r.action === 'EXIT') realizeExit('recoveryBags', k, 1, price, r.reason, `Recovery bag closed at +0.30% or better @ $${formatPrecisePrice(price)}`);
     }
   } finally {
     sentryBusy = false;
