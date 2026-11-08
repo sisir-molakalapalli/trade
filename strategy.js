@@ -702,6 +702,70 @@ function analyzeCandlestickPattern(klines) {
   };
 }
 
+/* =========================================================================
+ * NO-LOSS EXITS + SPOT RECOVERY BAG (v5.8)
+ * An open position is never sold below +0.35% by the engine. If it fails it moves to a
+ * recovery bag, and a bag closes only at +0.30%. There is no loss cap and no time decay.
+ * ========================================================================= */
+const EXIT_RULES = {
+  floorPct: 0.35, profitLockAtPct: 0.70, profitLockPct: 0.50, trailAtPct: 1.00, trailPct: 0.35,
+  tp1Pct: 1.80, runnerTrailPct: 0.50, scratchMinutes: 45,
+  demotePct: -2.80, softDemotePct: -1.50, softDemoteMinutes: 25,
+  bagTargetPct: 0.30, minPartialUSDT: 10
+};
+
+/**
+ * @param signals { bearishPattern: string|null, peakExhausted: bool, upsideDead: bool }
+ * @returns { action: 'HOLD'|'PARTIAL'|'EXIT'|'DEMOTE', fraction?, reason? }
+ */
+function manageNoLoss(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES) {
+  const entry = num(pos.entryPriceUSDT);
+  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
+  const gain = Number((((price - entry) / entry) * 100).toFixed(3));
+  const held = (now - num(pos.openedAt || now)) / 60000;
+  pos.peakGainPct = Math.max(num(pos.peakGainPct) || 0, gain);
+  pos.peakHighPrice = Math.max(num(pos.peakHighPrice) || entry, price);
+  const peak = pos.peakGainPct, floor = entry * (1 + R.floorPct / 100);
+  const stage = pos.ratchetStage || 'INITIAL';
+
+  if (peak >= R.floorPct && stage === 'INITIAL') { pos.ratchetStage = 'BREAKEVEN_LOCKED'; pos.sl = floor; }
+  if (peak >= R.profitLockAtPct && ['INITIAL', 'BREAKEVEN_LOCKED'].includes(pos.ratchetStage)) {
+    pos.ratchetStage = 'PROFIT_LOCKED'; pos.sl = Math.max(floor, entry * (1 + R.profitLockPct / 100));
+  }
+  if (peak >= R.trailAtPct && pos.ratchetStage !== 'RUNNER_TRAIL') {
+    pos.ratchetStage = 'DYNAMIC_TRAIL'; pos.sl = Math.max(floor, num(pos.sl) || 0, pos.peakHighPrice * (1 - R.trailPct / 100));
+  }
+  let partial = null;
+  if (gain >= R.tp1Pct && !pos.tp1Secured) {
+    pos.tp1Secured = true; pos.ratchetStage = 'RUNNER_TRAIL';
+    partial = { action: 'PARTIAL', fraction: 0.5, reason: 'TP1 1.8%' };
+  }
+  if (pos.ratchetStage === 'RUNNER_TRAIL') pos.sl = Math.max(floor, num(pos.sl) || 0, pos.peakHighPrice * (1 - R.runnerTrailPct / 100));
+
+  if (price >= floor) {
+    if (signals.bearishPattern) return { action: 'EXIT', reason: `CANDLE HARVEST [${signals.bearishPattern}]` };
+    if (signals.peakExhausted) return { action: 'EXIT', reason: 'PEAK HARVEST' };
+    if (pos.ratchetStage !== 'INITIAL' && price <= num(pos.sl)) return { action: 'EXIT', reason: pos.tp1Secured ? 'RUNNER EXIT' : 'TRAILING STOP' };
+    if (held >= R.scratchMinutes) return { action: 'EXIT', reason: 'TIME SCRATCH 45M' };
+    if (partial) return partial;
+    return { action: 'HOLD' };
+  }
+  if (gain <= R.demotePct || (held >= R.softDemoteMinutes && gain <= R.softDemotePct && signals.upsideDead)) {
+    return { action: 'DEMOTE', reason: `${gain.toFixed(2)}%` };
+  }
+  return { action: 'HOLD' };
+}
+
+/** A recovery bag closes only at entry +0.30% or better. */
+function manageBag(bag, price, R = EXIT_RULES) {
+  const entry = num(bag.entryPriceUSDT);
+  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
+  bag.targetExitPriceUSDT = entry * (1 + R.bagTargetPct / 100);
+  bag.targetStep = 'CLOSES AT +0.30%';
+  bag.troughPrice = Math.min(num(bag.troughPrice) || price, price);
+  return price >= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
+}
+
 module.exports = {
   CONFIG,
   closedOnly,
@@ -717,5 +781,10 @@ module.exports = {
   portfolioGuard,
   inSymbolCooldown,
   analyzeCandlestickPattern,
-  analyzeCandlestickPatternLegacy
+  analyzeCandlestickPatternLegacy,
+  assessCandles: Candles.assess,
+  majorTrendOf: Candles.majorTrendOf,
+  EXIT_RULES,
+  manageNoLoss,
+  manageBag
 };
