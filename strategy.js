@@ -704,13 +704,14 @@ function analyzeCandlestickPattern(klines) {
 
 /* =========================================================================
  * NO-LOSS EXITS + SPOT RECOVERY BAG (v5.8)
- * An open position is never sold below +0.35% by the engine. If it fails it moves to a
+ * An open position is never closed below its minimum exit (+0.30% long, +0.20% short: both about
+ * +0.10% after fees) by the engine. If it falls 3.50% it moves to a
  * recovery bag, and a bag closes only at +0.30%. There is no loss cap and no time decay.
  * ========================================================================= */
 const EXIT_RULES = {
-  floorPct: 0.35, profitLockAtPct: 0.70, profitLockPct: 0.50, trailAtPct: 1.00, trailPct: 0.35,
+  floorPct: 0.30, shortFloorPct: 0.20, profitLockAtPct: 0.70, profitLockPct: 0.50, trailAtPct: 1.00, trailPct: 0.35,
   tp1Pct: 1.80, runnerTrailPct: 0.50, scratchMinutes: 45,
-  demotePct: -2.80, softDemotePct: -1.50, softDemoteMinutes: 25,
+  demotePct: -3.50,
   bagTargetPct: 0.30, minPartialUSDT: 10
 };
 
@@ -750,7 +751,7 @@ function manageNoLoss(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES
     if (partial) return partial;
     return { action: 'HOLD' };
   }
-  if (gain <= R.demotePct || (held >= R.softDemoteMinutes && gain <= R.softDemotePct && signals.upsideDead)) {
+  if (gain <= R.demotePct) {
     return { action: 'DEMOTE', reason: `${gain.toFixed(2)}%` };
   }
   return { action: 'HOLD' };
@@ -837,7 +838,7 @@ function manageShort(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES)
   if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
   const mirror = (x) => 2 * entry - x;
   const shadow = { ...pos, sl: mirror(num(pos.sl) || entry), peakHighPrice: mirror(num(pos.peakLowPrice) || entry) };
-  const r = manageNoLoss(shadow, mirror(price), signals, now, R);
+  const r = manageNoLoss(shadow, mirror(price), signals, now, { ...R, floorPct: R.shortFloorPct });
   pos.peakGainPct = shadow.peakGainPct;
   pos.peakLowPrice = mirror(shadow.peakHighPrice);
   pos.ratchetStage = shadow.ratchetStage;
