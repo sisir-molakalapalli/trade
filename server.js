@@ -69,8 +69,8 @@ const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 
 // Paper account size. On the first boot with a new CAPITAL_RESET_ID the saved account is
 // re-based so total value (cash + open positions) equals STARTING_EQUITY_USDT.
-const STARTING_EQUITY_USDT = Number(process.env.STARTING_EQUITY_USDT) || 21;
-const CAPITAL_RESET_ID = process.env.CAPITAL_RESET_ID || 'equity-21usd-2026-11-07';
+const STARTING_EQUITY_USDT = Number(process.env.STARTING_EQUITY_USDT) || 110;
+const CAPITAL_RESET_ID = process.env.CAPITAL_RESET_ID || 'equity-110usd-2026-11-09';
 
 // In-memory trade dispatch deduplication
 const recentTradeDispatches = new Set();
@@ -125,7 +125,6 @@ const State = {
     maxRecoveryBagsLimit: 5,
     governorTier: 'UNLIMITED_SPRINT',
     maxTradesPer24h: 9999,
-    maxConcurrentPositions: 3,
     rollingTrades24h: [],
     consecutiveWinStreak: 0,
     nextSlotReleaseTimestamp: 0,
@@ -302,7 +301,7 @@ async function refreshMarketMode(tickers) {
   const before = State.subsystems.marketMode.mode;
   State.subsystems.marketMode = { ...r, breadth: r.breadth === null || r.breadth === undefined ? null : Number(r.breadth.toFixed(2)), updatedAt: Date.now() };
   if (before !== r.mode) {
-    logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${r.side === 'LONG' ? 'Autopilot opens spot longs.' : r.side === 'SHORT' ? 'Autopilot opens USD-M shorts.' : 'No new trades.'} Open positions keep their exits.`, 'warning');
+    logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${r.side === 'LONG' ? 'Autopilot opens futures longs.' : r.side === 'SHORT' ? 'Autopilot opens futures shorts.' : r.side === 'BOTH' ? 'Autopilot follows each coin\'s own 1h trend.' : 'No new trades.'} Open positions keep their exits.`, 'warning');
   }
   return r;
 }
@@ -315,6 +314,9 @@ const FAPI_BASE = process.env.FAPI_BASE || 'https://fapi.binance.com';
 const FSTREAM_URL = process.env.FSTREAM_URL || 'wss://fstream.binance.com/market/ws';
 const FUT_FEE_RATE = Strategy.FUTURES.feePct / 100;
 const isShort = (p) => Boolean(p) && p.side === 'SHORT';
+// Spot positions opened before the move to futures have no market field and finish on spot rules.
+const isFutures = (p) => isShort(p) || (Boolean(p) && p.market === 'FUTURES');
+const minExitFor = (p) => (isFutures(p) ? Strategy.EXIT_RULES.shortFloorPct : Strategy.EXIT_RULES.floorPct);
 let perpetuals = new Map();
 let perpetualsAt = 0;
 
@@ -343,11 +345,11 @@ async function refreshPerpetuals() {
 // What a market order would actually get: a long sells at the bid, a short buys back at the ask.
 const quoteMemo = new Map();
 async function executableExitPrice(k, pos) {
-  const short = isShort(pos);
+  const short = isShort(pos), fut = isFutures(pos);
   const hit = quoteMemo.get(k);
   let q = hit && Date.now() - hit.at < 250 ? hit.q : null;
   if (!q) {
-    const url = short ? `${FAPI_BASE}/fapi/v1/ticker/bookTicker?symbol=${k}` : `https://api.binance.com/api/v3/ticker/bookTicker?symbol=${k}`;
+    const url = fut ? `${FAPI_BASE}/fapi/v1/ticker/bookTicker?symbol=${k}` : `https://api.binance.com/api/v3/ticker/bookTicker?symbol=${k}`;
     q = await safeFetch(url, 1500).catch(() => null);
     if (q) quoteMemo.set(k, { at: Date.now(), q });
   }
@@ -375,20 +377,20 @@ async function fetchFuturesPrice(pairKey) {
   } catch (e) { return null; }
 }
 
-// Funding is booked per position when each settlement passes. Positive rate: shorts receive it.
+// Funding is booked per position when each settlement passes. Positive rate: shorts receive it, longs pay it.
 let fundingBusy = false;
 async function settleFunding() {
   if (fundingBusy) return;
   fundingBusy = true;
   try {
-    const held = [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isShort(p));
+    const held = [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isFutures(p));
     for (const [k, p] of held) {
       if (Date.now() < Number(p.nextFundingAt || 0)) continue;
       let d = null;
       try { d = await safeFetch(`${FAPI_BASE}/fapi/v1/premiumIndex?symbol=${k}`, 2500); } catch (e) { d = null; }
       if (!d || !(parseFloat(d.markPrice) > 0)) continue;
       if (p.nextFundingAt) {
-        const amount = Number(p.qty) * parseFloat(d.markPrice) * (parseFloat(d.lastFundingRate) || 0);
+        const amount = (isShort(p) ? 1 : -1) * Number(p.qty) * parseFloat(d.markPrice) * (parseFloat(d.lastFundingRate) || 0);
         p.fundingUSDT = Number(((Number(p.fundingUSDT) || 0) + amount).toFixed(6));
         logOperation('FUNDING', `${p.pair}: funding ${amount >= 0 ? 'received' : 'paid'} $${Math.abs(amount).toFixed(4)}.`, 'info');
       }
@@ -425,7 +427,7 @@ function computeEquity() {
   const add = (p) => {
     const px = Number(p.livePriceUSDT || p.entryPriceUSDT) || 0;
     const qty = Number(p.qty) || (Number(p.notionalUSDT) / Number(p.entryPriceUSDT || 1));
-    eq += isShort(p) ? qty * (2 * Number(p.entryPriceUSDT) - px) + (Number(p.fundingUSDT) || 0) : qty * px;
+    eq += isShort(p) ? qty * (2 * Number(p.entryPriceUSDT) - px) + (Number(p.fundingUSDT) || 0) : qty * px + (isFutures(p) ? Number(p.fundingUSDT) || 0 : 0);
   };
   Object.values(State.activePositions || {}).forEach(add);
   Object.values(State.recoveryBags || {}).forEach(add);
@@ -521,7 +523,6 @@ async function runDynamicScreener() {
     await refreshPerpetuals();
     await refreshFundingRates();
     const mode = await refreshMarketMode(tickers);
-    const bearMode = mode.side === 'SHORT';
 
     const universe = {};
     const candidateKlinesQueue = [];
@@ -563,17 +564,19 @@ async function runDynamicScreener() {
         }
       }
 
-      // In a bear market the best candidates are the weakest coins that can be shorted.
-      const shortBlock = !perpetuals.has(sym) ? 'no USD-M contract'
-        : Strategy.shortExclusion({ volumeUSD: volQuote, fundingRate: currentFundingRate(sym), listedAt: perpetuals.get(sym).listedAt });
-      const canShort = !shortBlock;
+      // Bull: strongest coins. Bear: weakest coins. Neutral: upper half of the day's range ranks as a long, lower half as a short.
+      const side = mode.side === 'SHORT' || (mode.side === 'BOTH' && posInRange < 0.5) ? 'SHORT' : 'LONG';
+      const bearMode = side === 'SHORT';
+      const tradeBlock = !perpetuals.has(sym) ? 'no USD-M contract'
+        : Strategy.futuresExclusion({ side, volumeUSD: volQuote, fundingRate: currentFundingRate(sym), listedAt: perpetuals.get(sym).listedAt });
+      const canTrade = !tradeBlock;
       let score = bearMode
         ? 60 + ((1 - posInRange) * 22) + (Math.min(-change24, 15) * 0.9)
         : 60 + (posInRange * 22) + (Math.min(change24, 15) * 0.9);
       if (volQuote >= 10000000) score += 5;
       if (rangePct >= 5.0) score += 3;
 
-      if (isPumpDump || (bearMode && !canShort)) {
+      if (isPumpDump || !canTrade) {
         score = 0;
       }
 
@@ -586,16 +589,16 @@ async function runDynamicScreener() {
         pricePositionInRange: Number(posInRange.toFixed(2)),
         score: Math.min(99, Math.round(score)),
         volumeM: Math.round(volQuote / 1000000),
-        side: bearMode ? 'SHORT' : 'LONG',
-        canShort,
-        shortBlock,
+        side,
+        canTrade,
+        tradeBlock,
         obi: 0.55,
         isPumpAndDump: isPumpDump,
         pumpDumpReason: pumpDumpReason,
         candlestickPattern: 'WATCH'
       };
 
-      if (!isPumpDump && score >= 60 && (!bearMode || canShort) && candidateKlinesQueue.length < 35) {
+      if (!isPumpDump && score >= 60 && canTrade && candidateKlinesQueue.length < 35) {
         candidateKlinesQueue.push(sym);
       }
     }
@@ -604,7 +607,8 @@ async function runDynamicScreener() {
     for (const topSym of candidateKlinesQueue) {
       try {
         // 100 bars = same cache key the entry evaluator uses; patterns on CLOSED bars only
-        const klines15m = await getCachedKlines(topSym, '15m', 100, 2000, 0, bearMode);
+        const klines15m = await getCachedKlines(topSym, '15m', 100, 2000, 0, true);
+        const bearMode = universe[topSym] && universe[topSym].side === 'SHORT';
         const closed15m = Strategy.closedOnly(klines15m);
         const pat = bearMode ? null : Strategy.assessCandles(closed15m);
         if (universe[topSym] && bearMode) {
@@ -652,7 +656,7 @@ async function runDynamicScreener() {
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
     State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= (State.activeThresholds?.scoreThreshold || 65) && !c.isPumpAndDump).length;
 
-    logOperation('RADAR_SCREENER', `[${mode.mode}] Scanned ${Object.keys(universe).length} pairs for ${bearMode ? 'shorts' : 'spot longs'}. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
+    logOperation('RADAR_SCREENER', `[${mode.mode}] Scanned ${Object.keys(universe).length} pairs for ${mode.side === 'SHORT' ? 'futures shorts' : mode.side === 'LONG' ? 'futures longs' : 'futures longs and shorts'}. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
     broadcastStateUpdate({ withUniverse: true });
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
@@ -665,49 +669,27 @@ async function runDynamicScreener() {
 // -------------------------------------------------------------
 const FEE_RATE = Strategy.CONFIG.feePct / 100;
 
-function openPosition(pairKey, signal, plan, takerBuyRatio) {
+function openLong(pairKey, signal, plan, takerBuyRatio) {
   const sym = pairKey.replace(/USDT$/, '');
   const entry = plan.entryPrice;
-  const bagAt = entry * (1 + Strategy.EXIT_RULES.demotePct / 100);
-  const tp1 = entry * (1 + Strategy.EXIT_RULES.tp1Pct / 100);
-  const cost = plan.notional * (1 + FEE_RATE);
+  const R = Strategy.EXIT_RULES;
+  const cost = plan.notional * (1 + FUT_FEE_RATE); // 1x margin plus the opening fee
   if (State.portfolio.cashUSDT < cost) {
-    logOperation('CASH_GUARD', `Cannot open ${sym}/USDT: need $${cost.toFixed(2)}, free cash $${State.portfolio.cashUSDT.toFixed(2)}.`, 'danger');
+    logOperation('CASH_GUARD', `Cannot long ${sym}/USDT: need $${cost.toFixed(2)}, free cash $${State.portfolio.cashUSDT.toFixed(2)}.`, 'danger');
     return false;
   }
   State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT - cost).toFixed(6));
-
+  const bagAt = entry * (1 + R.demotePct / 100);
   State.activePositions[pairKey] = {
-    pair: `${sym}/USDT`,
-    pairSymbol: sym,
-    strategyVersion: 6,
-    openedAt: Date.now(),
-    entryPriceUSDT: entry,
-    livePriceUSDT: entry,
-    lastTickAt: Date.now(),
-    qty: plan.qty,
-    notionalUSDT: plan.notional,
-    initialNotionalUSDT: plan.notional,
-    initialStopPrice: bagAt,
-    sl: bagAt,
-    stopPct: Number(plan.stopPct.toFixed(3)),
-    riskUSDT: plan.riskUSDT,
-    atrPct: Number(signal.atrPct.toFixed(3)),
-    breakevenPrice: entry * (1 + Strategy.EXIT_RULES.floorPct / 100),
-    tp1Price: tp1,
-    targetPrice: entry * 1.03,
-    peakGainPct: 0,
-    peakHighPrice: entry,
-    ratchetStage: 'INITIAL',
-    tp1Secured: false,
-    candlestickPattern: signal.pattern
+    pair: `${sym}/USDT`, pairSymbol: sym, side: 'LONG', market: 'FUTURES', leverage: Strategy.FUTURES.leverage, strategyVersion: 6,
+    openedAt: Date.now(), entryPriceUSDT: entry, livePriceUSDT: entry, lastTickAt: Date.now(),
+    qty: plan.qty, notionalUSDT: plan.notional, initialNotionalUSDT: plan.notional,
+    initialStopPrice: bagAt, sl: bagAt, stopPct: Number(plan.stopPct.toFixed(3)), riskUSDT: plan.riskUSDT, atrPct: Number(signal.atrPct.toFixed(3)),
+    breakevenPrice: entry * (1 + R.shortFloorPct / 100), tp1Price: entry * (1 + R.tp1Pct / 100), targetPrice: entry * 1.03,
+    fundingUSDT: 0, nextFundingAt: 0,
+    peakGainPct: 0, peakHighPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern
   };
-
-  logOperation('EXECUTION',
-    `BOUGHT ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}) via [${signal.pattern}] • ` +
-    `Min exit +0.30% • Moves to recovery bag at -3.50% • RVOL ${signal.rvol}x • Taker ${takerBuyRatio}%`,
-    'success');
-  console.log(`[Order] BUY ${pairKey} @ ${entry} notional ${plan.notional}`);
+  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper) via [${signal.pattern}] • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -726,7 +708,7 @@ function openShort(pairKey, signal, plan, takerBuyRatio) {
   State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT - cost).toFixed(6));
   const bagAt = entry * (1 - R.demotePct / 100);
   State.activePositions[pairKey] = {
-    pair: `${sym}/USDT`, pairSymbol: sym, side: 'SHORT', leverage: Strategy.FUTURES.leverage, strategyVersion: 6,
+    pair: `${sym}/USDT`, pairSymbol: sym, side: 'SHORT', market: 'FUTURES', leverage: Strategy.FUTURES.leverage, strategyVersion: 6,
     openedAt: Date.now(), entryPriceUSDT: entry, livePriceUSDT: entry, lastTickAt: Date.now(),
     qty: plan.qty, notionalUSDT: plan.notional, initialNotionalUSDT: plan.notional,
     initialStopPrice: bagAt, sl: bagAt, stopPct: Number(plan.stopPct.toFixed(3)), riskUSDT: plan.riskUSDT, atrPct: Number(signal.atrPct.toFixed(3)),
@@ -759,10 +741,13 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   }
   const totalQty = Number(pos.qty) || (Number(pos.notionalUSDT) / entry);
   const qtySold = fraction >= 1 ? totalQty : totalQty * fraction;
-  const fundingShare = short ? (Number(pos.fundingUSDT) || 0) * (fraction >= 1 ? 1 : fraction) : 0;
-  const proceeds = short ? qtySold * (2 * entry - price) - qtySold * price * FUT_FEE_RATE + fundingShare : qtySold * price * (1 - FEE_RATE);
-  const pnl = short ? Strategy.netPnlShort(qtySold, entry, price) + fundingShare : Strategy.netPnl(qtySold, entry, price);
-  if (short && fraction < 1) pos.fundingUSDT = Number(((Number(pos.fundingUSDT) || 0) - fundingShare).toFixed(6));
+  const fut = isFutures(pos);
+  const fundingShare = fut ? (Number(pos.fundingUSDT) || 0) * (fraction >= 1 ? 1 : fraction) : 0;
+  const proceeds = short ? qtySold * (2 * entry - price) - qtySold * price * FUT_FEE_RATE + fundingShare
+    : fut ? qtySold * price - qtySold * price * FUT_FEE_RATE + fundingShare : qtySold * price * (1 - FEE_RATE);
+  const pnl = short ? Strategy.netPnlShort(qtySold, entry, price) + fundingShare
+    : fut ? Strategy.netPnlLongFutures(qtySold, entry, price) + fundingShare : Strategy.netPnl(qtySold, entry, price);
+  if (fut && fraction < 1) pos.fundingUSDT = Number(((Number(pos.fundingUSDT) || 0) - fundingShare).toFixed(6));
 
   State.portfolio.cashUSDT = Number((Number(State.portfolio.cashUSDT) + proceeds).toFixed(6));
   State.portfolio.realizedPnL = Number((Number(State.portfolio.realizedPnL || 0) + pnl).toFixed(6));
@@ -781,9 +766,10 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   const tradePayload = {
     id: Date.now(),
     pair: pos.pair || `${key.replace('USDT', '')}/USDT`,
-    type: short ? `SHORT ${typeLabel}` : typeLabel,
+    type: short ? `SHORT ${typeLabel}` : fut ? `LONG ${typeLabel}` : typeLabel,
     side: short ? 'SHORT' : 'LONG',
-    fundingUSDT: short ? Number(fundingShare.toFixed(4)) : 0,
+    market: fut ? 'FUTURES' : 'SPOT',
+    fundingUSDT: fut ? Number(fundingShare.toFixed(4)) : 0,
     entryPriceUSDT: entry,
     exitPriceUSDT: price,
     notionalUSDT: Number((qtySold * entry).toFixed(4)),
@@ -848,9 +834,9 @@ async function checkCandlestickSentry(symbol, futures = false) {
 
 async function checkVeteranOrderFlowAndVSA(symbol) {
   try {
-    const klines = await getCachedKlines(symbol, '5m', 8, 2500, 20000);
+    const klines = await getCachedKlines(symbol, '5m', 8, 2500, 20000, true);
     if (!Array.isArray(klines) || klines.length < 3) {
-      return { passed: true, takerBuyRatio: 52, reason: 'Fallback pass' };
+      return { passed: false, reason: 'Futures data unavailable' };
     }
 
     let totalVol = 0;
@@ -875,15 +861,15 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
 
     return { passed: true, takerBuyRatio, clv: Number(clv.toFixed(2)) };
   } catch (e) {
-    return { passed: true, takerBuyRatio: 52, reason: 'Error fallback' };
+    return { passed: false, reason: 'Futures data unavailable' };
   }
 }
 
 async function checkMicrostructureMomentumAndVwap(symbol) {
   try {
-    const klines = await getCachedKlines(symbol, '15m', 16, 2500, 45000);
+    const klines = await getCachedKlines(symbol, '15m', 16, 2500, 45000, true);
     if (!Array.isArray(klines) || klines.length < 8) {
-      return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Fallback pass' };
+      return { passed: false, reason: 'Futures data unavailable' };
     }
 
     const curBar = klines[klines.length - 1];
@@ -950,7 +936,7 @@ async function checkMicrostructureMomentumAndVwap(symbol) {
       upperWickRatio: Number(upperWickRatio.toFixed(2))
     };
   } catch (e) {
-    return { passed: true, change15mPct: 0.8, rvol: 1.3, reason: 'Error fallback' };
+    return { passed: false, reason: 'Futures data unavailable' };
   }
 }
 
@@ -958,10 +944,10 @@ async function check1hTrendAlignment(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const klines = await getCachedKlines(pairSym, '1h', 60, 3500, 120000);
+    const klines = await getCachedKlines(pairSym, '1h', 60, 3500, 120000, true);
 
     if (!Array.isArray(klines) || klines.length < 20) {
-      return { passed: true, reason: 'Fallback pass' };
+      return { passed: false, reason: 'Futures data unavailable' };
     }
     const curClose = parseFloat(klines[klines.length - 1][4]);
     
@@ -1027,7 +1013,7 @@ async function check1hTrendAlignment(symbol) {
       distAboveEmaPct: Number(distAboveEmaPct.toFixed(2)) 
     };
   } catch (err) {
-    return { passed: true, reason: 'Error fallback' };
+    return { passed: false, reason: 'Futures data unavailable' };
   }
 }
 
@@ -1077,7 +1063,14 @@ async function checkShort1hTrend(symbol) {
   return { passed: true };
 }
 
-async function evaluateShortEntries(maxSlots, maxBagsLimit) {
+// Neutral market: a coin may only trade in the direction of its own closed 1h trend.
+async function coinTrendAgrees(pairKey, side) {
+  const k = await getCachedKlines(pairKey, '1h', 120, 3500, 120000, true).catch(() => null);
+  if (!Array.isArray(k)) return false;
+  return Strategy.coinTrend(Strategy.closedOnly(k).map((b) => parseFloat(b[4]))) === side;
+}
+
+async function evaluateShortEntries(maxBagsLimit) {
   if (!perpetuals.size) {
     throttledNotice('noperps', 'FUTURES', 'Market is bearish, but Binance Futures data is unavailable. No shorts opened.', 'danger', 60000);
     return;
@@ -1090,10 +1083,9 @@ async function evaluateShortEntries(maxSlots, maxBagsLimit) {
     const now = Date.now();
     const veto = (pairKey, ms, cat, msg, lvl = 'warning') => { candidateCooldownMemo.set(pairKey, now + ms); logOperation(cat, `${pairKey} short: ${msg}`, lvl); };
     for (const k of sorted) {
-      if (Object.keys(State.activePositions || {}).length >= maxSlots) break;
       if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
       const coin = State.universe[k];
-      if (!coin || !coin.symbol || coin.isPumpAndDump || coin.side !== 'SHORT' || !coin.canShort) continue;
+      if (!coin || !coin.symbol || coin.isPumpAndDump || coin.side !== 'SHORT' || !coin.canTrade) continue;
       if ((coin.score || 0) < minScore) break;
       const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
       const pairKey = `${baseSym}USDT`;
@@ -1106,6 +1098,7 @@ async function evaluateShortEntries(maxSlots, maxBagsLimit) {
       const change24h = Number(coin.change24h || 0), rangePct = Number(coin.intradayRangePct || 0);
       if (change24h > -0.20 && rangePct < 3.0) continue;
       if (Number(coin.pricePositionInRange ?? 0.3) > 0.50) continue;
+      if (State.subsystems.marketMode.mode === 'NEUTRAL' && !(await coinTrendAgrees(pairKey, 'SHORT'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
 
       const flow = await checkShortOrderFlow(pairKey);
       if (!flow.passed) { veto(pairKey, 30000, 'FLOW_VETO', flow.reason); continue; }
@@ -1135,7 +1128,7 @@ async function evaluateShortEntries(maxSlots, maxBagsLimit) {
       }
       const stopPct = Math.min(cfg.maxStopPct, Math.max(structPct, (atr || 0) * cfg.atrStopMult, cfg.minStopPct));
       const signal = { ok: true, pattern: label, refPrice: px, stopPrice: px * (1 - stopPct / 100), stopPct, atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: mom.rvol };
-      const plan = Strategy.planEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT));
+      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT));
       if (!plan.ok) { veto(pairKey, 30000, 'CASH_GUARD', plan.reason); continue; }
       const minN = perpetuals.get(pairKey)?.minNotional || 5;
       if (plan.notional < minN) { veto(pairKey, 300000, 'CASH_GUARD', `Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
@@ -1153,7 +1146,7 @@ async function buildEntrySignal(pairKey, price, pattern, microMom) {
   const cfg = Strategy.CONFIG;
   let atr = NaN, structPct = cfg.minStopPct;
   try {
-    const k = await getCachedKlines(pairKey, '15m', 16, 2500, 45000);
+    const k = await getCachedKlines(pairKey, '15m', 16, 2500, 45000, true);
     if (Array.isArray(k) && k.length >= 15) {
       const bars = Strategy.toBars(k);
       atr = Strategy.atrPct(bars, 14);
@@ -1167,13 +1160,6 @@ async function buildEntrySignal(pairKey, price, pattern, microMom) {
 
 async function evaluateAutopilotEntries() {
   if (!State.autopilotEnabled || isEvaluatingEntries) return;
-
-  const maxSlots = State.tradeFrequencyController?.maxConcurrentPositions || 3;
-  const currentCount = Object.keys(State.activePositions || {}).length;
-  if (currentCount >= maxSlots) {
-    throttledNotice('slots', 'AUTOPILOT', `All ${maxSlots} breakout slots occupied (${currentCount}/${maxSlots}). Monitoring trailing sentry.`, 'info', 30000);
-    return;
-  }
 
   const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
   const maxBagsLimit = State.tradeFrequencyController?.maxRecoveryBagsLimit || 5;
@@ -1199,10 +1185,12 @@ async function evaluateAutopilotEntries() {
     throttledNotice('mode', 'MARKET_MODE', `No new trades: ${mode.reason}.`, 'info', 120000);
     return;
   }
-  if (mode.side === 'SHORT') {
-    await evaluateShortEntries(maxSlots, maxBagsLimit);
+  if (Number(State.portfolio.cashUSDT) < Strategy.CONFIG.minNotional * (1 + FUT_FEE_RATE)) {
+    throttledNotice('cash', 'CASH_GUARD', 'Free cash is below the $5 minimum position. Waiting for open trades to close.', 'info', 60000);
     return;
   }
+  if (mode.side !== 'LONG') await evaluateShortEntries(maxBagsLimit);
+  if (mode.side === 'SHORT') return;
 
   if (learningEngine.recalculateDynamicHurdles) learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
 
@@ -1217,10 +1205,9 @@ async function evaluateAutopilotEntries() {
     const now = Date.now();
 
     for (const k of sorted) {
-      if (Object.keys(State.activePositions || {}).length >= maxSlots) break;
       if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
       const coin = State.universe[k];
-      if (!coin || !coin.symbol) continue;
+      if (!coin || !coin.symbol || coin.side !== 'LONG' || !coin.canTrade) continue;
 
       if (coin.isPumpAndDump) continue;
       if ((coin.score || 0) < minScore) break;
@@ -1245,6 +1232,7 @@ async function evaluateAutopilotEntries() {
 
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
       if (posInRange < 0.50) continue;
+      if (State.subsystems.marketMode.mode === 'NEUTRAL' && !(await coinTrendAgrees(pairKey, 'LONG'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
 
       const volQuote = (coin.volumeM || 0) * 1000000;
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
@@ -1284,7 +1272,7 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
-      const candleCheck = await checkCandlestickSentry(pairKey);
+      const candleCheck = await checkCandlestickSentry(pairKey, true);
       if (candleCheck.isBearishReversal) {
         candidateCooldownMemo.set(pairKey, now + 20000);
         logOperation('CANDLE_VETO', `${pairKey} halted: Bearish pattern detected [${candleCheck.patternName}]. Rejecting distribution wick.`, 'warning');
@@ -1300,12 +1288,11 @@ async function evaluateAutopilotEntries() {
       }
       const patternLabel = isConfirmedPatternEntry ? candleCheck.bullishPatternName : 'HIGH_VOL_IGNITION';
 
-      let book = await fetchRealOrderBookDepth(pairKey);
+      const book = await fetchRealOrderBookDepth(pairKey, true);
       if (!book) {
-        // radar prices only refresh once a minute, so ask Binance for the current price
-        const px = (await fetchTickerPrice(pairKey)) || Number(coin.priceUSDT || 0);
-        if (!(px > 0)) continue;
-        book = { obi: Number(coin.obi || 0.55), spreadPct: 0.05, bestBid: px, bestAsk: px * 1.0005 };
+        candidateCooldownMemo.set(pairKey, now + 30000);
+        logOperation('BOOK_VETO', `${pairKey} halted: futures order book unavailable.`, 'warning');
+        continue;
       }
       if (book.obi < 0.45 || book.spreadPct > 0.20) {
         candidateCooldownMemo.set(pairKey, now + 30000);
@@ -1315,15 +1302,20 @@ async function evaluateAutopilotEntries() {
 
       logOperation('BOOK_CLEAR', `${pairKey} confirmed [${patternLabel}]: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%, Taker Buy ${orderFlow.takerBuyRatio}%. Entering...`, 'success');
 
-      // Sizing keeps the $21 account / $5-minimum rule rather than the spec's $10.50 floor and $500 refill.
       const signal = await buildEntrySignal(pairKey, book.bestAsk, patternLabel, microMom);
-      const plan = Strategy.planEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT));
+      const plan = Strategy.planCompoundEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT));
       if (!plan.ok) {
         candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('CASH_GUARD', `${pairKey}: ${plan.reason}`, 'warning');
         continue;
       }
-      openPosition(pairKey, signal, plan, orderFlow.takerBuyRatio);
+      const minN = perpetuals.get(pairKey)?.minNotional || 5;
+      if (plan.notional < minN) {
+        candidateCooldownMemo.set(pairKey, now + 300000);
+        logOperation('CASH_GUARD', `${pairKey} long: Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info');
+        continue;
+      }
+      openLong(pairKey, signal, plan, orderFlow.takerBuyRatio);
     }
   } finally {
     isEvaluatingEntries = false;
@@ -1371,12 +1363,12 @@ function demoteToBag(k, pos, price, reason) {
     pair: pos.pair, pairSymbol: pos.pairSymbol, openedAt: pos.openedAt, movedAt: Date.now(),
     entryPriceUSDT: Number(pos.entryPriceUSDT), livePriceUSDT: price, lastTickAt: Date.now(),
     notionalUSDT: pos.notionalUSDT, qty: pos.qty,
-    side: isShort(pos) ? 'SHORT' : 'LONG', fundingUSDT: pos.fundingUSDT || 0, nextFundingAt: pos.nextFundingAt || 0, liquidationPrice: pos.liquidationPrice,
+    side: isShort(pos) ? 'SHORT' : 'LONG', market: isFutures(pos) ? 'FUTURES' : 'SPOT', fundingUSDT: pos.fundingUSDT || 0, nextFundingAt: pos.nextFundingAt || 0, liquidationPrice: pos.liquidationPrice,
     targetStep: 'CLOSES AT +0.30%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + (isShort(pos) ? -1 : 1) * Strategy.EXIT_RULES.bagTargetPct / 100),
     troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6
   };
   delete State.activePositions[k];
-  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : 'Spot'} Recovery Bag, closes at +0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
+  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at +0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
 }
@@ -1385,7 +1377,7 @@ async function livePriceFor(k, pos) {
   const tickPrice = Number(pos.livePriceUSDT || State.universe[k]?.priceUSDT);
   if (tickPrice > 0 && Date.now() - Number(pos.lastTickAt || 0) < 20000) return tickPrice;
   // Stream went quiet for this symbol: never manage risk on a stale price.
-  const rest = (isShort(pos) && await fetchFuturesPrice(k)) || await fetchTickerPrice(k);
+  const rest = isFutures(pos) ? await fetchFuturesPrice(k) : await fetchTickerPrice(k);
   if (rest) {
     pos.livePriceUSDT = rest;
     pos.lastTickAt = Date.now();
@@ -1408,9 +1400,9 @@ async function refreshExitSignals() {
       const gainPct = (short ? entry - live : live - entry) / entry * 100;
       const R = Strategy.EXIT_RULES;
       const s = {};
-      if (gainPct >= (short ? R.shortFloorPct : R.floorPct) - 0.10) {
-        const candle = await checkCandlestickSentry(k, short);
-        const flow = await checkSelfAwareOrderFlow(k, short);
+      if (gainPct >= minExitFor(pos) - 0.10) {
+        const candle = await checkCandlestickSentry(k, isFutures(pos));
+        const flow = await checkSelfAwareOrderFlow(k, isFutures(pos));
         if (short ? candle.isBullishSignal : candle.isBearishReversal) s.bearishPattern = short ? candle.bullSignalName : candle.bearishPatternName;
         s.peakExhausted = short ? flow.isBottomExhausted : flow.isApexExhausted;
       }
@@ -1452,11 +1444,12 @@ async function runPredictiveSentry() {
       const held = (Date.now() - Number(pos.openedAt || Date.now())) / 60000;
       const cached = exitSignals.get(k) || {};
       // Harvest signals count only in profit, the dead-flow signal only in the soft-demote window.
-      const minExitPct = short ? Strategy.EXIT_RULES.shortFloorPct : Strategy.EXIT_RULES.floorPct;
+      const minExitPct = minExitFor(pos);
       const signals = gainPct >= minExitPct ? { bearishPattern: cached.bearishPattern, peakExhausted: cached.peakExhausted } : {};
 
       const prevStage = pos.ratchetStage;
-      const r = short ? Strategy.manageShort(pos, price, signals) : Strategy.manageNoLoss(pos, price, signals);
+      const r = short ? Strategy.manageShort(pos, price, signals)
+        : Strategy.manageNoLoss(pos, price, signals, Date.now(), { ...Strategy.EXIT_RULES, floorPct: minExitPct });
       if (pos.ratchetStage !== prevStage && pos.ratchetStage === 'BREAKEVEN_LOCKED') {
         logOperation('SENTRY', `${pos.pair}: +${minExitPct.toFixed(2)}% minimum exit locked ($${formatPrecisePrice(pos.sl)}).`, 'success');
       }
@@ -1483,7 +1476,7 @@ async function runPredictiveSentry() {
       }
     }
 
-    // ---- spot recovery bags: close at +0.30%, never in loss ----
+    // ---- recovery bags: close at +0.30%, never in loss ----
     for (const k of Object.keys(State.recoveryBags || {})) {
       const bag = State.recoveryBags[k];
       if (!bag || bag.exitInProgress) continue;
@@ -1793,7 +1786,7 @@ function loadDiskState() {
   applyCapitalReset();
 }
 
-// One-time re-base of the paper account to STARTING_EQUITY_USDT ($21).
+// One-time re-base of the paper account to STARTING_EQUITY_USDT.
 // Open positions are kept; cash becomes whatever is left after their market value.
 function applyCapitalReset() {
   if (State.capitalResetId === CAPITAL_RESET_ID) return;
@@ -2109,13 +2102,13 @@ function connectBinanceGlobalStream() {
             State.universe[sym].priceINR = Number((closePrice * rate).toFixed(2));
           }
 
-          if (State.activePositions[sym] && !isShort(State.activePositions[sym])) {
+          if (State.activePositions[sym] && !isFutures(State.activePositions[sym])) {
             State.activePositions[sym].livePriceUSDT = closePrice;
             State.activePositions[sym].lastTickAt = Date.now();
             activePriceChanged = true;
           }
 
-          if (State.recoveryBags[sym] && !isShort(State.recoveryBags[sym])) {
+          if (State.recoveryBags[sym] && !isFutures(State.recoveryBags[sym])) {
             State.recoveryBags[sym].livePriceUSDT = closePrice;
             State.recoveryBags[sym].lastTickAt = Date.now();
             activePriceChanged = true;
@@ -2138,13 +2131,13 @@ function connectBinanceGlobalStream() {
   }
 }
 
-// Shorts are marked on the futures price. This socket exists only while a short is held.
+// Futures positions are marked on the futures price. This socket exists only while one is held.
 let futuresWs = null;
 let futuresStreams = new Set();
-const heldShorts = () => [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isShort(p)).map(([k]) => k);
+const heldFutures = () => [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isFutures(p)).map(([k]) => k);
 
 function syncFuturesStream() {
-  const wanted = new Set(heldShorts().map((s) => `${s.toLowerCase()}@aggTrade`));
+  const wanted = new Set(heldFutures().map((s) => `${s.toLowerCase()}@aggTrade`));
   if (!wanted.size) {
     if (futuresWs) { const w = futuresWs; futuresWs = null; futuresStreams = new Set(); try { w.terminate(); } catch (e) {} }
     return;
@@ -2162,7 +2155,7 @@ function syncFuturesStream() {
         if (!(price > 0)) return;
         let changed = false;
         [State.activePositions[t.s], State.recoveryBags[t.s]].forEach((p) => {
-          if (isShort(p)) { p.livePriceUSDT = price; p.lastTickAt = Date.now(); changed = true; }
+          if (isFutures(p)) { p.livePriceUSDT = price; p.lastTickAt = Date.now(); changed = true; }
         });
         if (changed) kickSentry();
       } catch (e) {}
@@ -2182,8 +2175,8 @@ function syncActiveSymbolSubscriptions() {
   syncFuturesStream();
   if (!binanceGlobalWs || binanceGlobalWs.readyState !== WebSocket.OPEN) return;
   const currentSymbols = new Set([
-    ...Object.keys(State.activePositions || {}).filter((k) => !isShort(State.activePositions[k])),
-    ...Object.keys(State.recoveryBags || {}).filter((k) => !isShort(State.recoveryBags[k]))
+    ...Object.keys(State.activePositions || {}).filter((k) => !isFutures(State.activePositions[k])),
+    ...Object.keys(State.recoveryBags || {}).filter((k) => !isFutures(State.recoveryBags[k]))
   ]);
 
   const wanted = new Set([...currentSymbols].map((sym) => `${sym.toLowerCase()}@aggTrade`));
