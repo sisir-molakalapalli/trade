@@ -5,7 +5,7 @@
  * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
  * No orders are sent to Binance from this file.
  *
- * Exits: the engine never sells below +0.35%. A failing position moves to a Spot
+ * Exits: the engine never closes below +0.30% (long) or +0.20% (short). A failing position moves to a Spot
  * Recovery Bag, which closes only at +0.30%. See CHANGES.md v5.8.
  * Strategy logic lives in strategy.js (shared with backtest.js).
  * =========================================================================
@@ -111,7 +111,7 @@ const State = {
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
-    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min +0.35% floor • Candlestick harvest • Trail • Failing trades move to recovery bags' },
+    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • Trail • Failing trades move to recovery bags' },
     recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at +0.30% only', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
@@ -248,10 +248,10 @@ function logOperation(category, message, level = 'info') {
 const klineCache = new Map();
 // maxAgeMs: callers that read the LIVE (still open) candle — e.g. the BTC gate — pass 20000 so the
 // open bar is never more than 20s old.
-async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500, maxAgeMs = 0) {
+async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500, maxAgeMs = 0, futures = false) {
   const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
   const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-  const cacheKey = `${pairSym}_${interval}_${limit}`;
+  const cacheKey = `${futures ? 'FUT_' : ''}${pairSym}_${interval}_${limit}`;
   const now = Date.now();
   const cached = klineCache.get(cacheKey);
 
@@ -261,7 +261,8 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500, maxAge
     return cached.data;
   }
 
-  const url = `https://api.binance.com/api/v3/klines?symbol=${pairSym}&interval=${interval}&limit=${limit}`;
+  const query = `symbol=${pairSym}&interval=${interval}&limit=${limit}`;
+  const url = futures ? `${FAPI_BASE}/fapi/v1/klines?${query}` : `https://api.binance.com/api/v3/klines?${query}`;
   const data = await safeFetch(url, timeoutMs);
 
   if (Array.isArray(data) && data.length > 0) {
@@ -310,7 +311,8 @@ async function refreshMarketMode(tickers) {
 // USD-M FUTURES DATA (paper only: nothing here places an order)
 // -------------------------------------------------------------
 const FAPI_BASE = process.env.FAPI_BASE || 'https://fapi.binance.com';
-const FSTREAM_URL = process.env.FSTREAM_URL || 'wss://fstream.binance.com/ws';
+// Binance moved aggTrade to the /market path in 2026; the old /ws path no longer carries it.
+const FSTREAM_URL = process.env.FSTREAM_URL || 'wss://fstream.binance.com/market/ws';
 const FUT_FEE_RATE = Strategy.FUTURES.feePct / 100;
 const isShort = (p) => Boolean(p) && p.side === 'SHORT';
 let perpetuals = new Map();
@@ -602,7 +604,7 @@ async function runDynamicScreener() {
     for (const topSym of candidateKlinesQueue) {
       try {
         // 100 bars = same cache key the entry evaluator uses; patterns on CLOSED bars only
-        const klines15m = await getCachedKlines(topSym, '15m', 100, 2000);
+        const klines15m = await getCachedKlines(topSym, '15m', 100, 2000, 0, bearMode);
         const closed15m = Strategy.closedOnly(klines15m);
         const pat = bearMode ? null : Strategy.assessCandles(closed15m);
         if (universe[topSym] && bearMode) {
@@ -703,7 +705,7 @@ function openPosition(pairKey, signal, plan, takerBuyRatio) {
 
   logOperation('EXECUTION',
     `BOUGHT ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}) via [${signal.pattern}] • ` +
-    `Min exit +0.35% • Moves to recovery bag at -2.80% • RVOL ${signal.rvol}x • Taker ${takerBuyRatio}%`,
+    `Min exit +0.30% • Moves to recovery bag at -3.50% • RVOL ${signal.rvol}x • Taker ${takerBuyRatio}%`,
     'success');
   console.log(`[Order] BUY ${pairKey} @ ${entry} notional ${plan.notional}`);
   saveDiskState();
@@ -728,11 +730,11 @@ function openShort(pairKey, signal, plan, takerBuyRatio) {
     openedAt: Date.now(), entryPriceUSDT: entry, livePriceUSDT: entry, lastTickAt: Date.now(),
     qty: plan.qty, notionalUSDT: plan.notional, initialNotionalUSDT: plan.notional,
     initialStopPrice: bagAt, sl: bagAt, stopPct: Number(plan.stopPct.toFixed(3)), riskUSDT: plan.riskUSDT, atrPct: Number(signal.atrPct.toFixed(3)),
-    breakevenPrice: entry * (1 - R.floorPct / 100), tp1Price: entry * (1 - R.tp1Pct / 100), targetPrice: entry * 0.97,
+    breakevenPrice: entry * (1 - R.shortFloorPct / 100), tp1Price: entry * (1 - R.tp1Pct / 100), targetPrice: entry * 0.97,
     liquidationPrice: Strategy.shortLiquidationPrice(entry), fundingUSDT: 0, nextFundingAt: 0,
     peakGainPct: 0, peakLowPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern
   };
-  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper) via [${signal.pattern}] • Min exit +0.35% • Moves to recovery bag at -2.80% • Taker buy ${takerBuyRatio}%`, 'success');
+  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper) via [${signal.pattern}] • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -819,14 +821,14 @@ function throttledNotice(key, category, message, level = 'info', everyMs = 60000
 // -------------------------------------------------------------
 // AUTOPILOT ENTRY GATES (restored from v4 — see autopilot_engine_complete_logic_specification.md)
 // -------------------------------------------------------------
-async function checkCandlestickSentry(symbol) {
+async function checkCandlestickSentry(symbol, futures = false) {
   const none = { isShortEntry: false, shortPatternName: 'NONE', isBullishSignal: false, isBearishReversal: false, isBullishEntry: false, bullishPatternName: 'NONE', bearishPatternName: 'NONE', patternName: 'NONE', confidence: 0, patternRvol: 1.0, convergence: [], major: 'flat' };
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
     const [k15, k1h] = await Promise.all([
-      getCachedKlines(pairSym, '15m', 100, 2500),
-      getCachedKlines(pairSym, '1h', 60, 3500)
+      getCachedKlines(pairSym, '15m', 100, 2500, 0, futures),
+      getCachedKlines(pairSym, '1h', 60, 3500, 0, futures)
     ]);
     const closed15 = Strategy.closedOnly(k15);
     if (!Array.isArray(closed15) || closed15.length < 30) return none;
@@ -1033,7 +1035,7 @@ async function check1hTrendAlignment(symbol) {
 // SHORT ENTRY GATES: the long gates mirrored. These fail closed: no data, no short.
 // -------------------------------------------------------------
 async function checkShortOrderFlow(symbol) {
-  const k = await getCachedKlines(symbol, '5m', 8, 2500, 20000).catch(() => null);
+  const k = await getCachedKlines(symbol, '5m', 8, 2500, 20000, true).catch(() => null);
   if (!Array.isArray(k) || k.length < 3) return { passed: false, reason: '5m data unavailable' };
   let vol = 0, buy = 0;
   k.slice(-3).forEach((b) => { vol += parseFloat(b[5]); buy += parseFloat(b[9]); });
@@ -1045,7 +1047,7 @@ async function checkShortOrderFlow(symbol) {
 }
 
 async function checkShortMomentum(symbol) {
-  const k = await getCachedKlines(symbol, '15m', 16, 2500, 45000).catch(() => null);
+  const k = await getCachedKlines(symbol, '15m', 16, 2500, 45000, true).catch(() => null);
   if (!Array.isArray(k) || k.length < 8) return { passed: false, reason: '15m data unavailable' };
   const [o, h, l, c, v] = k[k.length - 1].slice(1, 6).map(parseFloat);
   const change15mPct = o > 0 ? Number((((c - o) / o) * 100).toFixed(2)) : 0;
@@ -1063,7 +1065,7 @@ async function checkShortMomentum(symbol) {
 }
 
 async function checkShort1hTrend(symbol) {
-  const k = await getCachedKlines(symbol, '1h', 60, 3500, 120000).catch(() => null);
+  const k = await getCachedKlines(symbol, '1h', 60, 3500, 120000, true).catch(() => null);
   if (!Array.isArray(k) || k.length < 45) return { passed: false, reason: '1h data unavailable' };
   const closes = k.map((b) => parseFloat(b[4])), n = closes.length - 1, c = closes[n];
   const e20 = Strategy.emaSeries(closes, 20), e50 = Strategy.emaSeries(closes, 50);
@@ -1112,7 +1114,7 @@ async function evaluateShortEntries(maxSlots, maxBagsLimit) {
       if (!mom.passed) { veto(pairKey, 30000, 'MOM_VETO', mom.reason); continue; }
       const trend = await checkShort1hTrend(pairKey);
       if (!trend.passed) { veto(pairKey, 30000, 'TREND_VETO', trend.reason); continue; }
-      const candle = await checkCandlestickSentry(pairKey);
+      const candle = await checkCandlestickSentry(pairKey, true);
       if (candle.isBullishSignal) { veto(pairKey, 20000, 'CANDLE_VETO', `bullish pattern [${candle.bullSignalName}].`); continue; }
       const breakdown = mom.change15mPct <= -0.80 && mom.rvol >= 1.35 && flow.takerBuyRatio <= 48;
       if (!candle.isShortEntry && !breakdown) { veto(pairKey, 30000, 'CANDLE_WAIT', `waiting for a completed bearish pattern on 15m (1h trend ${candle.major}) or a breakdown (15m <= -0.80%).`, 'info'); continue; }
@@ -1125,7 +1127,7 @@ async function evaluateShortEntries(maxSlots, maxBagsLimit) {
       // planEntry only uses the stop distance for sizing, so the distance is passed on the long side of the price.
       const px = book.bestBid, cfg = Strategy.CONFIG;
       let atr = NaN, structPct = cfg.minStopPct;
-      const k15 = await getCachedKlines(pairKey, '15m', 16, 2500, 45000).catch(() => null);
+      const k15 = await getCachedKlines(pairKey, '15m', 16, 2500, 45000, true).catch(() => null);
       if (Array.isArray(k15) && k15.length >= 15) {
         const bars = Strategy.toBars(k15);
         atr = Strategy.atrPct(bars, 14);
@@ -1329,7 +1331,7 @@ async function evaluateAutopilotEntries() {
 }
 
 // -------------------------------------------------------------
-// POSITION SENTRY: never sells below +0.35%, failing trades move to recovery bags
+// POSITION SENTRY: never closes below the minimum exit, failing trades move to recovery bags
 // -------------------------------------------------------------
 let sentryBusy = false;
 
@@ -1344,14 +1346,14 @@ function migrateLegacyPosition(k, pos) {
   pos.tp1Price = entry * (1 + Strategy.EXIT_RULES.tp1Pct / 100);
   pos.targetPrice = entry * 1.03;
   pos.strategyVersion = 6;
-  logOperation('SENTRY', `${pos.pair}: moved to no-loss rules (never sold below +0.35%, failing trades go to a recovery bag).`, 'warning');
+  logOperation('SENTRY', `${pos.pair}: moved to no-loss rules (never closed below the minimum exit, failing trades go to a recovery bag).`, 'warning');
 }
 
 // Live 5m candle read, same thresholds as the original Self-Aware detector.
-async function checkSelfAwareOrderFlow(symbol) {
+async function checkSelfAwareOrderFlow(symbol, futures = false) {
   const quiet = { isApexExhausted: false, isUpsideDead: false, isBottomExhausted: false, isDownsideDead: false };
   try {
-    const k = await getCachedKlines(symbol, '5m', 5, 2500, 20000);
+    const k = await getCachedKlines(symbol, '5m', 5, 2500, 20000, futures);
     if (!Array.isArray(k) || !k.length) return quiet;
     const cur = k[k.length - 1];
     const [o, h, l, c, vol, tb] = [cur[1], cur[2], cur[3], cur[4], cur[5], cur[9]].map(parseFloat);
@@ -1404,17 +1406,13 @@ async function refreshExitSignals() {
       const pos = State.activePositions[k];
       const entry = Number(pos.entryPriceUSDT), live = Number(pos.livePriceUSDT) || entry, short = isShort(pos);
       const gainPct = (short ? entry - live : live - entry) / entry * 100;
-      const held = (Date.now() - Number(pos.openedAt || Date.now())) / 60000;
       const R = Strategy.EXIT_RULES;
       const s = {};
-      if (gainPct >= R.floorPct - 0.10) {
-        const candle = await checkCandlestickSentry(k);
-        const flow = await checkSelfAwareOrderFlow(k);
+      if (gainPct >= (short ? R.shortFloorPct : R.floorPct) - 0.10) {
+        const candle = await checkCandlestickSentry(k, short);
+        const flow = await checkSelfAwareOrderFlow(k, short);
         if (short ? candle.isBullishSignal : candle.isBearishReversal) s.bearishPattern = short ? candle.bullSignalName : candle.bearishPatternName;
         s.peakExhausted = short ? flow.isBottomExhausted : flow.isApexExhausted;
-      } else if (held >= R.softDemoteMinutes && gainPct <= R.softDemotePct + 0.10) {
-        const flow = await checkSelfAwareOrderFlow(k);
-        s.upsideDead = short ? flow.isDownsideDead : flow.isUpsideDead;
       }
       exitSignals.set(k, s);
     }
@@ -1454,13 +1452,13 @@ async function runPredictiveSentry() {
       const held = (Date.now() - Number(pos.openedAt || Date.now())) / 60000;
       const cached = exitSignals.get(k) || {};
       // Harvest signals count only in profit, the dead-flow signal only in the soft-demote window.
-      const signals = gainPct >= Strategy.EXIT_RULES.floorPct ? { bearishPattern: cached.bearishPattern, peakExhausted: cached.peakExhausted }
-        : (held >= Strategy.EXIT_RULES.softDemoteMinutes && gainPct <= Strategy.EXIT_RULES.softDemotePct ? { upsideDead: cached.upsideDead } : {});
+      const minExitPct = short ? Strategy.EXIT_RULES.shortFloorPct : Strategy.EXIT_RULES.floorPct;
+      const signals = gainPct >= minExitPct ? { bearishPattern: cached.bearishPattern, peakExhausted: cached.peakExhausted } : {};
 
       const prevStage = pos.ratchetStage;
       const r = short ? Strategy.manageShort(pos, price, signals) : Strategy.manageNoLoss(pos, price, signals);
       if (pos.ratchetStage !== prevStage && pos.ratchetStage === 'BREAKEVEN_LOCKED') {
-        logOperation('SENTRY', `${pos.pair}: +0.35% minimum exit locked ($${formatPrecisePrice(pos.sl)}).`, 'success');
+        logOperation('SENTRY', `${pos.pair}: +${minExitPct.toFixed(2)}% minimum exit locked ($${formatPrecisePrice(pos.sl)}).`, 'success');
       }
 
       // The trigger comes from the last trade; the fill must be what the book really pays.
@@ -1468,7 +1466,7 @@ async function runPredictiveSentry() {
       if (r.action === 'EXIT' || r.action === 'PARTIAL') {
         fill = (await executableExitPrice(k, pos)) || price;
         const fillGain = (short ? entry - fill : fill - entry) / entry * 100;
-        if (fillGain < Strategy.EXIT_RULES.floorPct) continue;
+        if (fillGain < minExitPct) continue;
       }
 
       if (r.action === 'PARTIAL') {
