@@ -761,7 +761,10 @@ function manageNoLoss(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES
 function manageBag(bag, price, R = EXIT_RULES) {
   const entry = num(bag.entryPriceUSDT);
   if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
-  bag.targetExitPriceUSDT = entry * (1 + R.bagTargetPct / 100);
+  // A futures bag also has to earn back any funding it paid. Spot bags never pay funding.
+  const notional = num(bag.qty) * entry;
+  const fundingCostPct = bag.market === 'FUTURES' && notional > 0 ? Math.max(0, -(num(bag.fundingUSDT) || 0) / notional * 100) : 0;
+  bag.targetExitPriceUSDT = entry * (1 + (R.bagTargetPct + fundingCostPct) / 100);
   bag.targetStep = 'CLOSES AT +0.30%';
   bag.troughPrice = Math.min(num(bag.troughPrice) || price, price);
   return price >= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
@@ -769,11 +772,12 @@ function manageBag(bag, price, R = EXIT_RULES) {
 
 /* =========================================================================
  * MARKET MODE + PAPER USD-M SHORTS (v5.9)
- * BULL: spot longs only. BEAR: USD-M shorts only. Anything else: no new trades.
+ * Every new trade is paper USD-M at 1x. BULL: longs. BEAR: shorts. NEUTRAL: each coin follows its own 1h trend.
+ * Without enough market data: no new trades.
  * Replaces the BTC gate. Read on CLOSED 1h candles, and both of the last two hours must agree.
  * ========================================================================= */
 const MODE_RULES = { bullBreadth: 0.60, bearBreadth: 0.40, minCoins: 10, slopeBars: 6 };
-const FUTURES = { feePct: 0.05, leverage: 1, maintenancePct: 0.5 };
+const FUTURES = { feePct: 0.05, leverage: 1, maintenancePct: 0.5, positionPct: 10 };
 
 function modeAt(btcBars, coins, back, R) {
   const c = btcBars.map((b) => b.c), n = c.length - 1 - back;
@@ -807,7 +811,7 @@ function evaluateMarketMode(btc1h, coins1h = [], R = MODE_RULES) {
   if (now.mode === prev.mode && now.mode === 'BULL') return { ...base, mode: 'BULL', side: 'LONG', reason: `BTC uptrend and ${pct} of coins above their 1h EMA50` };
   if (now.mode === prev.mode && now.mode === 'BEAR') return { ...base, mode: 'BEAR', side: 'SHORT', reason: `BTC downtrend and only ${pct} of coins above their 1h EMA50` };
   const reason = now.mode !== 'NEUTRAL' ? `${now.mode === 'BULL' ? 'Bullish' : 'Bearish'} for one hour, waiting for a second hour` : `Mixed market: ${pct} of coins above their 1h EMA50`;
-  return { ...base, mode: 'NEUTRAL', side: 'NONE', reason };
+  return { ...base, mode: 'NEUTRAL', side: 'BOTH', reason };
 }
 
 /**
@@ -821,6 +825,40 @@ function shortExclusion({ volumeUSD, fundingRate, listedAt, now = Date.now() }, 
   if (fundingRate <= R.minFundingRate) return `funding ${(fundingRate * 100).toFixed(3)}%, crowded shorts`;
   if (listedAt && now - listedAt < R.minListedDays * 86400000) return 'listed under 3 days ago';
   return null;
+}
+
+/** Same limits for both directions. Funding must not be crowded on the side being opened. */
+function futuresExclusion({ side = 'SHORT', volumeUSD, fundingRate, listedAt, now = Date.now() }, R = SHORT_RULES) {
+  if (side === 'SHORT') return shortExclusion({ volumeUSD, fundingRate, listedAt, now }, R);
+  if (!(volumeUSD >= R.minVolumeUSD)) return 'under $10M daily volume';
+  if (!Number.isFinite(fundingRate)) return 'funding unknown';
+  if (fundingRate >= -R.minFundingRate) return `funding ${(fundingRate * 100).toFixed(3)}%, crowded longs`;
+  if (listedAt && now - listedAt < R.minListedDays * 86400000) return 'listed under 3 days ago';
+  return null;
+}
+
+/** A coin's own 1h direction from closed closes (55+ bars): 'LONG', 'SHORT' or null when it has no clear trend. */
+function coinTrend(closes, R = MODE_RULES) {
+  if (!Array.isArray(closes) || closes.length < 55 + R.slopeBars) return null;
+  const n = closes.length - 1, e20 = emaSeries(closes, 20), e50 = emaSeries(closes, 50), slope = e50[n] - e50[n - R.slopeBars];
+  if (closes[n] > e50[n] && e20[n] > e50[n] && slope > 0) return 'LONG';
+  if (closes[n] < e50[n] && e20[n] < e50[n] && slope < 0) return 'SHORT';
+  return null;
+}
+
+/** Compounding: each trade is positionPct of current account value, so profits and losses change the next size. */
+function planCompoundEntry(signal, livePrice, equityUSDT, freeCashUSDT, cfg = FUTURES, minNotional = CONFIG.minNotional) {
+  if (!signal || !signal.ok) return reject('no signal');
+  if (!(livePrice > 0)) return reject('no live price');
+  const wanted = Math.max(minNotional, equityUSDT * (cfg.positionPct / 100));
+  const notional = Math.floor(Math.min(wanted, freeCashUSDT / (1 + cfg.feePct / 100)) * 100) / 100;
+  if (notional < minNotional) return reject(`free cash covers only $${notional.toFixed(2)}, minimum position is $${minNotional}`);
+  return { ok: true, entryPrice: livePrice, stopPrice: signal.stopPrice, stopPct: signal.stopPct, notional, qty: notional / livePrice,
+    riskUSDT: Number((notional * signal.stopPct / 100).toFixed(4)) };
+}
+
+function netPnlLongFutures(qty, entryPrice, exitPrice, cfg = FUTURES) {
+  return qty * (exitPrice - entryPrice) - (qty * entryPrice + qty * exitPrice) * (cfg.feePct / 100);
 }
 
 function netPnlShort(qty, entryPrice, exitPrice, cfg = FUTURES) {
@@ -881,6 +919,10 @@ module.exports = {
   FUTURES,
   evaluateMarketMode,
   SHORT_RULES,
+  futuresExclusion,
+  coinTrend,
+  planCompoundEntry,
+  netPnlLongFutures,
   shortExclusion,
   netPnlShort,
   shortLiquidationPrice,
