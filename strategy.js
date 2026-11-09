@@ -809,6 +809,19 @@ function evaluateMarketMode(btc1h, coins1h = [], R = MODE_RULES) {
   return { ...base, mode: 'NEUTRAL', side: 'NONE', reason };
 }
 
+/**
+ * Coins that must not be shorted. Backtested over 180 days: the volume floor improved results in
+ * both halves of the sample and the funding limit cost almost nothing. Unknown funding blocks the short.
+ */
+const SHORT_RULES = { minVolumeUSD: 10000000, minFundingRate: -0.0003, minListedDays: 3 };
+function shortExclusion({ volumeUSD, fundingRate, listedAt, now = Date.now() }, R = SHORT_RULES) {
+  if (!(volumeUSD >= R.minVolumeUSD)) return 'under $10M daily volume';
+  if (!Number.isFinite(fundingRate)) return 'funding unknown';
+  if (fundingRate <= R.minFundingRate) return `funding ${(fundingRate * 100).toFixed(3)}%, crowded shorts`;
+  if (listedAt && now - listedAt < R.minListedDays * 86400000) return 'listed under 3 days ago';
+  return null;
+}
+
 function netPnlShort(qty, entryPrice, exitPrice, cfg = FUTURES) {
   return qty * (entryPrice - exitPrice) - (qty * entryPrice + qty * exitPrice) * (cfg.feePct / 100);
 }
@@ -866,6 +879,8 @@ module.exports = {
   MODE_RULES,
   FUTURES,
   evaluateMarketMode,
+  SHORT_RULES,
+  shortExclusion,
   netPnlShort,
   shortLiquidationPrice,
   manageShort,
