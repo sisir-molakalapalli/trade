@@ -331,7 +331,7 @@ async function refreshPerpetuals() {
   info.symbols.forEach((s) => {
     if (s.contractType !== 'PERPETUAL' || s.status !== 'TRADING' || s.quoteAsset !== 'USDT') return;
     const mn = (s.filters || []).find((x) => x.filterType === 'MIN_NOTIONAL');
-    next.set(s.symbol, { minNotional: parseFloat(mn && mn.notional) || 5 });
+    next.set(s.symbol, { minNotional: parseFloat(mn && mn.notional) || 5, listedAt: Number(s.onboardDate) || 0 });
   });
   perpetuals = next;
   perpetualsAt = Date.now();
@@ -352,6 +352,18 @@ async function executableExitPrice(k, pos) {
   const px = parseFloat(q && (short ? q.askPrice : q.bidPrice));
   return px > 0 ? px : null;
 }
+
+// One request covers every contract. Refreshed every 5 minutes; older than 15 minutes counts as unknown.
+let fundingRates = new Map();
+let fundingRatesAt = 0;
+async function refreshFundingRates() {
+  if (Date.now() - fundingRatesAt < 300000) return;
+  const rows = await safeFetch(`${FAPI_BASE}/fapi/v1/premiumIndex`, 6000).catch(() => null);
+  if (!Array.isArray(rows)) return;
+  fundingRates = new Map(rows.map((r) => [r.symbol, parseFloat(r.lastFundingRate)]));
+  fundingRatesAt = Date.now();
+}
+const currentFundingRate = (sym) => (Date.now() - fundingRatesAt < 900000 ? fundingRates.get(sym) : undefined);
 
 async function fetchFuturesPrice(pairKey) {
   try {
@@ -505,6 +517,7 @@ async function runDynamicScreener() {
     if (!tickers) return;
 
     await refreshPerpetuals();
+    await refreshFundingRates();
     const mode = await refreshMarketMode(tickers);
     const bearMode = mode.side === 'SHORT';
 
@@ -549,7 +562,9 @@ async function runDynamicScreener() {
       }
 
       // In a bear market the best candidates are the weakest coins that can be shorted.
-      const canShort = perpetuals.has(sym);
+      const shortBlock = !perpetuals.has(sym) ? 'no USD-M contract'
+        : Strategy.shortExclusion({ volumeUSD: volQuote, fundingRate: currentFundingRate(sym), listedAt: perpetuals.get(sym).listedAt });
+      const canShort = !shortBlock;
       let score = bearMode
         ? 60 + ((1 - posInRange) * 22) + (Math.min(-change24, 15) * 0.9)
         : 60 + (posInRange * 22) + (Math.min(change24, 15) * 0.9);
@@ -571,6 +586,7 @@ async function runDynamicScreener() {
         volumeM: Math.round(volQuote / 1000000),
         side: bearMode ? 'SHORT' : 'LONG',
         canShort,
+        shortBlock,
         obi: 0.55,
         isPumpAndDump: isPumpDump,
         pumpDumpReason: pumpDumpReason,
