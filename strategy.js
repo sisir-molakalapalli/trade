@@ -861,6 +861,35 @@ function netPnlLongFutures(qty, entryPrice, exitPrice, cfg = FUTURES) {
   return qty * (exitPrice - entryPrice) - (qty * entryPrice + qty * exitPrice) * (cfg.feePct / 100);
 }
 
+/* =========================================================================
+ * MANUAL PAPER FUTURES (separate account). The user opens and closes; nothing here exits on its own.
+ * ========================================================================= */
+const MANUAL = { startUSDT: 110, minNotional: 5, historyKeep: 200 };
+
+/** Can a manual position of `notional` USDT be opened at `price`? 1x margin, so the cost is the notional plus the opening fee. */
+function manualOpenPlan(cashUSDT, notional, price, side, cfg = FUTURES, minNotional = MANUAL.minNotional) {
+  if (side !== 'LONG' && side !== 'SHORT') return reject('side must be LONG or SHORT');
+  if (!(price > 0)) return reject('no live price');
+  if (!(notional >= minNotional)) return reject(`minimum position is $${minNotional}`);
+  const cost = notional * (1 + cfg.feePct / 100);
+  if (cost > cashUSDT + 1e-9) return reject(`needs $${cost.toFixed(2)} with the fee, free cash is $${Number(cashUSDT).toFixed(2)}`);
+  return { ok: true, cost, notional, qty: notional / price, entryPrice: price, liquidationPrice: side === 'SHORT' ? shortLiquidationPrice(price, cfg) : null };
+}
+
+/** Closing value of a manual position at `price` (exit fee and booked funding included). */
+function manualClose(pos, price, cfg = FUTURES) {
+  const q = num(pos.qty), e = num(pos.entryPriceUSDT), f = num(pos.fundingUSDT) || 0, short = pos.side === 'SHORT';
+  const proceeds = (short ? q * (2 * e - price) : q * price) - q * price * (cfg.feePct / 100) + f;
+  const pnl = (short ? netPnlShort(q, e, price, cfg) : netPnlLongFutures(q, e, price, cfg)) + f;
+  return { proceeds, pnl, gainPct: ((short ? e - price : price - e) / e) * 100 };
+}
+
+/** Value of a manual position marked at `price`, before the exit fee. */
+function manualMark(pos, price) {
+  const q = num(pos.qty), e = num(pos.entryPriceUSDT), f = num(pos.fundingUSDT) || 0;
+  return (pos.side === 'SHORT' ? q * (2 * e - price) : q * price) + f;
+}
+
 function netPnlShort(qty, entryPrice, exitPrice, cfg = FUTURES) {
   return qty * (entryPrice - exitPrice) - (qty * entryPrice + qty * exitPrice) * (cfg.feePct / 100);
 }
@@ -919,6 +948,10 @@ module.exports = {
   FUTURES,
   evaluateMarketMode,
   SHORT_RULES,
+  MANUAL,
+  manualOpenPlan,
+  manualClose,
+  manualMark,
   futuresExclusion,
   coinTrend,
   planCompoundEntry,
