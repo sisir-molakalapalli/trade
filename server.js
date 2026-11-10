@@ -1,6 +1,6 @@
 /**
  * =========================================================================
- * SISIR QUANT TERMINAL - BACKEND ENGINE v5.8 ((v4 ENTRIES, NO-LOSS EXITS, RECOVERY BAGS))
+ * SISIR QUANT TERMINAL - BACKEND ENGINE v5.8 (v4 ENTRIES, NO-LOSS EXITS, RECOVERY BAGS)
  * =========================================================================
  * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
  * No orders are sent to Binance from this file.
@@ -78,8 +78,11 @@ const recentTradeDispatches = new Set();
 // -------------------------------------------------------------
 // CORE SYSTEM STATE
 // -------------------------------------------------------------
+const MANUAL_START_USDT = Number(process.env.MANUAL_START_USDT) || Strategy.MANUAL.startUSDT;
 const State = {
   autopilotEnabled: true,
+  // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
+  manual: { startUSDT: MANUAL_START_USDT, cashUSDT: MANUAL_START_USDT, realizedPnL: 0, positions: {}, history: [] },
   portfolio: {
     cashUSDT: STARTING_EQUITY_USDT,
     holdings: {},
@@ -383,7 +386,8 @@ async function settleFunding() {
   if (fundingBusy) return;
   fundingBusy = true;
   try {
-    const held = [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isFutures(p));
+    const held = [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isFutures(p))
+      .concat(Object.values(State.manual.positions || {}).map((p) => [p.symbol, p]));
     for (const [k, p] of held) {
       if (Date.now() < Number(p.nextFundingAt || 0)) continue;
       let d = null;
@@ -392,7 +396,7 @@ async function settleFunding() {
       if (p.nextFundingAt) {
         const amount = (isShort(p) ? 1 : -1) * Number(p.qty) * parseFloat(d.markPrice) * (parseFloat(d.lastFundingRate) || 0);
         p.fundingUSDT = Number(((Number(p.fundingUSDT) || 0) + amount).toFixed(6));
-        logOperation('FUNDING', `${p.pair}: funding ${amount >= 0 ? 'received' : 'paid'} $${Math.abs(amount).toFixed(4)}.`, 'info');
+        logOperation('FUNDING', `${p.pair}${p.manual ? ' (manual)' : ''}: funding ${amount >= 0 ? 'received' : 'paid'} $${Math.abs(amount).toFixed(4)}.`, 'info');
       }
       p.nextFundingAt = Number(d.nextFundingTime) || Date.now() + 3600000;
     }
@@ -1754,6 +1758,7 @@ function saveDiskState() {
       activePositions: State.activePositions,
       recoveryBags: State.recoveryBags,
       tradeLogs: State.tradeLogs.slice(0, 150),
+      manual: State.manual,
       masterLedgerUrl: State.masterLedgerUrl,
       learningSheetUrl: State.learningSheetUrl,
       capitalResetId: State.capitalResetId || CAPITAL_RESET_ID
@@ -1770,6 +1775,7 @@ function loadDiskState() {
       if (parsed.activePositions) State.activePositions = parsed.activePositions;
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
+      if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
       if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
         State.masterLedgerUrl = parsed.masterLedgerUrl;
       } else {
@@ -1849,7 +1855,8 @@ app.get('/api/state', (req, res) => {
     learningSheetUrl: State.learningSheetUrl,
     learningEngineState: learningEngine.state || {},
     riskConfig: Strategy.CONFIG,
-    equityUSDT: computeEquity()
+    equityUSDT: computeEquity(),
+    manual: manualView()
   });
 });
 
@@ -1972,6 +1979,108 @@ app.post('/api/positions/close', async (req, res) => {
   res.json({ success: Boolean(trade), trade });
 });
 
+// -------------------------------------------------------------
+// MANUAL PAPER FUTURES: the user's own long/short positions on any USD-M perpetual.
+// Fills at the real book (long buys the ask, short sells the bid). Positions stay open until the user closes them;
+// the only exception is a 1x short whose margin is used up (price about +99%), which the exchange would liquidate.
+// -------------------------------------------------------------
+async function futuresQuote(sym) {
+  const q = await safeFetch(`${FAPI_BASE}/fapi/v1/ticker/bookTicker?symbol=${sym}`, 2500).catch(() => null);
+  const bid = parseFloat(q && q.bidPrice), ask = parseFloat(q && q.askPrice);
+  if (bid > 0 && ask > 0) return { bid, ask };
+  const last = await fetchFuturesPrice(sym);
+  return last ? { bid: last, ask: last } : null;
+}
+
+function manualView() {
+  const m = State.manual, pos = Object.values(m.positions || {});
+  const marked = pos.reduce((a, p) => a + Strategy.manualMark(p, Number(p.livePriceUSDT) || Number(p.entryPriceUSDT)), 0);
+  return { startUSDT: m.startUSDT, cashUSDT: m.cashUSDT, realizedPnL: m.realizedPnL, positions: m.positions, history: (m.history || []).slice(0, 50),
+    equityUSDT: Number((Number(m.cashUSDT) + marked).toFixed(6)), futures: State.subsystems.futures.status };
+}
+
+function closeManual(id, price, label) {
+  const m = State.manual, p = m.positions[id];
+  if (!p || p.closing) return null;
+  p.closing = true;
+  const r = Strategy.manualClose(p, price);
+  m.cashUSDT = Number((Number(m.cashUSDT) + r.proceeds).toFixed(6));
+  m.realizedPnL = Number((Number(m.realizedPnL || 0) + r.pnl).toFixed(6));
+  delete m.positions[id];
+  const trade = { id: Date.now(), positionId: id, symbol: p.symbol, pair: p.pair, side: p.side, type: label, entryPriceUSDT: p.entryPriceUSDT, exitPriceUSDT: price,
+    notionalUSDT: p.notionalUSDT, fundingUSDT: Number((Number(p.fundingUSDT) || 0).toFixed(4)), pnlUSDT: Number(r.pnl.toFixed(4)), gainPct: Number(r.gainPct.toFixed(3)),
+    openedAt: p.openedAt, closedAt: Date.now(), holdMinutes: Math.round((Date.now() - p.openedAt) / 60000) };
+  m.history = [trade, ...(m.history || [])].slice(0, Strategy.MANUAL.historyKeep);
+  logOperation('MANUAL', `${label}: ${p.side} ${p.pair} @ $${formatPrecisePrice(price)} (${r.gainPct >= 0 ? '+' : ''}${r.gainPct.toFixed(2)}%) • Net ${r.pnl >= 0 ? '+' : ''}$${r.pnl.toFixed(4)}`, r.pnl >= 0 ? 'success' : 'warning');
+  saveDiskState();
+  syncActiveSymbolSubscriptions();
+  broadcastStateUpdate();
+  return trade;
+}
+
+function checkManualLiquidation(sym, price) {
+  Object.entries(State.manual.positions || {}).forEach(([id, p]) => {
+    if (p.symbol === sym && p.side === 'SHORT' && p.liquidationPrice && price >= p.liquidationPrice) closeManual(id, p.liquidationPrice, 'LIQUIDATED');
+  });
+}
+
+app.get('/api/manual', (req, res) => res.json(manualView()));
+
+// Price preview for the ticket when the phone cannot reach Binance Futures directly.
+app.get('/api/manual/quote', async (req, res) => {
+  const s = String(req.query.symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!perpetuals.has(s)) return res.status(400).json({ error: 'not a USD-M perpetual' });
+  const q = await futuresQuote(s);
+  res.json(q ? { symbol: s, bid: q.bid, ask: q.ask } : { error: 'no price' });
+});
+
+app.get('/api/manual/symbols', async (req, res) => {
+  await refreshPerpetuals().catch(() => {});
+  res.json({ status: State.subsystems.futures.status, symbols: [...perpetuals.keys()].sort() });
+});
+
+app.post('/api/manual/open', async (req, res) => {
+  const symbol = String(req.body.symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const sym = symbol.endsWith('USDT') ? symbol : `${symbol}USDT`;
+  const side = String(req.body.side || '').toUpperCase();
+  const notional = Math.floor(parseFloat(req.body.notionalUSDT) * 100) / 100;
+  await refreshPerpetuals().catch(() => {});
+  if (!perpetuals.has(sym)) return res.status(400).json({ success: false, error: `${sym} is not a trading USD-M perpetual on Binance` });
+  const minN = Math.max(Strategy.MANUAL.minNotional, perpetuals.get(sym).minNotional || 5);
+  const q = await futuresQuote(sym);
+  if (!q) return res.status(503).json({ success: false, error: 'No live futures price right now. Nothing was opened.' });
+  const price = side === 'SHORT' ? q.bid : q.ask;
+  const plan = Strategy.manualOpenPlan(Number(State.manual.cashUSDT), notional, price, side, Strategy.FUTURES, minN);
+  if (!plan.ok) return res.status(400).json({ success: false, error: plan.reason });
+  const id = `m${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  State.manual.cashUSDT = Number((Number(State.manual.cashUSDT) - plan.cost).toFixed(6));
+  State.manual.positions[id] = { id, manual: true, symbol: sym, pair: `${sym.replace(/USDT$/, '')}/USDT`, side, market: 'FUTURES', leverage: Strategy.FUTURES.leverage,
+    openedAt: Date.now(), entryPriceUSDT: price, livePriceUSDT: price, lastTickAt: Date.now(), qty: plan.qty, notionalUSDT: plan.notional,
+    openFeeUSDT: Number((plan.cost - plan.notional).toFixed(6)), liquidationPrice: plan.liquidationPrice, fundingUSDT: 0, nextFundingAt: 0 };
+  logOperation('MANUAL', `Opened ${side} ${sym} @ $${formatPrecisePrice(price)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper, manual account)`, 'success');
+  saveDiskState();
+  syncActiveSymbolSubscriptions();
+  broadcastStateUpdate();
+  res.json({ success: true, position: State.manual.positions[id], manual: manualView() });
+});
+
+app.post('/api/manual/close', async (req, res) => {
+  const p = State.manual.positions[req.body.id];
+  if (!p) return res.status(404).json({ success: false, error: 'Position not found' });
+  const q = await futuresQuote(p.symbol);
+  if (!q) return res.status(503).json({ success: false, error: 'No live futures price right now. Your position is still open.' });
+  const trade = closeManual(p.id, p.side === 'SHORT' ? q.ask : q.bid, 'MANUAL CLOSE');
+  res.json({ success: Boolean(trade), trade, manual: manualView() });
+});
+
+app.post('/api/manual/reset', (req, res) => {
+  if (Object.keys(State.manual.positions || {}).length) return res.status(400).json({ success: false, error: 'Close your open manual positions first' });
+  State.manual = { startUSDT: MANUAL_START_USDT, cashUSDT: MANUAL_START_USDT, realizedPnL: 0, positions: {}, history: [] };
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, manual: manualView() });
+});
+
 app.post('/api/bags/close', async (req, res) => {
   const { pairKey } = req.body;
   if (!pairKey) return res.status(400).json({ success: false, error: 'Missing pairKey' });
@@ -2023,7 +2132,8 @@ function broadcastStateUpdate({ withUniverse = false } = {}) {
     tradeLogs: State.tradeLogs.slice(0, BROADCAST_TRADE_LOGS),
     subsystems: State.subsystems,
     riskConfig: Strategy.CONFIG,
-    equityUSDT: computeEquity()
+    equityUSDT: computeEquity(),
+    manual: manualView()
   };
   if (withUniverse) payload.universe = State.universe;
   sendAll(JSON.stringify(payload, omitTickStamps));
@@ -2034,6 +2144,7 @@ function broadcastStateUpdate({ withUniverse = false } = {}) {
 // Every 250 ms the app gets only the prices that moved (about 60 bytes). Position details such
 // as trail levels change far less often, so they go at most every 2 seconds, and only if changed.
 let lastSentPrices = {};
+const lastManualPx = {};
 let lastDetailSig = '';
 let lastDetailAt = 0;
 const omitLive = (key, value) => (key === 'lastTickAt' || key === 'livePriceUSDT' ? undefined : value);
@@ -2048,9 +2159,10 @@ function broadcastPriceStream() {
     sendAll(JSON.stringify({ type: 'PRICE_STREAM', activePositions: State.activePositions, recoveryBags: State.recoveryBags }, omitTickStamps));
     return;
   }
-  const moved = {};
+  const moved = {}, m = {};
   Object.entries(held).forEach(([k, p]) => { if (p.livePriceUSDT !== lastSentPrices[k]) moved[k] = lastSentPrices[k] = p.livePriceUSDT; });
-  if (Object.keys(moved).length) sendAll(JSON.stringify({ type: 'P', p: moved }));
+  Object.values(State.manual.positions || {}).forEach((p) => { if (p.livePriceUSDT !== lastManualPx[p.id]) m[p.id] = lastManualPx[p.id] = p.livePriceUSDT; });
+  if (Object.keys(moved).length || Object.keys(m).length) sendAll(JSON.stringify(Object.keys(m).length ? { type: 'P', p: moved, m } : { type: 'P', p: moved }));
 }
 
 // -------------------------------------------------------------
@@ -2134,7 +2246,8 @@ function connectBinanceGlobalStream() {
 // Futures positions are marked on the futures price. This socket exists only while one is held.
 let futuresWs = null;
 let futuresStreams = new Set();
-const heldFutures = () => [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isFutures(p)).map(([k]) => k);
+const heldFutures = () => [...new Set([...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isFutures(p)).map(([k]) => k)
+  .concat(Object.values(State.manual.positions || {}).map((p) => p.symbol)))];
 
 function syncFuturesStream() {
   const wanted = new Set(heldFutures().map((s) => `${s.toLowerCase()}@aggTrade`));
@@ -2157,6 +2270,8 @@ function syncFuturesStream() {
         [State.activePositions[t.s], State.recoveryBags[t.s]].forEach((p) => {
           if (isFutures(p)) { p.livePriceUSDT = price; p.lastTickAt = Date.now(); changed = true; }
         });
+        Object.values(State.manual.positions || {}).forEach((p) => { if (p.symbol === t.s) { p.livePriceUSDT = price; p.lastTickAt = Date.now(); } });
+        checkManualLiquidation(t.s, price);
         if (changed) kickSentry();
       } catch (e) {}
     });
@@ -2204,7 +2319,8 @@ wss.on('connection', (ws) => {
     universe: State.universe,
     tradeLogs: State.tradeLogs.slice(0, 150),
     subsystems: State.subsystems,
-    riskConfig: Strategy.CONFIG
+    riskConfig: Strategy.CONFIG,
+    manual: manualView()
   }, omitTickStamps));
 
   ws.on('message', (data) => {
@@ -2275,6 +2391,13 @@ setInterval(async () => {
 }, 1000);
 
 setInterval(() => { settleFunding().catch((e) => console.error('[Funding]', e.message)); }, 60000);
+setInterval(async () => {
+  for (const p of Object.values(State.manual.positions || {})) {
+    if (Date.now() - Number(p.lastTickAt || 0) < 15000) continue;
+    const px = await fetchFuturesPrice(p.symbol);
+    if (px) { p.livePriceUSDT = px; p.lastTickAt = Date.now(); checkManualLiquidation(p.symbol, px); }
+  }
+}, 10000);
 setInterval(broadcastPriceStream, 250);
 setInterval(() => { refreshExitSignals().catch(() => {}); }, 3000);
 setInterval(runDynamicScreener, 60000);
