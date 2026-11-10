@@ -1,6 +1,6 @@
 /**
  * =========================================================================
- * SISIR QUANT TERMINAL - BACKEND ENGINE v5.8 (v4 ENTRIES, NO-LOSS EXITS, RECOVERY BAGS)
+ * SISIR QUANT TERMINAL - BACKEND ENGINE v5.8 ((v4 ENTRIES, NO-LOSS EXITS, RECOVERY BAGS))
  * =========================================================================
  * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
  * No orders are sent to Binance from this file.
