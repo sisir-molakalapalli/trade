@@ -28,6 +28,17 @@
  * Ex 5.20-5.21). Crypto is the same, so star / dark-cloud / piercing use his latitude
  * versions. Windows keep the true shadow gap and so fire rarely.
  *
+ * v6.1 tightening (checked against the book and 180 days of 15m data):
+ *  - Charts whose candles are under 5 price steps tall give no patterns (rounding, not shapes).
+ *  - Every reversal and warning must make or retest the extreme of the prior 12 candles.
+ *  - Engulfing needs a full second body; stars need a real third body; hammers and stars full-size lines.
+ *  - Three rivers / mountains: three separate tests of one level at the move's extreme, confirmed by a
+ *    close beyond the peak (trough) between them, once.
+ *  - Tweezers match within a tenth of a candle; springs and upthrusts need a real penetration.
+ *  - On-neck, in-neck, thrusting, falling three methods, bearish separating line, three rivers and
+ *    three mountains are still detected and shown, but only as warnings: even after tightening they
+ *    were right less often than a random candle over the next 1h and 4h, so they do not open or block trades.
+ *
  * Input: Binance klines, CLOSED candles only, oldest first.
  * =========================================================================
  */
@@ -87,7 +98,22 @@ function makeCtx(B) {
   const isSpinning = (i) => !rawDoji(B[i]) && isSmall(i) && B[i].upper >= B[i].body && B[i].lower >= B[i].body;
   const atLow = (i, n = 20, tol = 0.25) => { const lo = lowestLow(i + 1, n), hi = highestHigh(i + 1, n); return B[i].c <= lo + (hi - lo) * tol; };
   const atHigh = (i, n = 20, tol = 0.25) => { const lo = lowestLow(i + 1, n), hi = highestHigh(i + 1, n); return B[i].c >= hi - (hi - lo) * tol; };
-  return { B, e10, e20, e50, rsi14, avgBody, avgVol, avgRange, trendBefore, majorTrend, isDoji, dojiCrowded, isLong, isSmall, isSpinning, lowestLow, highestHigh, atLow, atHigh };
+  // Smallest price step seen. A shape that is one or two steps wide is rounding, not a candle.
+  const px = [...new Set(B.slice(-120).flatMap((b) => [b.o, b.h, b.l, b.c]))].sort((a, b) => a - b);
+  let tick = Infinity; for (let j = 1; j < px.length; j++) { const d = px[j] - px[j - 1]; if (d > px[j] * 1e-9 && d < tick) tick = d; }
+  if (!Number.isFinite(tick)) tick = 0;
+  const real = (i, f = 0.4) => B[i].range >= avgRange(i) * f && B[i].range >= tick * 3;
+  return { B, e10, e20, e50, rsi14, avgBody, avgVol, avgRange, trendBefore, majorTrend, isDoji, dojiCrowded, isLong, isSmall, isSpinning, lowestLow, highestHigh, atLow, atHigh, tick, real };
+}
+
+function swingIdx(C, i, n, type) {
+  const out = [], B = C.B;
+  for (let j = Math.max(2, i - n); j <= i - 2; j++) {
+    const b = B[j];
+    if (type === 'low' && b.l < B[j - 1].l && b.l < B[j - 2].l && b.l <= B[j + 1].l && b.l <= B[j + 2].l) out.push(j);
+    if (type === 'high' && b.h > B[j - 1].h && b.h > B[j - 2].h && b.h >= B[j + 1].h && b.h >= B[j + 2].h) out.push(j);
+  }
+  return out;
 }
 
 function swings(C, i, n, type) {
@@ -113,15 +139,17 @@ const def = (name, dir, kind, trend, confirm, bars, fn, weight = 1, extra = {}) 
 
 // --- Chapter 4
 def('HAMMER', 'bull', 'reversal', 'down', false, 1, (C, i) => {
-  const b = C.B[i]; if (!hammerShape(b) || b.l > C.lowestLow(i, 8) * 1.002) return false;
+  const b = C.B[i]; if (!hammerShape(b) || !C.real(i, 0.8) || b.l > C.lowestLow(i, 8) * 1.002) return false;
   const p = C.B[i - 1];
   return (shavenBlack(p) && C.isLong(i - 1)) ? { confirm: true } : true;   // Ex 4.10 hammer 4
 }, 1.2);
-def('HANGING MAN', 'bear', 'reversal', 'up', true, 1, (C, i) => hammerShape(C.B[i]) && C.B[i].top >= C.highestHigh(i, 8) * 0.997);
+def('HANGING MAN', 'bear', 'reversal', 'up', true, 1, (C, i) => hammerShape(C.B[i]) && C.real(i, 0.8) && C.B[i].top >= C.highestHigh(i, 8) * 0.997);
 const engulf = (C, i, up) => {
   const a = C.B[i - 1], b = C.B[i], t = closeTol(a);
   if (!(up ? b.white : b.black) || b.top < a.top - t || b.bot > a.bot + t || b.body <= a.body) return false;
-  return (up ? a.black : a.white) || a.body <= C.avgBody(i - 1) * 0.2;   // tiny first body: colour exception
+  if (b.body < b.range * 0.5 || b.body < C.avgBody(i)) return false;            // the engulfing line is a real, full body
+  if (up ? a.black : a.white) return true;
+  return a.body <= C.avgBody(i - 1) * 0.2 && C.isLong(i);                       // tiny first body: only a very large second body
 };
 def('BULLISH ENGULFING', 'bull', 'reversal', 'down', false, 2, (C, i) => engulf(C, i, true), 1.5);
 def('BEARISH ENGULFING', 'bear', 'reversal', 'up', false, 2, (C, i) => engulf(C, i, false), 1.5);
@@ -135,23 +163,23 @@ def('PIERCING PATTERN', 'bull', 'reversal', 'down', false, 2, (C, i) => {
   return a.black && C.isLong(i - 1) && b.white && b.o <= a.c + closeTol(a) && b.l <= a.l + tol(a) && b.c > a.mid && b.c < a.o;  // strict midpoint
 }, 1.3);
 const neck = (C, i) => { const a = C.B[i - 1], b = C.B[i]; return a.black && C.isLong(i - 1) && b.white && b.o <= a.c + closeTol(a); };
-def('ON-NECK LINE', 'bear', 'continuation', 'down', false, 2, (C, i) => neck(C, i) && C.isSmall(i) && Math.abs(C.B[i].c - C.B[i - 1].l) <= tol(C.B[i - 1]));
-def('IN-NECK LINE', 'bear', 'continuation', 'down', false, 2, (C, i) => { const a = C.B[i - 1], b = C.B[i]; return neck(C, i) && C.isSmall(i) && b.c >= a.c && b.c <= a.c + a.body * 0.15; });
-def('THRUSTING LINE', 'bear', 'continuation', 'down', false, 2, (C, i) => { const a = C.B[i - 1], b = C.B[i]; return neck(C, i) && !C.isSmall(i) && b.c > a.c + a.body * 0.15 && b.c <= a.mid; });
+def('ON-NECK LINE', 'bear', 'warning', 'down', false, 2, (C, i) => neck(C, i) && C.isSmall(i) && Math.abs(C.B[i].c - C.B[i - 1].l) <= tol(C.B[i - 1]));
+def('IN-NECK LINE', 'bear', 'warning', 'down', false, 2, (C, i) => { const a = C.B[i - 1], b = C.B[i]; return neck(C, i) && C.isSmall(i) && b.c >= a.c && b.c <= a.c + a.body * 0.15; });
+def('THRUSTING LINE', 'bear', 'warning', 'down', false, 2, (C, i) => { const a = C.B[i - 1], b = C.B[i]; return neck(C, i) && !C.isSmall(i) && b.c > a.c + a.body * 0.15 && b.c <= a.mid; });
 
 // --- Chapter 5: stars
 const starBelow = (a, s) => s.top <= a.c + closeTol(a);
 const starAbove = (a, s) => s.bot >= a.c - closeTol(a);
-const morning = (C, i, doji) => { const [a, s, c] = [C.B[i - 2], C.B[i - 1], C.B[i]]; return a.black && C.isLong(i - 2) && (doji ? C.isDoji(i - 1) : (C.isSmall(i - 1) && !C.isDoji(i - 1))) && starBelow(a, s) && c.white && c.c > a.mid; };
-const evening = (C, i, doji) => { const [a, s, c] = [C.B[i - 2], C.B[i - 1], C.B[i]]; return a.white && C.isLong(i - 2) && (doji ? C.isDoji(i - 1) : (C.isSmall(i - 1) && !C.isDoji(i - 1))) && starAbove(a, s) && c.black && c.c < a.mid; };
+const morning = (C, i, doji) => { const [a, s, c] = [C.B[i - 2], C.B[i - 1], C.B[i]]; return a.black && C.isLong(i - 2) && (doji ? C.isDoji(i - 1) : (C.isSmall(i - 1) && !C.isDoji(i - 1))) && starBelow(a, s) && c.white && c.c > a.mid && c.body >= C.avgBody(i) * 0.8; };
+const evening = (C, i, doji) => { const [a, s, c] = [C.B[i - 2], C.B[i - 1], C.B[i]]; return a.white && C.isLong(i - 2) && (doji ? C.isDoji(i - 1) : (C.isSmall(i - 1) && !C.isDoji(i - 1))) && starAbove(a, s) && c.black && c.c < a.mid && c.body >= C.avgBody(i) * 0.8; };
 def('MORNING STAR', 'bull', 'reversal', 'down', false, 3, (C, i) => morning(C, i, false), 1.6);
 def('EVENING STAR', 'bear', 'reversal', 'up', false, 3, (C, i) => evening(C, i, false), 1.6);
 def('MORNING DOJI STAR', 'bull', 'reversal', 'down', false, 3, (C, i) => morning(C, i, true) && !C.dojiCrowded(i), 1.7);
 def('EVENING DOJI STAR', 'bear', 'reversal', 'up', false, 3, (C, i) => evening(C, i, true) && !C.dojiCrowded(i), 1.7);
 def('BULLISH ABANDONED BABY', 'bull', 'reversal', 'down', false, 3, (C, i) => { const [a, s, c] = [C.B[i - 2], C.B[i - 1], C.B[i]]; return a.black && C.isDoji(i - 1) && s.h < a.l && s.h < c.l && c.white; }, 1.8);
 def('BEARISH ABANDONED BABY', 'bear', 'reversal', 'up', false, 3, (C, i) => { const [a, s, c] = [C.B[i - 2], C.B[i - 1], C.B[i]]; return a.white && C.isDoji(i - 1) && s.l > a.h && s.l > c.h && c.black; }, 1.8);
-def('SHOOTING STAR', 'bear', 'reversal', 'up', true, 2, (C, i) => shootingShape(C.B[i]) && C.B[i].h >= C.highestHigh(i, 8) * 0.998);
-def('INVERTED HAMMER', 'bull', 'reversal', 'down', true, 2, (C, i) => shootingShape(C.B[i]) && C.B[i].l <= C.lowestLow(i, 8) * 1.003);
+def('SHOOTING STAR', 'bear', 'reversal', 'up', true, 2, (C, i) => shootingShape(C.B[i]) && C.real(i, 0.8) && C.B[i].h >= C.highestHigh(i, 8) * 0.998);
+def('INVERTED HAMMER', 'bull', 'reversal', 'down', true, 2, (C, i) => shootingShape(C.B[i]) && C.real(i, 0.8) && C.B[i].l <= C.lowestLow(i, 8) * 1.003);
 
 // --- Chapter 6
 const harami = (C, i) => { const a = C.B[i - 1], b = C.B[i]; return C.isLong(i - 1) && b.top <= a.top && b.bot >= a.bot && b.body <= a.body * 0.5; };
@@ -160,8 +188,10 @@ def('BEARISH HARAMI', 'bear', 'reversal', 'up', true, 2, (C, i) => C.B[i - 1].wh
 def('BULLISH HARAMI CROSS', 'bull', 'reversal', 'down', true, 2, (C, i) => C.B[i - 1].black && C.isDoji(i) && harami(C, i) && !C.dojiCrowded(i), 1.2, { confirmAbove: 'mother' });
 def('BEARISH HARAMI CROSS', 'bear', 'reversal', 'up', false, 2, (C, i) => C.B[i - 1].white && C.isDoji(i) && harami(C, i) && !C.dojiCrowded(i), 1.3);  // "better at tops"
 // tweezers count only with another candlestick signal on the second line
-const twzBot = (C, i) => { const a = C.B[i - 1], b = C.B[i]; if (Math.abs(a.l - b.l) > a.l * 0.0008) return false; return hammerShape(b, 1.5) || (a.black && C.isLong(i - 1) && b.white && b.c > a.mid) || (a.black && C.isLong(i - 1) && C.isDoji(i)) || engulf(C, i, true); };
-const twzTop = (C, i) => { const a = C.B[i - 1], b = C.B[i]; if (Math.abs(a.h - b.h) > a.h * 0.0008) return false; return hammerShape(b, 1.5) || shootingShape(b, 1.5) || (a.white && C.isLong(i - 1) && C.isDoji(i)) || (a.white && C.isLong(i - 1) && b.black && b.c < a.mid) || engulf(C, i, false); };
+const twzMatch = (C, i, x, y) => Math.abs(x - y) <= Math.max(C.tick, C.avgRange(i) * 0.1);
+const twzBot = (C, i) => { const a = C.B[i - 1], b = C.B[i]; if (!twzMatch(C, i, a.l, b.l)) return false; return hammerShape(b, 1.5) || (a.black && C.isLong(i - 1) && b.white && b.c > a.mid) || (a.black && C.isLong(i - 1) && C.isDoji(i)) || engulf(C, i, true); };
+const twzTop = (C, i) => { const a = C.B[i - 1], b = C.B[i]; if (!twzMatch(C, i, a.h, b.h)) return false; if (hammerShape(b, 1.5) || shootingShape(b, 1.5)) return { confirm: true };  // hanging man / shooting star second line: confirm first
+  return (a.white && C.isLong(i - 1) && C.isDoji(i)) || (a.white && C.isLong(i - 1) && b.black && b.c < a.mid) || engulf(C, i, false); };
 def('TWEEZERS BOTTOM', 'bull', 'reversal', 'down', false, 2, twzBot, 1.1);
 def('TWEEZERS TOP', 'bear', 'reversal', 'up', false, 2, twzTop, 1.1);
 def('BULLISH BELT-HOLD', 'bull', 'reversal', 'down', false, 1, (C, i) => { const b = C.B[i]; return b.white && C.isLong(i) && b.body >= C.avgBody(i) * 1.5 && b.lower <= b.range * 0.05 && C.atLow(i - 1, 20, 0.3); });
@@ -174,7 +204,7 @@ def('THREE WHITE SOLDIERS', 'bull', 'reversal', null, false, 3, (C, i) => {
   const [a, b, c] = [C.B[i - 2], C.B[i - 1], C.B[i]];
   if (!soldiers(a, b, c) || ![a, b, c].every((k) => k.upper <= k.range * 0.25)) return false;
   return C.atLow(i - 3, 20, 0.4) && (c.c - a.o) <= C.avgRange(i - 2) * 6;     // from a low area, not overextended
-}, 1.5);
+}, 1.5, { loc: false });
 def('ADVANCE BLOCK', 'bear', 'warning', 'up', false, 3, (C, i) => { const [a, b, c] = [C.B[i - 2], C.B[i - 1], C.B[i]]; return [a, b, c].every((k) => k.white) && b.c > a.c && c.c > b.c && ((b.body < a.body && c.body < b.body) || (c.upper >= c.body && b.upper >= b.body * 0.5)); });
 def('STALLED PATTERN', 'bear', 'warning', 'up', false, 3, (C, i) => { const [a, b, c] = [C.B[i - 2], C.B[i - 1], C.B[i]]; return a.white && b.white && c.white && C.isLong(i - 2) && C.isLong(i - 1) && b.c > a.c && C.isSmall(i) && c.bot >= b.c - b.body * 0.25; });
 def('BULLISH COUNTERATTACK', 'bull', 'reversal', 'down', true, 2, (C, i) => { const a = C.B[i - 1], b = C.B[i]; return a.black && C.isLong(i - 1) && b.white && C.isLong(i) && b.o < a.c - a.body * 0.3 && Math.abs(b.c - a.c) <= a.body * 0.1; });
@@ -185,20 +215,28 @@ def('UNIQUE THREE RIVER BOTTOM', 'bull', 'reversal', 'down', true, 3, (C, i) => 
 // three tests of a low/high; a close beyond the intervening peak/trough confirms
 const threeBuddha = (C, i, low) => {
   if (i < 42) return false;
-  const pts = swings(C, i, 40, low ? 'low' : 'high').slice(-3); if (pts.length < 3) return false;
-  const lo = Math.min(...pts), hi = Math.max(...pts), avgr = C.avgRange(i);
-  if (hi - lo > avgr * 2.2) return false;
-  const last10 = C.B.slice(i - 10, i);
-  return low ? (C.B[i].white && C.B[i].c > Math.max(...last10.map((b) => b.h))) : (C.B[i].black && C.B[i].c < Math.min(...last10.map((b) => b.l)));
+  const idx = swingIdx(C, i, 40, low ? 'low' : 'high').slice(-3); if (idx.length < 3) return false;
+  if (idx[1] - idx[0] < 3 || idx[2] - idx[1] < 3) return false;                 // three separate tests
+  const pts = idx.map((j) => (low ? C.B[j].l : C.B[j].h)), ar = C.avgRange(i);
+  if (Math.max(...pts) - Math.min(...pts) > ar * 1.5) return false;              // the same level each time
+  const ext = low ? C.lowestLow(i, 40) : C.highestHigh(i, 40);                   // and it is the bottom (top) of the move
+  if (low ? Math.min(...pts) > ext + ar * 0.25 : Math.max(...pts) < ext - ar * 0.25) return false;
+  // Nison: "the peak of the troughs should be exceeded to confirm a bottom"
+  const between = C.B.slice(idx[0], idx[2] + 1);
+  const lvl = low ? Math.max(...between.map((x) => x.h)) : Math.min(...between.map((x) => x.l));
+  if ((low ? lvl - Math.min(...pts) : Math.max(...pts) - lvl) < ar * 1.5) return false;   // a formation, not a flat line
+  const m = Math.max(ar * 0.15, C.tick * 2), bar = C.B[i], prev = C.B[i - 1];
+  return low ? (bar.white && bar.c > lvl + m && prev.c <= lvl + m) : (bar.black && bar.c < lvl - m && prev.c >= lvl - m);
 };
-def('THREE RIVERS BOTTOM', 'bull', 'reversal', null, false, 1, (C, i) => threeBuddha(C, i, true), 1.5);
-def('THREE MOUNTAINS TOP', 'bear', 'reversal', null, false, 1, (C, i) => threeBuddha(C, i, false), 1.5);
+def('THREE RIVERS BOTTOM', 'bull', 'warning', null, false, 1, (C, i) => threeBuddha(C, i, true), 1.5, { loc: false });
+def('THREE MOUNTAINS TOP', 'bear', 'warning', null, false, 1, (C, i) => threeBuddha(C, i, false), 1.5, { loc: false });
 // rounded base / top of small bodies completed by a window
 const rounded = (C, i, base) => { if (i < 14) return false; const s = C.B.slice(i - 12, i); const smallShare = s.filter((_, k) => C.isSmall(i - 12 + k)).length / 12; if (smallShare < 0.6) return false;
   const closes = s.map((b) => b.c), m = closes.slice(4, 8).reduce((x, y) => x + y) / 4, ends = (closes[0] + closes[11]) / 2;
-  return base ? (m < ends && C.B[i].l > s[11].h) : (m > ends && C.B[i].h < s[11].l); };
-def('FRY PAN BOTTOM', 'bull', 'reversal', null, false, 1, (C, i) => rounded(C, i, true), 1.4);
-def('DUMPLING TOP', 'bear', 'reversal', null, false, 1, (C, i) => rounded(C, i, false), 1.4);
+  const depth = Math.abs(ends - m) >= C.avgRange(i) * 1.0;
+  return depth && (base ? (m < ends && C.B[i].l > s[11].h) : (m > ends && C.B[i].h < s[11].l)); };
+def('FRY PAN BOTTOM', 'bull', 'reversal', null, false, 1, (C, i) => rounded(C, i, true), 1.4, { loc: false });
+def('DUMPLING TOP', 'bear', 'reversal', null, false, 1, (C, i) => rounded(C, i, false), 1.4, { loc: false });
 
 // --- Chapter 7: continuation
 def('RISING WINDOW', 'bull', 'continuation', 'up', false, 2, (C, i) => C.B[i].l > C.B[i - 1].h);
@@ -214,10 +252,10 @@ const threeMethods = (C, i, n, up) => { const first = C.B[i - n - 1], last = C.B
   if (up ? !(first.white && last.white && last.c > first.c && last.o >= C.B[i - 1].c - closeTol(C.B[i - 1])) : !(first.black && last.black && last.c < first.c && last.o <= C.B[i - 1].c + closeTol(C.B[i - 1]))) return false;
   for (let k = 1; k <= n; k++) { const m = C.B[i - k]; if (!C.isSmall(i - k) || m.top > first.h || m.bot < first.l) return false; } return true; };
 def('RISING THREE METHODS', 'bull', 'continuation', 'up', false, 5, (C, i) => [2, 3, 4].some((n) => i - n - 1 >= 0 && threeMethods(C, i, n, true)), 1.5);
-def('FALLING THREE METHODS', 'bear', 'continuation', 'down', false, 5, (C, i) => [2, 3, 4].some((n) => i - n - 1 >= 0 && threeMethods(C, i, n, false)), 1.5);
+def('FALLING THREE METHODS', 'bear', 'warning', 'down', false, 5, (C, i) => [2, 3, 4].some((n) => i - n - 1 >= 0 && threeMethods(C, i, n, false)), 1.5);
 def('MAT-HOLD', 'bull', 'continuation', 'up', false, 5, (C, i) => [2, 3, 4].some((n) => { if (i - n - 1 < 0) return false; const a = C.B[i - n - 1], s = C.B.slice(i - n, i), e = C.B[i]; return a.white && C.isLong(i - n - 1) && s[0].black && s[0].bot >= a.c - closeTol(a) && s.every((m) => m.black) && e.white && e.c > Math.max(...s.map((m) => m.h)); }), 1.5);
 def('BULLISH SEPARATING LINE', 'bull', 'continuation', 'up', false, 2, (C, i) => { const a = C.B[i - 1], b = C.B[i]; return a.black && b.white && C.isLong(i) && Math.abs(b.o - a.o) <= a.range * 0.1 && b.lower <= b.range * 0.1; });
-def('BEARISH SEPARATING LINE', 'bear', 'continuation', 'down', false, 2, (C, i) => { const a = C.B[i - 1], b = C.B[i]; return a.white && b.black && C.isLong(i) && Math.abs(b.o - a.o) <= a.range * 0.1 && b.upper <= b.range * 0.1; });
+def('BEARISH SEPARATING LINE', 'bear', 'warning', 'down', false, 2, (C, i) => { const a = C.B[i - 1], b = C.B[i]; return a.white && b.black && C.isLong(i) && Math.abs(b.o - a.o) <= a.range * 0.1 && b.upper <= b.range * 0.1; });
 
 // --- Chapter 8: doji
 def('DOJI AFTER LONG WHITE', 'bear', 'warning', 'up', true, 2, (C, i) => C.isDoji(i) && C.isLong(i - 1) && C.B[i - 1].white && !C.dojiCrowded(i), 1.2);
@@ -231,9 +269,9 @@ def('SPINNING TOP', 'neutral', 'warning', null, false, 1, (C, i) => C.isSpinning
 def('HIGH-WAVE CANDLE', 'neutral', 'warning', null, false, 1, (C, i) => { const b = C.B[i]; return C.isSmall(i) && b.upper >= b.range * 0.35 && b.lower >= b.range * 0.35 && b.range >= C.avgRange(i) * 1.5; });
 
 // --- Chapter 11: springs and upthrusts of a lateral band
-const band = (C, i) => { if (i < 34) return null; const s = C.B.slice(i - 30, i - 1); const hi = Math.max(...s.map((b) => b.h)), lo = Math.min(...s.map((b) => b.l)); return (hi - lo) <= C.avgRange(i) * 12 ? { hi, lo } : null; };
-def('SPRING', 'bull', 'reversal', null, false, 1, (C, i) => { const r = band(C, i), b = C.B[i]; return !!r && b.l < r.lo && b.c > r.lo && b.c >= b.l + b.range * 0.5; }, 1.6);
-def('UPTHRUST', 'bear', 'reversal', null, false, 1, (C, i) => { const r = band(C, i), b = C.B[i]; return !!r && b.h > r.hi && b.c < r.hi && b.c <= b.l + b.range * 0.5; }, 1.6);
+const band = (C, i) => { if (i < 34) return null; const s = C.B.slice(i - 30, i - 1); const hi = Math.max(...s.map((b) => b.h)), lo = Math.min(...s.map((b) => b.l)); return (hi - lo) <= C.avgRange(i) * 10 ? { hi, lo, m: Math.max(C.avgRange(i) * 0.1, C.tick * 2) } : null; };
+def('SPRING', 'bull', 'reversal', null, false, 1, (C, i) => { const r = band(C, i), b = C.B[i]; return !!r && C.real(i, 0.6) && b.l <= r.lo - r.m && b.c > r.lo && b.c >= b.l + b.range * 0.5; }, 1.6, { loc: false });
+def('UPTHRUST', 'bear', 'reversal', null, false, 1, (C, i) => { const r = band(C, i), b = C.B[i]; return !!r && C.real(i, 0.6) && b.h >= r.hi + r.m && b.c < r.hi && b.c <= b.l + b.range * 0.5; }, 1.6, { loc: false });
 
 const CATALOG = P.map(({ name, dir, kind, trend, confirm }) => ({ name, dir, kind, trend, confirm }));
 
@@ -271,18 +309,30 @@ function recordSessions(C, i) {
 function risingWindows(C, i) { let n = 0; for (let j = i; j > Math.max(0, i - 25); j--) { if (C.B[j].l > C.B[j - 1].h) n++; if (C.B[j].c < C.e50[j]) break; } return n; }
 
 // ---------------------------------------------------------------- scan
+// continuation patterns kept as warnings only (they lost to a random candle on 15m crypto); they form mid-move, so no location check
+const INFO_ONLY = new Set(['ON-NECK LINE', 'IN-NECK LINE', 'THRUSTING LINE', 'FALLING THREE METHODS', 'BEARISH SEPARATING LINE']);
 function scan(klines) {
   const B = parse(Array.isArray(klines) ? klines : []);
   const empty = { patterns: [], bull: [], bear: [], warnings: [], trend: 'none', major: 'flat', ctx: null };
   if (B.length < 12) return empty;
   const C = makeCtx(B), n = B.length - 1, found = [];
+  // Candles only a few price steps tall cannot form shapes (the step decides the shape, not the traders).
+  if (C.tick > 0 && C.avgRange(n) < C.tick * 5) return { ...empty, coarse: true, trend: C.trendBefore(n + 1), major: C.majorTrend(n), ctx: C };
+  const low = (i, bars) => Math.min(...B.slice(i - bars + 1, i + 1).map((b) => b.l));
+  const high = (i, bars) => Math.max(...B.slice(i - bars + 1, i + 1).map((b) => b.h));
+  // Nison: a reversal pattern is meaningful at the top or bottom of a move. The pattern has to make or
+  // retest the extreme of the 12 candles before it, and its last line has to be a readable candle.
+  const placed = (p, i) => {
+    if (p.loc === false || p.dir === 'neutral' || p.kind === 'continuation' || INFO_ONLY.has(p.name)) return true;
+    const s0 = i - p.bars + 1, ar = C.avgRange(s0);
+    if (!C.real(i)) return false;
+    return p.dir === 'bull' ? low(i, p.bars) <= C.lowestLow(s0, 12) + ar * 0.5 : high(i, p.bars) >= C.highestHigh(s0, 12) - ar * 0.5;
+  };
   const test = (p, i) => {
     if (i - p.bars < 1) return false;
     if (p.trend && C.trendBefore(i - p.bars + 1) !== p.trend) return false;
-    try { return p.fn(C, i) || false; } catch (e) { return false; }
+    try { return (placed(p, i) && p.fn(C, i)) || false; } catch (e) { return false; }
   };
-  const low = (i, bars) => Math.min(...B.slice(i - bars + 1, i + 1).map((b) => b.l));
-  const high = (i, bars) => Math.max(...B.slice(i - bars + 1, i + 1).map((b) => b.h));
   for (const p of P) {
     const now = test(p, n);
     if (now && !(p.confirm || now.confirm)) { found.push({ p, at: n, status: 'complete' }); continue; }
