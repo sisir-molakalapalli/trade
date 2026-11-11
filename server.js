@@ -63,6 +63,7 @@ try {
 
 // Strategy core (pure functions, shared with backtest.js)
 const Strategy = require('./strategy');
+const SMC = require('./smc');
 
 const PORT = process.env.PORT || 3000;
 const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
@@ -79,8 +80,10 @@ const recentTradeDispatches = new Set();
 // CORE SYSTEM STATE
 // -------------------------------------------------------------
 const MANUAL_START_USDT = Number(process.env.MANUAL_START_USDT) || Strategy.MANUAL.startUSDT;
+const ENTRY_MODELS = { ORDER_BLOCK: 'Order block retest (London / New York sessions)', CANDLE: 'Candlestick patterns' };
 const State = {
   autopilotEnabled: true,
+  entryModel: ENTRY_MODELS[process.env.ENTRY_MODEL] ? process.env.ENTRY_MODEL : 'ORDER_BLOCK',
   // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
   manual: { startUSDT: MANUAL_START_USDT, cashUSDT: MANUAL_START_USDT, realizedPnL: 0, positions: {}, history: [] },
   portfolio: {
@@ -112,6 +115,7 @@ const State = {
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
+    entries: { model: 'ORDER_BLOCK', label: '', inSession: false, nextSessionAt: 0, scannedBar: 0, coinsScanned: 0, pending: 0, lastSignal: '' },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • Trail • Failing trades move to recovery bags' },
@@ -299,7 +303,7 @@ async function refreshMarketMode(tickers) {
   const top = tickers
     .filter((t) => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && !/^(USDC|FDUSD|TUSD|EUR|USD1|RLUSD|PAXG)/.test(t.symbol))
     .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume)).slice(0, 30).map((t) => t.symbol);
-  const [btc, ...coins] = await Promise.all(['BTCUSDT', ...top].map((s) => getKlinesStrict(s, '1h', 120)));
+  const [btc, ...coins] = await Promise.all(['BTCUSDT', ...top].map((s) => getKlinesStrict(s, '1h', 200)));
   const r = Strategy.evaluateMarketMode(btc ? Strategy.closedOnly(btc) : null, coins.filter(Boolean).map((k) => Strategy.closedOnly(k)));
   const before = State.subsystems.marketMode.mode;
   State.subsystems.marketMode = { ...r, breadth: r.breadth === null || r.breadth === undefined ? null : Number(r.breadth.toFixed(2)), updatedAt: Date.now() };
@@ -818,7 +822,7 @@ async function checkCandlestickSentry(symbol, futures = false) {
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
     const [k15, k1h] = await Promise.all([
       getCachedKlines(pairSym, '15m', 100, 2500, 0, futures),
-      getCachedKlines(pairSym, '1h', 60, 3500, 0, futures)
+      getCachedKlines(pairSym, '1h', 200, 3500, 0, futures)
     ]);
     const closed15 = Strategy.closedOnly(k15);
     if (!Array.isArray(closed15) || closed15.length < 30) return none;
@@ -948,7 +952,7 @@ async function check1hTrendAlignment(symbol) {
   try {
     const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
     const pairSym = cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`;
-    const klines = await getCachedKlines(pairSym, '1h', 60, 3500, 120000, true);
+    const klines = await getCachedKlines(pairSym, '1h', 200, 3500, 120000, true);
 
     if (!Array.isArray(klines) || klines.length < 20) {
       return { passed: false, reason: 'Futures data unavailable' };
@@ -1055,7 +1059,7 @@ async function checkShortMomentum(symbol) {
 }
 
 async function checkShort1hTrend(symbol) {
-  const k = await getCachedKlines(symbol, '1h', 60, 3500, 120000, true).catch(() => null);
+  const k = await getCachedKlines(symbol, '1h', 200, 3500, 120000, true).catch(() => null);
   if (!Array.isArray(k) || k.length < 45) return { passed: false, reason: '1h data unavailable' };
   const closes = k.map((b) => parseFloat(b[4])), n = closes.length - 1, c = closes[n];
   const e20 = Strategy.emaSeries(closes, 20), e50 = Strategy.emaSeries(closes, 50);
@@ -1069,7 +1073,7 @@ async function checkShort1hTrend(symbol) {
 
 // Neutral market: a coin may only trade in the direction of its own closed 1h trend.
 async function coinTrendAgrees(pairKey, side) {
-  const k = await getCachedKlines(pairKey, '1h', 120, 3500, 120000, true).catch(() => null);
+  const k = await getCachedKlines(pairKey, '1h', 200, 3500, 120000, true).catch(() => null);
   if (!Array.isArray(k)) return false;
   return Strategy.coinTrend(Strategy.closedOnly(k).map((b) => parseFloat(b[4]))) === side;
 }
@@ -1162,6 +1166,96 @@ async function buildEntrySignal(pairKey, price, pattern, microMom) {
     atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: microMom.rvol };
 }
 
+// -------------------------------------------------------------
+// ORDER BLOCK ENTRIES (smc.js). The scanner reads every coin's newest CLOSED 15m futures candle at all hours,
+// so an order block retested outside the sessions is used up, exactly as in the 180-day test. Trades open
+// only for signals in the London / New York sessions, within 5 minutes of the candle closing.
+// -------------------------------------------------------------
+const OB = { lastBar: new Map(), used: new Map(), lastSigBar: new Map(), signals: new Map(), busy: false };
+const BAR_MS = 900000;
+
+async function coinOwnTrend(pairKey) {
+  const k = await getCachedKlines(pairKey, '1h', 200, 3500, 120000, true).catch(() => null);
+  if (!Array.isArray(k)) return null;
+  return Strategy.coinTrend(Strategy.closedOnly(k).map((b) => parseFloat(b[4])));
+}
+
+async function scanOrderBlocks() {
+  const E = State.subsystems.entries;
+  E.model = State.entryModel; E.label = ENTRY_MODELS[State.entryModel];
+  E.inSession = SMC.inKillzone(Date.now()); E.nextSessionAt = E.inSession ? 0 : SMC.nextKillzone(Date.now());
+  if (State.entryModel !== 'ORDER_BLOCK' || OB.busy || !perpetuals.size) return;
+  const mode = State.subsystems.marketMode;
+  if (!mode || mode.side === 'NONE') return;
+  const bar = Math.floor(Date.now() / BAR_MS) * BAR_MS - BAR_MS;          // open time of the newest closed 15m candle
+  const coins = Object.entries(State.universe || {})
+    .filter(([sym, c]) => perpetuals.has(sym) && Number(c.volumeM || 0) >= 10 && OB.lastBar.get(sym) !== bar)
+    .map(([sym, c]) => ({ sym, c }));
+  if (!coins.length) return;
+  OB.busy = true;
+  try {
+    let next = 0;
+    const work = async () => {
+      while (next < coins.length) {
+        const { sym, c } = coins[next++];
+        const raw = await getCachedKlines(sym, '15m', 131, 3500, 60000, true).catch(() => null);
+        const k = Array.isArray(raw) ? Strategy.closedOnly(raw) : null;
+        if (!k || k.length < SMC.OB_RULES.minBars || +k[k.length - 1][0] !== bar) continue;   // not closed yet here: retry next pass
+        OB.lastBar.set(sym, bar);
+        let side = mode.side === 'LONG' ? 'LONG' : mode.side === 'SHORT' ? 'SHORT' : await coinOwnTrend(sym);
+        if (!side) continue;
+        const block = Strategy.futuresExclusion({ side, volumeUSD: Number(c.volumeM) * 1e6, fundingRate: currentFundingRate(sym), listedAt: perpetuals.get(sym).listedAt });
+        if (block) continue;
+        const r = SMC.findOrderBlockEntry(k, side === 'LONG' ? 1 : -1);
+        if (!r.ok) continue;
+        const used = OB.used.get(sym) || new Set(); OB.used.set(sym, used);
+        if (used.has(r.obTime) || bar - (OB.lastSigBar.get(sym) || -Infinity) < SMC.OB_RULES.cooldownBars * BAR_MS) continue;
+        used.add(r.obTime); if (used.size > 50) used.delete(used.values().next().value);
+        OB.lastSigBar.set(sym, bar);
+        if (SMC.inKillzone(bar)) {
+          OB.signals.set(sym, { sym, side, bar, r });
+          E.lastSignal = `${sym} ${side} order block retest at ${new Date(bar + BAR_MS).toISOString().slice(11, 16)} UTC`;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: 6 }, work));
+    E.scannedBar = bar; E.coinsScanned = coins.length;
+  } finally { OB.busy = false; }
+  for (const [sym, s] of OB.signals) if (Date.now() - (s.bar + BAR_MS) > 5 * 60000) OB.signals.delete(sym);
+  E.pending = OB.signals.size;
+  if (OB.signals.size) kickEntries();
+}
+function kickEntries() { evaluateAutopilotEntries().catch((e) => console.error('[Entries]', e.message)); }
+
+async function evaluateOrderBlockEntries(maxBagsLimit) {
+  isEvaluatingEntries = true;
+  try {
+    const now = Date.now();
+    for (const [sym, s] of [...OB.signals]) {
+      OB.signals.delete(sym);                                   // one attempt per signal
+      if (now - (s.bar + BAR_MS) > 5 * 60000) continue;         // the test entered at the next candle's open
+      if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
+      const base = sym.replace(/USDT$/, '');
+      if (State.activePositions[sym] || State.recoveryBags[sym]) continue;
+      if (State.cooldowns[base] && State.cooldowns[base].until > now) continue;
+      const book = await fetchRealOrderBookDepth(sym, true);
+      if (!book || book.spreadPct > 0.20) { logOperation('BOOK_VETO', `${sym} order block ${s.side.toLowerCase()}: ${book ? `spread ${book.spreadPct.toFixed(2)}%` : 'futures order book unavailable'}.`, 'warning'); continue; }
+      const short = s.side === 'SHORT', px = short ? book.bestBid : book.bestAsk;
+      if (short ? px >= s.r.stop : px <= s.r.stop) { logOperation('OB_SKIP', `${sym}: price already beyond the order block.`, 'info'); continue; }
+      const stopPct = Math.abs(px - s.r.stop) / px * 100;
+      const signal = { ok: true, pattern: 'ORDER BLOCK RETEST', refPrice: px, stopPrice: s.r.stop, stopPct, atrPct: stopPct, rvol: 1 };
+      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT));
+      if (!plan.ok) { logOperation('CASH_GUARD', `${sym}: ${plan.reason}`, 'warning'); continue; }
+      const minN = perpetuals.get(sym)?.minNotional || 5;
+      if (plan.notional < minN) { logOperation('CASH_GUARD', `${sym}: Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
+      logOperation('BOOK_CLEAR', `${sym} order block ${s.side.toLowerCase()} confirmed: zone $${formatPrecisePrice(s.r.zoneLow)}-$${formatPrecisePrice(s.r.zoneHigh)}, spread ${book.spreadPct.toFixed(2)}%. Entering...`, 'success');
+      if (short) openShort(sym, signal, plan, 50); else openLong(sym, signal, plan, 50);
+    }
+  } finally {
+    isEvaluatingEntries = false;
+  }
+}
+
 async function evaluateAutopilotEntries() {
   if (!State.autopilotEnabled || isEvaluatingEntries) return;
 
@@ -1191,6 +1285,14 @@ async function evaluateAutopilotEntries() {
   }
   if (Number(State.portfolio.cashUSDT) < Strategy.CONFIG.minNotional * (1 + FUT_FEE_RATE)) {
     throttledNotice('cash', 'CASH_GUARD', 'Free cash is below the $5 minimum position. Waiting for open trades to close.', 'info', 60000);
+    return;
+  }
+  if (State.entryModel === 'ORDER_BLOCK') {
+    if (!SMC.inKillzone(Date.now())) {
+      throttledNotice('session', 'ENTRIES', `Order block entries open only in the London (07:00-10:00 UTC) and New York (12:00-16:00 UTC) sessions. Next session ${new Date(SMC.nextKillzone(Date.now())).toISOString().slice(11, 16)} UTC.`, 'info', 900000);
+      return;
+    }
+    if (OB.signals.size) await evaluateOrderBlockEntries(maxBagsLimit);
     return;
   }
   if (mode.side !== 'LONG') await evaluateShortEntries(maxBagsLimit);
@@ -1759,6 +1861,7 @@ function saveDiskState() {
       recoveryBags: State.recoveryBags,
       tradeLogs: State.tradeLogs.slice(0, 150),
       manual: State.manual,
+      entryModel: State.entryModel,
       masterLedgerUrl: State.masterLedgerUrl,
       learningSheetUrl: State.learningSheetUrl,
       capitalResetId: State.capitalResetId || CAPITAL_RESET_ID
@@ -1776,6 +1879,7 @@ function loadDiskState() {
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
       if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
+      if (ENTRY_MODELS[parsed.entryModel] && !process.env.ENTRY_MODEL) State.entryModel = parsed.entryModel;
       if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
         State.masterLedgerUrl = parsed.masterLedgerUrl;
       } else {
@@ -2023,6 +2127,18 @@ function checkManualLiquidation(sym, price) {
     if (p.symbol === sym && p.side === 'SHORT' && p.liquidationPrice && price >= p.liquidationPrice) closeManual(id, p.liquidationPrice, 'LIQUIDATED');
   });
 }
+
+app.post('/api/entry-model', (req, res) => {
+  const m = String(req.body.model || '').toUpperCase();
+  if (!ENTRY_MODELS[m]) return res.status(400).json({ success: false, error: 'model must be ORDER_BLOCK or CANDLE' });
+  State.entryModel = m;
+  OB.signals.clear();
+  State.subsystems.entries.model = m; State.subsystems.entries.label = ENTRY_MODELS[m];
+  logOperation('ENTRIES', `Entry model set to ${ENTRY_MODELS[m]}. Exits, sizing and recovery bags are unchanged.`, 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, model: m, label: ENTRY_MODELS[m] });
+});
 
 app.get('/api/manual', (req, res) => res.json(manualView()));
 
@@ -2399,5 +2515,6 @@ setInterval(async () => {
   }
 }, 10000);
 setInterval(broadcastPriceStream, 250);
+setInterval(() => { scanOrderBlocks().catch((e) => console.error('[OrderBlocks]', e.message)); }, 15000);
 setInterval(() => { refreshExitSignals().catch(() => {}); }, 3000);
 setInterval(runDynamicScreener, 60000);
