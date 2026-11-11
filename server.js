@@ -83,7 +83,7 @@ const MANUAL_START_USDT = Number(process.env.MANUAL_START_USDT) || Strategy.MANU
 const ENTRY_MODELS = { ORDER_BLOCK: 'Order block retest (London / New York sessions)', CANDLE: 'Candlestick patterns' };
 const State = {
   autopilotEnabled: true,
-  entryModel: ENTRY_MODELS[process.env.ENTRY_MODEL] ? process.env.ENTRY_MODEL : 'ORDER_BLOCK',
+  entryModel: ENTRY_MODELS[process.env.ENTRY_MODEL] ? process.env.ENTRY_MODEL : 'CANDLE',
   // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
   manual: { startUSDT: MANUAL_START_USDT, cashUSDT: MANUAL_START_USDT, realizedPnL: 0, positions: {}, history: [] },
   portfolio: {
@@ -115,7 +115,7 @@ const State = {
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
-    entries: { model: 'ORDER_BLOCK', label: '', inSession: false, nextSessionAt: 0, scannedBar: 0, coinsScanned: 0, pending: 0, lastSignal: '' },
+    entries: { model: 'CANDLE', label: '', inSession: false, nextSessionAt: 0, scannedBar: 0, coinsScanned: 0, pending: 0, lastSignal: '' },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • Trail • Failing trades move to recovery bags' },
@@ -1862,6 +1862,7 @@ function saveDiskState() {
       tradeLogs: State.tradeLogs.slice(0, 150),
       manual: State.manual,
       entryModel: State.entryModel,
+      entryModelV: 2,
       masterLedgerUrl: State.masterLedgerUrl,
       learningSheetUrl: State.learningSheetUrl,
       capitalResetId: State.capitalResetId || CAPITAL_RESET_ID
@@ -1879,7 +1880,8 @@ function loadDiskState() {
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
       if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
-      if (ENTRY_MODELS[parsed.entryModel] && !process.env.ENTRY_MODEL) State.entryModel = parsed.entryModel;
+      // v6.3 saved ORDER_BLOCK as the default; only a choice made after v6.3.2 (entryModelV 2) is kept.
+      if (ENTRY_MODELS[parsed.entryModel] && parsed.entryModelV === 2 && !process.env.ENTRY_MODEL) State.entryModel = parsed.entryModel;
       if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
         State.masterLedgerUrl = parsed.masterLedgerUrl;
       } else {
@@ -2122,6 +2124,23 @@ function closeManual(id, price, label) {
   return trade;
 }
 
+// Take-profit: once the trade price reaches the target, close at what the book really pays
+// (long sells the bid, short buys the ask), and only if that fill still meets the target.
+const tpBusy = new Set();
+async function checkManualTakeProfit(sym, price) {
+  for (const [id, p] of Object.entries(State.manual.positions || {})) {
+    if (p.symbol !== sym || !p.takeProfitPct || p.closing || tpBusy.has(id)) continue;
+    if (Strategy.manualGainPct(p, price) < p.takeProfitPct) continue;
+    tpBusy.add(id);
+    try {
+      const q = await futuresQuote(sym);
+      if (!q || !State.manual.positions[id]) continue;
+      const fill = p.side === 'SHORT' ? q.ask : q.bid;
+      if (Strategy.manualGainPct(p, fill) >= p.takeProfitPct) closeManual(id, fill, 'TAKE PROFIT');
+    } finally { tpBusy.delete(id); }
+  }
+}
+
 function checkManualLiquidation(sym, price) {
   Object.entries(State.manual.positions || {}).forEach(([id, p]) => {
     if (p.symbol === sym && p.side === 'SHORT' && p.liquidationPrice && price >= p.liquidationPrice) closeManual(id, p.liquidationPrice, 'LIQUIDATED');
@@ -2160,6 +2179,8 @@ app.post('/api/manual/open', async (req, res) => {
   const sym = symbol.endsWith('USDT') ? symbol : `${symbol}USDT`;
   const side = String(req.body.side || '').toUpperCase();
   const notional = Math.floor(parseFloat(req.body.notionalUSDT) * 100) / 100;
+  const tp = Strategy.manualTakeProfit(req.body.takeProfitPct);
+  if (!tp.ok) return res.status(400).json({ success: false, error: tp.reason });
   await refreshPerpetuals().catch(() => {});
   if (!perpetuals.has(sym)) return res.status(400).json({ success: false, error: `${sym} is not a trading USD-M perpetual on Binance` });
   const minN = Math.max(Strategy.MANUAL.minNotional, perpetuals.get(sym).minNotional || 5);
@@ -2172,8 +2193,9 @@ app.post('/api/manual/open', async (req, res) => {
   State.manual.cashUSDT = Number((Number(State.manual.cashUSDT) - plan.cost).toFixed(6));
   State.manual.positions[id] = { id, manual: true, symbol: sym, pair: `${sym.replace(/USDT$/, '')}/USDT`, side, market: 'FUTURES', leverage: Strategy.FUTURES.leverage,
     openedAt: Date.now(), entryPriceUSDT: price, livePriceUSDT: price, lastTickAt: Date.now(), qty: plan.qty, notionalUSDT: plan.notional,
-    openFeeUSDT: Number((plan.cost - plan.notional).toFixed(6)), liquidationPrice: plan.liquidationPrice, fundingUSDT: 0, nextFundingAt: 0 };
-  logOperation('MANUAL', `Opened ${side} ${sym} @ $${formatPrecisePrice(price)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper, manual account)`, 'success');
+    openFeeUSDT: Number((plan.cost - plan.notional).toFixed(6)), liquidationPrice: plan.liquidationPrice, fundingUSDT: 0, nextFundingAt: 0, takeProfitPct: tp.pct };
+  State.manual.positions[id].takeProfitPrice = Strategy.manualTakeProfitPrice(State.manual.positions[id]);
+  logOperation('MANUAL', `Opened ${side} ${sym} @ $${formatPrecisePrice(price)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper, manual account)${tp.pct ? `, closes at +${tp.pct}%` : ''}`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -2187,6 +2209,19 @@ app.post('/api/manual/close', async (req, res) => {
   if (!q) return res.status(503).json({ success: false, error: 'No live futures price right now. Your position is still open.' });
   const trade = closeManual(p.id, p.side === 'SHORT' ? q.ask : q.bid, 'MANUAL CLOSE');
   res.json({ success: Boolean(trade), trade, manual: manualView() });
+});
+
+app.post('/api/manual/tp', (req, res) => {
+  const p = State.manual.positions[req.body.id];
+  if (!p) return res.status(404).json({ success: false, error: 'Position not found' });
+  const tp = Strategy.manualTakeProfit(req.body.takeProfitPct);
+  if (!tp.ok) return res.status(400).json({ success: false, error: tp.reason });
+  p.takeProfitPct = tp.pct; p.takeProfitPrice = Strategy.manualTakeProfitPrice(p);
+  logOperation('MANUAL', `${p.pair} ${p.side}: ${tp.pct ? `closes automatically at +${tp.pct}% ($${formatPrecisePrice(p.takeProfitPrice)})` : 'take profit off'}.`, 'info');
+  saveDiskState();
+  broadcastStateUpdate();
+  if (tp.pct && p.livePriceUSDT) checkManualTakeProfit(p.symbol, Number(p.livePriceUSDT)).catch(() => {});
+  res.json({ success: true, position: p, manual: manualView() });
 });
 
 app.post('/api/manual/reset', (req, res) => {
@@ -2388,6 +2423,7 @@ function syncFuturesStream() {
         });
         Object.values(State.manual.positions || {}).forEach((p) => { if (p.symbol === t.s) { p.livePriceUSDT = price; p.lastTickAt = Date.now(); } });
         checkManualLiquidation(t.s, price);
+        checkManualTakeProfit(t.s, price).catch(() => {});
         if (changed) kickSentry();
       } catch (e) {}
     });
@@ -2511,7 +2547,7 @@ setInterval(async () => {
   for (const p of Object.values(State.manual.positions || {})) {
     if (Date.now() - Number(p.lastTickAt || 0) < 15000) continue;
     const px = await fetchFuturesPrice(p.symbol);
-    if (px) { p.livePriceUSDT = px; p.lastTickAt = Date.now(); checkManualLiquidation(p.symbol, px); }
+    if (px) { p.livePriceUSDT = px; p.lastTickAt = Date.now(); checkManualLiquidation(p.symbol, px); await checkManualTakeProfit(p.symbol, px).catch(() => {}); }
   }
 }, 10000);
 setInterval(broadcastPriceStream, 250);
