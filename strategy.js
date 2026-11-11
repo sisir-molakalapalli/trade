@@ -884,6 +884,20 @@ function manualClose(pos, price, cfg = FUTURES) {
   return { proceeds, pnl, gainPct: ((short ? e - price : price - e) / e) * 100 };
 }
 
+/** Price move of a manual position in its favour, in % of entry (the figure the Manual tab shows). */
+function manualGainPct(pos, price) {
+  const e = num(pos.entryPriceUSDT);
+  return e > 0 ? ((pos.side === 'SHORT' ? e - price : price - e) / e) * 100 : 0;
+}
+/** A take-profit is a price move of 0.1% to 100% in the position's favour; null turns it off. */
+function manualTakeProfit(pct) {
+  if (pct === null || pct === undefined || pct === '' || pct === 0 || pct === '0') return { ok: true, pct: null };
+  const v = Number(pct);
+  if (!Number.isFinite(v) || v < 0.1 || v > 100) return { ok: false, reason: 'take profit must be between 0.1% and 100%' };
+  return { ok: true, pct: Math.round(v * 100) / 100 };
+}
+const manualTakeProfitPrice = (pos) => (pos.takeProfitPct ? num(pos.entryPriceUSDT) * (1 + (pos.side === 'SHORT' ? -1 : 1) * pos.takeProfitPct / 100) : null);
+
 /** Value of a manual position marked at `price`, before the exit fee. */
 function manualMark(pos, price) {
   const q = num(pos.qty), e = num(pos.entryPriceUSDT), f = num(pos.fundingUSDT) || 0;
@@ -952,6 +966,9 @@ module.exports = {
   manualOpenPlan,
   manualClose,
   manualMark,
+  manualGainPct,
+  manualTakeProfit,
+  manualTakeProfitPrice,
   futuresExclusion,
   coinTrend,
   planCompoundEntry,
