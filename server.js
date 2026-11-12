@@ -63,7 +63,7 @@ try {
 
 // Strategy core (pure functions, shared with backtest.js)
 const Strategy = require('./strategy');
-const SMC = require('./smc');
+const PP = require('./pricepattern');
 
 const PORT = process.env.PORT || 3000;
 const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
@@ -80,7 +80,8 @@ const recentTradeDispatches = new Set();
 // CORE SYSTEM STATE
 // -------------------------------------------------------------
 const MANUAL_START_USDT = Number(process.env.MANUAL_START_USDT) || Strategy.MANUAL.startUSDT;
-const ENTRY_MODELS = { ORDER_BLOCK: 'Order block retest (London / New York sessions)', CANDLE: 'Candlestick patterns' };
+// Entry signals the autopilot can use. Order blocks (sessions) were removed in v6.3.3; price action patterns added in v6.4.
+const ENTRY_MODELS = { CANDLE: 'Candlestick patterns', PRICE_ACTION: 'Price action patterns (Seo)' };
 const State = {
   autopilotEnabled: true,
   entryModel: ENTRY_MODELS[process.env.ENTRY_MODEL] ? process.env.ENTRY_MODEL : 'CANDLE',
@@ -115,7 +116,7 @@ const State = {
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
-    entries: { model: 'CANDLE', label: '', inSession: false, nextSessionAt: 0, scannedBar: 0, coinsScanned: 0, pending: 0, lastSignal: '' },
+    entries: { model: 'CANDLE', label: 'Candlestick patterns', scannedBar: 0, coinsScanned: 0, pending: 0, lastSignal: '' },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • Trail • Failing trades move to recovery bags' },
@@ -1167,12 +1168,13 @@ async function buildEntrySignal(pairKey, price, pattern, microMom) {
 }
 
 // -------------------------------------------------------------
-// ORDER BLOCK ENTRIES (smc.js). The scanner reads every coin's newest CLOSED 15m futures candle at all hours,
-// so an order block retested outside the sessions is used up, exactly as in the 180-day test. Trades open
-// only for signals in the London / New York sessions, within 5 minutes of the candle closing.
+// PRICE ACTION PATTERN ENTRIES (pricepattern.js, Young Ho Seo). Every coin's newest CLOSED 15m futures
+// candle is scanned once, at all hours, with the same code as the back test (1500 candles give the same signals
+// as the full 180-day history: 21,825 of 21,825 checked). A signal is tried once,
+// within 5 minutes of its candle closing (the back test entered at the next candle's open).
 // -------------------------------------------------------------
-const OB = { lastBar: new Map(), used: new Map(), lastSigBar: new Map(), signals: new Map(), busy: false };
-const BAR_MS = 900000;
+const PA = { lastBar: new Map(), signals: new Map(), busy: false };
+const PA_BAR_MS = 900000;
 
 async function coinOwnTrend(pairKey) {
   const k = await getCachedKlines(pairKey, '1h', 200, 3500, 120000, true).catch(() => null);
@@ -1180,75 +1182,68 @@ async function coinOwnTrend(pairKey) {
   return Strategy.coinTrend(Strategy.closedOnly(k).map((b) => parseFloat(b[4])));
 }
 
-async function scanOrderBlocks() {
+async function scanPricePatterns() {
   const E = State.subsystems.entries;
   E.model = State.entryModel; E.label = ENTRY_MODELS[State.entryModel];
-  E.inSession = SMC.inKillzone(Date.now()); E.nextSessionAt = E.inSession ? 0 : SMC.nextKillzone(Date.now());
-  if (State.entryModel !== 'ORDER_BLOCK' || OB.busy || !perpetuals.size) return;
+  if (State.entryModel !== 'PRICE_ACTION' || PA.busy || !perpetuals.size) return;
   const mode = State.subsystems.marketMode;
   if (!mode || mode.side === 'NONE') return;
-  const bar = Math.floor(Date.now() / BAR_MS) * BAR_MS - BAR_MS;          // open time of the newest closed 15m candle
+  const bar = Math.floor(Date.now() / PA_BAR_MS) * PA_BAR_MS - PA_BAR_MS;   // open time of the newest closed 15m candle
   const coins = Object.entries(State.universe || {})
-    .filter(([sym, c]) => perpetuals.has(sym) && Number(c.volumeM || 0) >= 10 && OB.lastBar.get(sym) !== bar)
+    .filter(([sym, c]) => perpetuals.has(sym) && Number(c.volumeM || 0) >= 10 && PA.lastBar.get(sym) !== bar)
     .map(([sym, c]) => ({ sym, c }));
   if (!coins.length) return;
-  OB.busy = true;
+  PA.busy = true;
   try {
     let next = 0;
     const work = async () => {
       while (next < coins.length) {
         const { sym, c } = coins[next++];
-        const raw = await getCachedKlines(sym, '15m', 131, 3500, 60000, true).catch(() => null);
+        const raw = await getCachedKlines(sym, '15m', 1500, 6000, 60000, true).catch(() => null);   // 1000-bar EFW window + 500 to warm up
         const k = Array.isArray(raw) ? Strategy.closedOnly(raw) : null;
-        if (!k || k.length < SMC.OB_RULES.minBars || +k[k.length - 1][0] !== bar) continue;   // not closed yet here: retry next pass
-        OB.lastBar.set(sym, bar);
-        let side = mode.side === 'LONG' ? 'LONG' : mode.side === 'SHORT' ? 'SHORT' : await coinOwnTrend(sym);
+        if (!k || k.length < PP.RULES.minBars || +k[k.length - 1][0] !== bar) continue;   // not closed yet here: retry next pass
+        PA.lastBar.set(sym, bar);
+        const side = mode.side === 'LONG' ? 'LONG' : mode.side === 'SHORT' ? 'SHORT' : await coinOwnTrend(sym);
         if (!side) continue;
         const block = Strategy.futuresExclusion({ side, volumeUSD: Number(c.volumeM) * 1e6, fundingRate: currentFundingRate(sym), listedAt: perpetuals.get(sym).listedAt });
         if (block) continue;
-        const r = SMC.findOrderBlockEntry(k, side === 'LONG' ? 1 : -1);
+        const r = PP.findEntry(k, side);
         if (!r.ok) continue;
-        const used = OB.used.get(sym) || new Set(); OB.used.set(sym, used);
-        if (used.has(r.obTime) || bar - (OB.lastSigBar.get(sym) || -Infinity) < SMC.OB_RULES.cooldownBars * BAR_MS) continue;
-        used.add(r.obTime); if (used.size > 50) used.delete(used.values().next().value);
-        OB.lastSigBar.set(sym, bar);
-        if (SMC.inKillzone(bar)) {
-          OB.signals.set(sym, { sym, side, bar, r });
-          E.lastSignal = `${sym} ${side} order block retest at ${new Date(bar + BAR_MS).toISOString().slice(11, 16)} UTC`;
-        }
+        PA.signals.set(sym, { sym, side, bar, r });
+        E.lastSignal = `${sym} ${side} ${r.name} at ${new Date(bar + PA_BAR_MS).toISOString().slice(11, 16)} UTC`;
       }
     };
     await Promise.all(Array.from({ length: 6 }, work));
     E.scannedBar = bar; E.coinsScanned = coins.length;
-  } finally { OB.busy = false; }
-  for (const [sym, s] of OB.signals) if (Date.now() - (s.bar + BAR_MS) > 5 * 60000) OB.signals.delete(sym);
-  E.pending = OB.signals.size;
-  if (OB.signals.size) kickEntries();
+  } finally { PA.busy = false; }
+  for (const [sym, s] of PA.signals) if (Date.now() - (s.bar + PA_BAR_MS) > 5 * 60000) PA.signals.delete(sym);
+  E.pending = PA.signals.size;
+  if (PA.signals.size) evaluateAutopilotEntries().catch((e) => console.error('[Entries]', e.message));
 }
-function kickEntries() { evaluateAutopilotEntries().catch((e) => console.error('[Entries]', e.message)); }
 
-async function evaluateOrderBlockEntries(maxBagsLimit) {
+async function evaluatePricePatternEntries(maxBagsLimit) {
   isEvaluatingEntries = true;
   try {
     const now = Date.now();
-    for (const [sym, s] of [...OB.signals]) {
-      OB.signals.delete(sym);                                   // one attempt per signal
-      if (now - (s.bar + BAR_MS) > 5 * 60000) continue;         // the test entered at the next candle's open
+    for (const [sym, s] of [...PA.signals]) {
+      PA.signals.delete(sym);                                   // one attempt per signal
+      if (now - (s.bar + PA_BAR_MS) > 5 * 60000) continue;      // the test entered at the next candle's open
       if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
       const base = sym.replace(/USDT$/, '');
       if (State.activePositions[sym] || State.recoveryBags[sym]) continue;
       if (State.cooldowns[base] && State.cooldowns[base].until > now) continue;
       const book = await fetchRealOrderBookDepth(sym, true);
-      if (!book || book.spreadPct > 0.20) { logOperation('BOOK_VETO', `${sym} order block ${s.side.toLowerCase()}: ${book ? `spread ${book.spreadPct.toFixed(2)}%` : 'futures order book unavailable'}.`, 'warning'); continue; }
+      if (!book || book.spreadPct > 0.20) { logOperation('BOOK_VETO', `${sym} ${s.r.name}: ${book ? `spread ${book.spreadPct.toFixed(2)}%` : 'futures order book unavailable'}.`, 'warning'); continue; }
       const short = s.side === 'SHORT', px = short ? book.bestBid : book.bestAsk;
-      if (short ? px >= s.r.stop : px <= s.r.stop) { logOperation('OB_SKIP', `${sym}: price already beyond the order block.`, 'info'); continue; }
+      if (short ? px >= s.r.stop : px <= s.r.stop) { logOperation('PA_SKIP', `${sym}: price already beyond the pattern's stop.`, 'info'); continue; }
       const stopPct = Math.abs(px - s.r.stop) / px * 100;
-      const signal = { ok: true, pattern: 'ORDER BLOCK RETEST', refPrice: px, stopPrice: s.r.stop, stopPct, atrPct: stopPct, rvol: 1 };
+      const signal = { ok: true, pattern: s.r.name.toUpperCase(), refPrice: px, stopPrice: s.r.stop, stopPct, atrPct: stopPct, rvol: 1 };
       const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT));
       if (!plan.ok) { logOperation('CASH_GUARD', `${sym}: ${plan.reason}`, 'warning'); continue; }
       const minN = perpetuals.get(sym)?.minNotional || 5;
       if (plan.notional < minN) { logOperation('CASH_GUARD', `${sym}: Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
-      logOperation('BOOK_CLEAR', `${sym} order block ${s.side.toLowerCase()} confirmed: zone $${formatPrecisePrice(s.r.zoneLow)}-$${formatPrecisePrice(s.r.zoneHigh)}, spread ${book.spreadPct.toFixed(2)}%. Entering...`, 'success');
+      const acc = s.r.accuracy ? `, ${s.r.accuracy}% pattern match` : '';
+      logOperation('BOOK_CLEAR', `${sym} ${s.r.name} (${s.side.toLowerCase()}${acc}): pattern stop $${formatPrecisePrice(s.r.stop)}, spread ${book.spreadPct.toFixed(2)}%. ${s.r.note}. Entering...`, 'success');
       if (short) openShort(sym, signal, plan, 50); else openLong(sym, signal, plan, 50);
     }
   } finally {
@@ -1287,12 +1282,8 @@ async function evaluateAutopilotEntries() {
     throttledNotice('cash', 'CASH_GUARD', 'Free cash is below the $5 minimum position. Waiting for open trades to close.', 'info', 60000);
     return;
   }
-  if (State.entryModel === 'ORDER_BLOCK') {
-    if (!SMC.inKillzone(Date.now())) {
-      throttledNotice('session', 'ENTRIES', `Order block entries open only in the London (07:00-10:00 UTC) and New York (12:00-16:00 UTC) sessions. Next session ${new Date(SMC.nextKillzone(Date.now())).toISOString().slice(11, 16)} UTC.`, 'info', 900000);
-      return;
-    }
-    if (OB.signals.size) await evaluateOrderBlockEntries(maxBagsLimit);
+  if (State.entryModel === 'PRICE_ACTION') {
+    if (PA.signals.size) await evaluatePricePatternEntries(maxBagsLimit);
     return;
   }
   if (mode.side !== 'LONG') await evaluateShortEntries(maxBagsLimit);
@@ -1880,7 +1871,7 @@ function loadDiskState() {
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
       if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
-      // v6.3 saved ORDER_BLOCK as the default; only a choice made after v6.3.2 (entryModelV 2) is kept.
+      // Only a saved choice that still exists is kept (ORDER_BLOCK was removed in v6.3.3, PRICE_ACTION added in v6.4).
       if (ENTRY_MODELS[parsed.entryModel] && parsed.entryModelV === 2 && !process.env.ENTRY_MODEL) State.entryModel = parsed.entryModel;
       if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
         State.masterLedgerUrl = parsed.masterLedgerUrl;
@@ -2149,9 +2140,9 @@ function checkManualLiquidation(sym, price) {
 
 app.post('/api/entry-model', (req, res) => {
   const m = String(req.body.model || '').toUpperCase();
-  if (!ENTRY_MODELS[m]) return res.status(400).json({ success: false, error: 'model must be ORDER_BLOCK or CANDLE' });
+  if (!ENTRY_MODELS[m]) return res.status(400).json({ success: false, error: `model must be one of: ${Object.keys(ENTRY_MODELS).join(', ')}` });
   State.entryModel = m;
-  OB.signals.clear();
+  PA.signals.clear();
   State.subsystems.entries.model = m; State.subsystems.entries.label = ENTRY_MODELS[m];
   logOperation('ENTRIES', `Entry model set to ${ENTRY_MODELS[m]}. Exits, sizing and recovery bags are unchanged.`, 'warning');
   saveDiskState();
@@ -2551,6 +2542,6 @@ setInterval(async () => {
   }
 }, 10000);
 setInterval(broadcastPriceStream, 250);
-setInterval(() => { scanOrderBlocks().catch((e) => console.error('[OrderBlocks]', e.message)); }, 15000);
 setInterval(() => { refreshExitSignals().catch(() => {}); }, 3000);
 setInterval(runDynamicScreener, 60000);
+setInterval(() => { scanPricePatterns().catch((e) => console.error('[PricePatterns]', e.message)); }, 15000);
