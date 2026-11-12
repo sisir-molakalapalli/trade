@@ -771,13 +771,43 @@ function manageBag(bag, price, R = EXIT_RULES) {
 }
 
 /* =========================================================================
+ * HIGH VOL BREAKDOWN AS A LONG (v6.5, paper test, Settings > High vol breakdown > Long)
+ * A breakdown signal is bought instead of shorted. The long closes only at its target: +0.30% on the
+ * bid (about +0.20% after both fees), plus any funding it has paid. No harvest, trailing, time scratch or
+ * partial exits. At -3.50% it moves to a normal recovery bag, which also closes at +0.30%.
+ * ========================================================================= */
+const BREAKDOWN_LONG = { targetPct: 0.30 };
+
+function manageTargetLong(pos, price, R = EXIT_RULES) {
+  const entry = num(pos.entryPriceUSDT);
+  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
+  const gain = Number((((price - entry) / entry) * 100).toFixed(3));
+  pos.peakGainPct = Math.max(num(pos.peakGainPct) || 0, gain);
+  pos.peakHighPrice = Math.max(num(pos.peakHighPrice) || entry, price);
+  const targetPct = num(pos.targetOnlyPct) || BREAKDOWN_LONG.targetPct;
+  const notional = num(pos.qty) * entry;
+  const fundingCostPct = notional > 0 ? Math.max(0, -(num(pos.fundingUSDT) || 0) / notional * 100) : 0;
+  pos.targetPrice = entry * (1 + (targetPct + fundingCostPct) / 100);
+  if (price >= pos.targetPrice) return { action: 'EXIT', reason: `TARGET +${targetPct.toFixed(2)}%` };
+  if (gain <= R.demotePct) return { action: 'DEMOTE', reason: `${gain.toFixed(2)}%` };
+  return { action: 'HOLD' };
+}
+
+/* =========================================================================
  * MARKET MODE + PAPER USD-M SHORTS (v5.9)
  * Every new trade is paper USD-M at 1x. BULL: longs. BEAR: shorts. NEUTRAL: each coin follows its own 1h trend.
  * Without enough market data: no new trades.
  * Replaces the BTC gate. Read on CLOSED 1h candles, and both of the last two hours must agree.
  * ========================================================================= */
 const MODE_RULES = { bullBreadth: 0.60, bearBreadth: 0.40, minCoins: 10, slopeBars: 6 };
-const FUTURES = { feePct: 0.05, leverage: 1, maintenancePct: 0.5, positionPct: 10 };
+const FUTURES = { feePct: 0.05, leverage: 1, maintenancePct: 0.5, positionPct: 20 };   // positionPct: default size, Settings can change it (v6.6)
+const POSITION_SIZE = { minPct: 1, maxPct: 100 };
+/** A position size the user may pick: 1% to 100% of account value, at most 2 decimals. Anything else is null. */
+function validPositionPct(x) {
+  const v = Number(x);
+  if (x === null || x === undefined || x === '' || !Number.isFinite(v) || v < POSITION_SIZE.minPct || v > POSITION_SIZE.maxPct) return null;
+  return Math.round(v * 100) / 100;
+}
 
 function modeAt(btcBars, coins, back, R) {
   const c = btcBars.map((b) => b.c), n = c.length - 1 - back;
@@ -972,6 +1002,8 @@ module.exports = {
   futuresExclusion,
   coinTrend,
   planCompoundEntry,
+  POSITION_SIZE,
+  validPositionPct,
   netPnlLongFutures,
   shortExclusion,
   netPnlShort,
@@ -981,5 +1013,7 @@ module.exports = {
   majorTrendOf: Candles.majorTrendOf,
   EXIT_RULES,
   manageNoLoss,
-  manageBag
+  manageBag,
+  BREAKDOWN_LONG,
+  manageTargetLong
 };
