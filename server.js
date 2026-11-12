@@ -79,11 +79,16 @@ const recentTradeDispatches = new Set();
 // CORE SYSTEM STATE
 // -------------------------------------------------------------
 const MANUAL_START_USDT = Number(process.env.MANUAL_START_USDT) || Strategy.MANUAL.startUSDT;
-// Entry signals the autopilot can use. Order blocks (sessions) were removed in v6.3.3, price action patterns in v6.4.1.
-const ENTRY_MODELS = { CANDLE: 'Candlestick patterns' };
+// Autopilot entries are candle patterns (the Entry signals switch was removed in v6.5). A high vol breakdown signal is
+// shorted (SHORT, the normal process) or, as a paper test, bought and closed only at +0.30% (LONG): Settings > High vol breakdown.
+const BREAKDOWN_SIDES = { SHORT: 'Short (normal exits)', LONG: 'Long, closes only at +0.30% (test)' };
+// Each new autopilot trade is positionPct of account value (1% to 100%, default 20%): Settings > Position size.
+const sizeConfig = () => ({ ...Strategy.FUTURES, positionPct: State.positionPct });
 const State = {
   autopilotEnabled: true,
-  entryModel: ENTRY_MODELS[process.env.ENTRY_MODEL] ? process.env.ENTRY_MODEL : 'CANDLE',
+  positionPct: Strategy.validPositionPct(process.env.POSITION_PCT) || Strategy.FUTURES.positionPct,
+  breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
+  breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
   // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
   manual: { startUSDT: MANUAL_START_USDT, cashUSDT: MANUAL_START_USDT, realizedPnL: 0, positions: {}, history: [] },
   portfolio: {
@@ -115,7 +120,8 @@ const State = {
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
-    entries: { model: 'CANDLE', label: 'Candlestick patterns' },
+    sizing: { positionPct: Strategy.FUTURES.positionPct, minPct: Strategy.POSITION_SIZE.minPct, maxPct: Strategy.POSITION_SIZE.maxPct },
+    breakdown: { side: 'SHORT', label: BREAKDOWN_SIDES.SHORT, longs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' } },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • Trail • Failing trades move to recovery bags' },
@@ -677,7 +683,7 @@ async function runDynamicScreener() {
 // -------------------------------------------------------------
 const FEE_RATE = Strategy.CONFIG.feePct / 100;
 
-function openLong(pairKey, signal, plan, takerBuyRatio) {
+function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
   const sym = pairKey.replace(/USDT$/, '');
   const entry = plan.entryPrice;
   const R = Strategy.EXIT_RULES;
@@ -697,7 +703,10 @@ function openLong(pairKey, signal, plan, takerBuyRatio) {
     fundingUSDT: 0, nextFundingAt: 0,
     peakGainPct: 0, peakHighPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern
   };
-  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper) via [${signal.pattern}] • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
+  // Breakdown long (test): closes only at its fixed target, never by harvest, trail, scratch or partial.
+  const target = opts.targetOnlyPct ? entry * (1 + opts.targetOnlyPct / 100) : 0;
+  if (target) Object.assign(State.activePositions[pairKey], { targetOnlyPct: opts.targetOnlyPct, entrySource: opts.entrySource, ratchetStage: 'TARGET_ONLY', breakevenPrice: target, tp1Price: target, targetPrice: target });
+  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper) via [${signal.pattern}] • ${target ? `Closes only at +${opts.targetOnlyPct.toFixed(2)}% ($${formatPrecisePrice(target)})` : 'Min exit +0.20%'} • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -1125,6 +1134,24 @@ async function evaluateShortEntries(maxBagsLimit) {
       if (!book) { veto(pairKey, 30000, 'BOOK_VETO', 'futures order book unavailable.'); continue; }
       if (book.obi > 0.55 || book.spreadPct > 0.20) { veto(pairKey, 30000, 'BOOK_VETO', `bid share ${Math.round(book.obi * 100)}% (req <= 55%) or spread ${book.spreadPct.toFixed(2)}%.`); continue; }
 
+      // Settings > High vol breakdown > Long (paper test): the same breakdown signal, after the same checks, is bought
+      // at the ask and closes only at +0.30%. Candle-pattern shorts are never flipped.
+      if (!candle.isShortEntry && State.breakdownSide === 'LONG') {
+        const ask = book.bestAsk, tPct = Strategy.BREAKDOWN_LONG.targetPct;
+        const lsig = await buildEntrySignal(pairKey, ask, 'HIGH_VOL_BREAKDOWN LONG', mom);
+        const lplan = Strategy.planCompoundEntry(lsig, ask, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig());
+        if (!lplan.ok) { candidateCooldownMemo.set(pairKey, now + 30000); logOperation('CASH_GUARD', `${pairKey} breakdown long: ${lplan.reason}`, 'warning'); continue; }
+        const minNL = perpetuals.get(pairKey)?.minNotional || 5;
+        if (lplan.notional < minNL) { candidateCooldownMemo.set(pairKey, now + 300000); logOperation('CASH_GUARD', `${pairKey} breakdown long: Binance minimum for this contract is $${minNL}, position would be $${lplan.notional.toFixed(2)}.`, 'info'); continue; }
+        logOperation('BOOK_CLEAR', `${pairKey} high vol breakdown (15m ${mom.change15mPct}%, volume ${mom.rvol}x, taker buy ${flow.takerBuyRatio}%) bought instead of shorted (test): long at the ask $${formatPrecisePrice(ask)}, closes only at +${tPct.toFixed(2)}% ($${formatPrecisePrice(ask * (1 + tPct / 100))}). Entering...`, 'success');
+        if (openLong(pairKey, lsig, lplan, flow.takerBuyRatio, { targetOnlyPct: tPct, entrySource: 'BREAKDOWN_LONG' })) {
+          State.breakdownLongs.opened++;
+          State.breakdownLongs.last = `${pairKey} long @ $${formatPrecisePrice(ask)}, ${new Date().toISOString().slice(11, 16)} UTC`;
+          saveDiskState();
+        }
+        continue;
+      }
+
       // planEntry only uses the stop distance for sizing, so the distance is passed on the long side of the price.
       const px = book.bestBid, cfg = Strategy.CONFIG;
       let atr = NaN, structPct = cfg.minStopPct;
@@ -1136,7 +1163,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       }
       const stopPct = Math.min(cfg.maxStopPct, Math.max(structPct, (atr || 0) * cfg.atrStopMult, cfg.minStopPct));
       const signal = { ok: true, pattern: label, refPrice: px, stopPrice: px * (1 - stopPct / 100), stopPct, atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: mom.rvol };
-      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT));
+      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig());
       if (!plan.ok) { veto(pairKey, 30000, 'CASH_GUARD', plan.reason); continue; }
       const minN = perpetuals.get(pairKey)?.minNotional || 5;
       if (plan.notional < minN) { veto(pairKey, 300000, 'CASH_GUARD', `Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
@@ -1311,7 +1338,7 @@ async function evaluateAutopilotEntries() {
       logOperation('BOOK_CLEAR', `${pairKey} confirmed [${patternLabel}]: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%, Taker Buy ${orderFlow.takerBuyRatio}%. Entering...`, 'success');
 
       const signal = await buildEntrySignal(pairKey, book.bestAsk, patternLabel, microMom);
-      const plan = Strategy.planCompoundEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT));
+      const plan = Strategy.planCompoundEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig());
       if (!plan.ok) {
         candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('CASH_GUARD', `${pairKey}: ${plan.reason}`, 'warning');
@@ -1373,7 +1400,8 @@ function demoteToBag(k, pos, price, reason) {
     notionalUSDT: pos.notionalUSDT, qty: pos.qty,
     side: isShort(pos) ? 'SHORT' : 'LONG', market: isFutures(pos) ? 'FUTURES' : 'SPOT', fundingUSDT: pos.fundingUSDT || 0, nextFundingAt: pos.nextFundingAt || 0, liquidationPrice: pos.liquidationPrice,
     targetStep: 'CLOSES AT +0.30%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + (isShort(pos) ? -1 : 1) * Strategy.EXIT_RULES.bagTargetPct / 100),
-    troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6
+    troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6,
+    entrySource: pos.entrySource
   };
   delete State.activePositions[k];
   logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at +0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
@@ -1404,6 +1432,7 @@ async function refreshExitSignals() {
   try {
     for (const k of Object.keys(State.activePositions || {})) {
       const pos = State.activePositions[k];
+      if (pos.targetOnlyPct) { exitSignals.delete(k); continue; }
       const entry = Number(pos.entryPriceUSDT), live = Number(pos.livePriceUSDT) || entry, short = isShort(pos);
       const gainPct = (short ? entry - live : live - entry) / entry * 100;
       const R = Strategy.EXIT_RULES;
@@ -1446,6 +1475,21 @@ async function runPredictiveSentry() {
       const short = isShort(pos);
       if (short && price >= Number(pos.liquidationPrice)) {
         realizeExit('activePositions', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
+        continue;
+      }
+      // Breakdown long (test): its +0.30% target on the real bid, or a recovery bag at -3.50%. Nothing else.
+      if (pos.targetOnlyPct) {
+        const r = Strategy.manageTargetLong(pos, price);
+        if (r.action === 'EXIT') {
+          const fill = (await executableExitPrice(k, pos)) || price;
+          if (Strategy.manageTargetLong(pos, fill).action === 'EXIT' &&
+            realizeExit('activePositions', k, 1, fill, r.reason, `Breakdown long (test) closed at its +${Number(pos.targetOnlyPct).toFixed(2)}% target @ $${formatPrecisePrice(fill)}`)) {
+            State.breakdownLongs.target++; saveDiskState();
+          }
+        } else if (r.action === 'DEMOTE') {
+          demoteToBag(k, pos, price, r.reason);
+          State.breakdownLongs.bagged++; saveDiskState();
+        }
         continue;
       }
       const gainPct = (short ? entry - price : price - entry) / entry * 100;
@@ -1499,7 +1543,12 @@ async function runPredictiveSentry() {
       if (r.action === 'EXIT') {
         const fill = (await executableExitPrice(k, bag)) || price;
         const check = isShort(bag) ? Strategy.manageShortBag(bag, fill) : Strategy.manageBag(bag, fill);
-        if (check.action === 'EXIT') realizeExit('recoveryBags', k, 1, fill, r.reason, `Recovery bag closed at +0.30% or better @ $${formatPrecisePrice(fill)}`);
+        if (check.action === 'EXIT') {
+          const bdl = bag.entrySource === 'BREAKDOWN_LONG';
+          if (realizeExit('recoveryBags', k, 1, fill, r.reason, `Recovery bag${bdl ? ' (breakdown long test)' : ''} closed at +0.30% or better @ $${formatPrecisePrice(fill)}`) && bdl) {
+            State.breakdownLongs.bagClosed++; saveDiskState();
+          }
+        }
       }
     }
   } finally {
@@ -1763,8 +1812,9 @@ function saveDiskState() {
       recoveryBags: State.recoveryBags,
       tradeLogs: State.tradeLogs.slice(0, 150),
       manual: State.manual,
-      entryModel: State.entryModel,
-      entryModelV: 2,
+      positionPct: State.positionPct,
+      breakdownSide: State.breakdownSide,
+      breakdownLongs: State.breakdownLongs,
       masterLedgerUrl: State.masterLedgerUrl,
       learningSheetUrl: State.learningSheetUrl,
       capitalResetId: State.capitalResetId || CAPITAL_RESET_ID
@@ -1782,8 +1832,9 @@ function loadDiskState() {
       if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
       if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
-      // Only a saved choice that still exists is kept (ORDER_BLOCK was removed in v6.3.3, PRICE_ACTION in v6.4.1).
-      if (ENTRY_MODELS[parsed.entryModel] && parsed.entryModelV === 2 && !process.env.ENTRY_MODEL) State.entryModel = parsed.entryModel;
+      if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
+      if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
+      if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
       if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
         State.masterLedgerUrl = parsed.masterLedgerUrl;
       } else {
@@ -2049,15 +2100,36 @@ function checkManualLiquidation(sym, price) {
   });
 }
 
-app.post('/api/entry-model', (req, res) => {
-  const m = String(req.body.model || '').toUpperCase();
-  if (!ENTRY_MODELS[m]) return res.status(400).json({ success: false, error: `model must be one of: ${Object.keys(ENTRY_MODELS).join(', ')}` });
-  State.entryModel = m;
-  State.subsystems.entries.model = m; State.subsystems.entries.label = ENTRY_MODELS[m];
-  logOperation('ENTRIES', `Entry model set to ${ENTRY_MODELS[m]}. Exits, sizing and recovery bags are unchanged.`, 'warning');
+function syncSizingStatus() {
+  State.subsystems.sizing = { positionPct: State.positionPct, minPct: Strategy.POSITION_SIZE.minPct, maxPct: Strategy.POSITION_SIZE.maxPct };
+}
+
+app.post('/api/position-size', (req, res) => {
+  const pct = Strategy.validPositionPct(req.body.pct);
+  if (!pct) return res.status(400).json({ success: false, error: `position size must be ${Strategy.POSITION_SIZE.minPct}% to ${Strategy.POSITION_SIZE.maxPct}% of account value` });
+  State.positionPct = pct;
+  syncSizingStatus();
+  logOperation('SIZING', `Position size set to ${pct}% of account value ($${(computeEquity() * pct / 100).toFixed(2)} now). New trades only: open positions and bags keep their size.`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
-  res.json({ success: true, model: m, label: ENTRY_MODELS[m] });
+  res.json({ success: true, pct });
+});
+
+function syncBreakdownStatus() {
+  State.subsystems.breakdown = { side: State.breakdownSide, label: BREAKDOWN_SIDES[State.breakdownSide], longs: State.breakdownLongs };
+}
+
+app.post('/api/breakdown-side', (req, res) => {
+  const side = String(req.body.side || '').toUpperCase();
+  if (!BREAKDOWN_SIDES[side]) return res.status(400).json({ success: false, error: `side must be one of: ${Object.keys(BREAKDOWN_SIDES).join(', ')}` });
+  State.breakdownSide = side;
+  syncBreakdownStatus();
+  logOperation('ENTRIES', side === 'LONG'
+    ? 'High vol breakdown set to LONG (test): breakdown signals are bought and close only at +0.30%. Candle-pattern shorts and all longs are unchanged.'
+    : 'High vol breakdown set to SHORT: breakdown signals are shorted with the normal exits. Open breakdown longs keep their +0.30% target.', 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, side, label: BREAKDOWN_SIDES[side] });
 });
 
 app.get('/api/manual', (req, res) => res.json(manualView()));
@@ -2409,6 +2481,8 @@ wss.on('connection', (ws) => {
 // BOOTSTRAP TIMERS & SERVICE INITIALIZATION
 // -------------------------------------------------------------
 loadDiskState();
+syncBreakdownStatus();
+syncSizingStatus();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
