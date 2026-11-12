@@ -858,6 +858,25 @@ function shortExclusion({ volumeUSD, fundingRate, listedAt, now = Date.now() }, 
 }
 
 /** Same limits for both directions. Funding must not be crowded on the side being opened. */
+/* =========================================================================
+ * FUTURES SCREENER (v6.7). The radar is built from USD-M futures, not spot: every trading USDT perpetual
+ * with at least $10M of 24h futures volume (the same floor futuresExclusion trades at), biggest first,
+ * at most maxCoins. Indexes, stablecoins and names that are not plain letters / digits are left out.
+ * ========================================================================= */
+const SCREENER = { minVolumeUSD: SHORT_RULES.minVolumeUSD, maxCoins: 150 };
+const SCREENER_EXCLUDE = /^(USDC|FDUSD|TUSD|USDP|USDE|USD1|RLUSD|DAI|EUR|BTCDOM|DEFI)USDT$/;
+
+function futuresUniverse(tickers, perps, R = SCREENER) {
+  if (!Array.isArray(tickers) || !perps || typeof perps.has !== 'function') return [];
+  return tickers
+    .filter((t) => t && typeof t.symbol === 'string' && /^[A-Z0-9]+USDT$/.test(t.symbol) && perps.has(t.symbol) && !SCREENER_EXCLUDE.test(t.symbol))
+    .map((t) => ({ t, vol: parseFloat(t.quoteVolume) }))
+    .filter((x) => x.vol >= R.minVolumeUSD && parseFloat(x.t.lastPrice) > 0)
+    .sort((a, b) => b.vol - a.vol)
+    .slice(0, R.maxCoins)
+    .map((x) => x.t);
+}
+
 function futuresExclusion({ side = 'SHORT', volumeUSD, fundingRate, listedAt, now = Date.now() }, R = SHORT_RULES) {
   if (side === 'SHORT') return shortExclusion({ volumeUSD, fundingRate, listedAt, now }, R);
   if (!(volumeUSD >= R.minVolumeUSD)) return 'under $10M daily volume';
@@ -1000,6 +1019,8 @@ module.exports = {
   manualTakeProfit,
   manualTakeProfitPrice,
   futuresExclusion,
+  SCREENER,
+  futuresUniverse,
   coinTrend,
   planCompoundEntry,
   POSITION_SIZE,
