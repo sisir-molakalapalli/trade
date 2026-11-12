@@ -116,7 +116,7 @@ const State = {
     },
     pumpDumpTrap: { status: 'ARMED', trappedTokensDetected: 0, lastBlockedSymbol: '--', minLiquidityHurdleUSD: '$70M' },
     bStockShield: { status: 'ACTIVE', blockedAssets: ['SOXLB', 'SNDKB', 'TSLAB', 'NVDB'], maxUnitPrice: '$350.00' },
-    screener: { status: 'ACTIVE', scannedPairsCount: 350, qualifiedCandidatesCount: 22, cadenceSec: 60, liquidityFloorUSD: 'High-Sustain ($3.5M+)' },
+    screener: { status: 'ACTIVE', scannedPairsCount: 0, qualifiedCandidatesCount: 0, cadenceSec: 60, liquidityFloorUSD: '$10M+ futures volume', source: 'USD-M futures' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
@@ -187,6 +187,7 @@ function safeFetch(url, timeoutMs = 8000) {
         agent: isHttps ? keepAliveHttps : keepAliveHttp,
         timeout: timeoutMs
       }, (res) => {
+        noteBinanceWeight(url, res);
         readBody(res, (err, data) => {
           if (err) return reject(err);
           try {
@@ -281,7 +282,7 @@ async function getCachedKlines(symbol, interval, limit, timeoutMs = 3500, maxAge
     const openBarCloseMs = Number(data[data.length - 1][6]) || 0;
     const expiresAt = Math.min(now + 300000, Math.max(now + 1000, openBarCloseMs + 1000));
     klineCache.set(cacheKey, { timestamp: now, expiresAt, data });
-    if (klineCache.size > 600) klineCache.delete(klineCache.keys().next().value);
+    if (klineCache.size > 2500) klineCache.delete(klineCache.keys().next().value);   // ~4 a coin, 400 coins max
   } else if (data && data.code && data.code < 0) {
     console.warn(`[Binance API Notice] ${pairSym} returned: ${data.msg || data.code}`);
   }
@@ -325,6 +326,27 @@ async function refreshMarketMode(tickers) {
 const FAPI_BASE = process.env.FAPI_BASE || 'https://fapi.binance.com';
 // Binance moved aggTrade to the /market path in 2026; the old /ws path no longer carries it.
 const FSTREAM_URL = process.env.FSTREAM_URL || 'wss://fstream.binance.com/market/ws';
+// The radar holds the biggest futures contracts by 24h volume with $10M+ (v6.7). 150 by default, 20 to 400.
+const SCREENER_MAX_COINS = Math.min(400, Math.max(20, Math.round(Number(process.env.SCREENER_MAX_COINS) || Strategy.SCREENER.maxCoins)));
+// Binance USD-M allows 2400 request weight a minute per IP, and Render's IP may be shared. At 1800 the search for
+// new trades pauses until the minute ends, so prices, exits and bags always have room. A 429 / 418 reply
+// pauses it for as long as Binance asks (Retry-After), 60s if it does not say.
+const FAPI_WEIGHT = { used: 0, minute: 0, pauseUntil: 0, pauseAt: 1800, limit: 2400 };
+function noteBinanceWeight(url, res) {
+  if (!String(url).startsWith(FAPI_BASE) || !res) return;
+  const w = Number(res.headers && res.headers['x-mbx-used-weight-1m']);
+  if (Number.isFinite(w) && w >= 0) { FAPI_WEIGHT.used = w; FAPI_WEIGHT.minute = Math.floor(Date.now() / 60000); }
+  if (res.statusCode === 429 || res.statusCode === 418) {
+    const sec = Number(res.headers && res.headers['retry-after']);
+    FAPI_WEIGHT.pauseUntil = Math.max(FAPI_WEIGHT.pauseUntil, Date.now() + (Number.isFinite(sec) && sec > 0 ? sec * 1000 : 60000));
+  }
+}
+function fapiBusy() {
+  const now = Date.now();
+  if (now < FAPI_WEIGHT.pauseUntil) return `Binance asked the engine to slow down, ${Math.ceil((FAPI_WEIGHT.pauseUntil - now) / 1000)}s left`;
+  if (FAPI_WEIGHT.minute === Math.floor(now / 60000) && FAPI_WEIGHT.used >= FAPI_WEIGHT.pauseAt) return `Binance request weight ${FAPI_WEIGHT.used} of ${FAPI_WEIGHT.limit} this minute`;
+  return null;
+}
 const FUT_FEE_RATE = Strategy.FUTURES.feePct / 100;
 const isShort = (p) => Boolean(p) && p.side === 'SHORT';
 // Spot positions opened before the move to futures have no market field and finish on spot rules.
@@ -455,7 +477,7 @@ async function checkDormantPumpAndDumpTrap(symbol, volQuote, change24, rangePct)
   try {
     if (volQuote >= 70000000) return { isTrap: false };
 
-    const klines = await getCachedKlines(symbol, '1h', 24, 3000);
+    const klines = await getCachedKlines(symbol, '1h', 24, 3000, 0, true);
     if (!Array.isArray(klines) || klines.length < 12) return { isTrap: false };
 
     let priorVolSum = 0;
@@ -538,27 +560,22 @@ async function runDynamicScreener() {
     await refreshFundingRates();
     const mode = await refreshMarketMode(tickers);
 
+    // v6.7: the radar is built from USD-M futures (every trading USDT perpetual with $10M+ of 24h futures volume,
+    // the biggest SCREENER_MAX_COINS). Market mode above still reads the spot list, exactly as every back test did.
+    const futTickers = await safeFetch(`${FAPI_BASE}/fapi/v1/ticker/24hr`, 8000).catch(() => null);
+    if (!Array.isArray(futTickers) || !perpetuals.size) {
+      throttledNotice('futtickers', 'FUTURES', 'Binance Futures tickers are unavailable. The radar keeps its last list.', 'warning', 300000);
+      return;
+    }
+    const eligible = Strategy.futuresUniverse(futTickers, perpetuals, { ...Strategy.SCREENER, maxCoins: Infinity });
+    const picked = eligible.slice(0, SCREENER_MAX_COINS);
     const universe = {};
-    const candidateKlinesQueue = [];
+    const candidates = [];
 
-    for (const t of tickers) {
+    for (const t of picked) {
       const sym = t.symbol;
-      if (!sym.endsWith('USDT')) continue;
-
-      if (sym.includes('UP') || sym.includes('DOWN') || sym.includes('BULL') || sym.includes('BEAR')) continue;
-      if (['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'EURUSDT'].includes(sym)) continue;
-
-      const blockedDerivatives = [
-        'SOXLB', 'SNDKB', 'TSLAB', 'AAPLB', 'NVDB', 'MSFTB', 'AMZNB', 
-        'SPYB', 'QQQB', 'GOOGB', 'METAB', 'COINB', 'MSTRB', 'BABAB'
-      ];
-      if (blockedDerivatives.some(d => sym.startsWith(d))) continue;
-
       const last = parseFloat(t.lastPrice);
-      if (last > 350.0 && !['BTCUSDT', 'ETHUSDT', 'PAXGUSDT'].includes(sym)) continue;
-
       const volQuote = parseFloat(t.quoteVolume);
-      if (volQuote < 3500000) continue;
 
       const high = parseFloat(t.highPrice);
       const low = parseFloat(t.lowPrice);
@@ -612,10 +629,10 @@ async function runDynamicScreener() {
         candlestickPattern: 'WATCH'
       };
 
-      if (!isPumpDump && score >= 60 && canTrade && candidateKlinesQueue.length < 35) {
-        candidateKlinesQueue.push(sym);
-      }
+      if (!isPumpDump && score >= 60 && canTrade) candidates.push(sym);
     }
+    // Candle checks for the 35 best-scoring candidates; skipped while Binance request weight is high.
+    const candidateKlinesQueue = fapiBusy() ? [] : candidates.sort((a, b) => universe[b].score - universe[a].score).slice(0, 35);
 
     // Inspect candlestick patterns on top candidates to award Steve Nison momentum bonuses
     for (const topSym of candidateKlinesQueue) {
@@ -668,9 +685,11 @@ async function runDynamicScreener() {
 
     State.universe = universe;
     State.subsystems.screener.scannedPairsCount = Object.keys(universe).length;
+    Object.assign(State.subsystems.screener, { source: 'USD-M futures', contractsListed: perpetuals.size, eligibleCount: eligible.length, maxCoins: SCREENER_MAX_COINS,
+      liquidityFloorUSD: '$10M+ futures volume', binanceWeight1m: FAPI_WEIGHT.minute === Math.floor(Date.now() / 60000) ? FAPI_WEIGHT.used : 0 });
     State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= (State.activeThresholds?.scoreThreshold || 65) && !c.isPumpAndDump).length;
 
-    logOperation('RADAR_SCREENER', `[${mode.mode}] Scanned ${Object.keys(universe).length} pairs for ${mode.side === 'SHORT' ? 'futures shorts' : mode.side === 'LONG' ? 'futures longs' : 'futures longs and shorts'}. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
+    logOperation('RADAR_SCREENER', `[${mode.mode}] Scanned ${Object.keys(universe).length} futures contracts (the biggest of ${eligible.length} with $10M+ volume, ${perpetuals.size} listed) for ${mode.side === 'SHORT' ? 'futures shorts' : mode.side === 'LONG' ? 'futures longs' : 'futures longs and shorts'}. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
     broadcastStateUpdate({ withUniverse: true });
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
@@ -1106,7 +1125,6 @@ async function evaluateShortEntries(maxBagsLimit) {
       if ((coin.score || 0) < minScore) break;
       const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
       const pairKey = `${baseSym}USDT`;
-      if (Number(coin.priceUSDT || 0) > 350 && !['BTCUSDT', 'ETHUSDT'].includes(pairKey)) continue;
       if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
       if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > now) continue;
       if ((candidateCooldownMemo.get(pairKey) || 0) > now) continue;
@@ -1224,6 +1242,11 @@ async function evaluateAutopilotEntries() {
     throttledNotice('cash', 'CASH_GUARD', 'Free cash is below the $5 minimum position. Waiting for open trades to close.', 'info', 60000);
     return;
   }
+  const busy = fapiBusy();
+  if (busy) {
+    throttledNotice('weight', 'AUTOPILOT', `New-trade checks paused: ${busy}. Open positions and bags are still managed.`, 'warning', 60000);
+    return;
+  }
   if (mode.side !== 'LONG') await evaluateShortEntries(maxBagsLimit);
   if (mode.side === 'SHORT') return;
 
@@ -1252,7 +1275,6 @@ async function evaluateAutopilotEntries() {
 
       const blockedDerivatives = ['SOXLB', 'SNDKB', 'TSLAB', 'AAPLB', 'NVDB', 'MSFTB', 'AMZNB', 'SPYB', 'QQQB'];
       if (blockedDerivatives.some(d => pairKey.startsWith(d))) continue;
-      if (Number(coin.priceUSDT || 0) > 350.0 && !['BTCUSDT', 'ETHUSDT'].includes(pairKey)) continue;
       if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
       if (State.cooldowns[baseSym] && State.cooldowns[baseSym].until > now) continue;
 
