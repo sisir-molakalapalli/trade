@@ -89,6 +89,8 @@ const State = {
   positionPct: Strategy.validPositionPct(process.env.POSITION_PCT) || Strategy.FUTURES.positionPct,
   // Settings > Leverage (v6.8, paper test): off = every trade 1x; on = the autopilot picks 1x to 3x per coin.
   leverageAuto: ['on', '1', 'true'].includes(String(process.env.LEVERAGE_AUTO || '').toLowerCase()),
+  // Settings > Both sides (v6.9): on = longs and shorts in every market mode; off = BULL longs only, BEAR shorts only.
+  bothSides: !['off', '0', 'false'].includes(String(process.env.BOTH_SIDES || '').toLowerCase()),
   breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
   // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
@@ -309,6 +311,22 @@ async function getKlinesStrict(symbol, interval, limit) {
 // -------------------------------------------------------------
 // MARKET MODE (replaces the BTC gate): see strategy.evaluateMarketMode
 // -------------------------------------------------------------
+// Which side(s) new trades may take: the market mode's side, or both when Settings > Both sides is on (v6.9).
+// A trade against the market mode's side needs the coin's own 1h trend to agree, as every trade in NEUTRAL does.
+function tradeSide(mode = State.subsystems.marketMode) {
+  if (!mode || !mode.side || mode.side === 'NONE') return 'NONE';
+  return State.bothSides ? 'BOTH' : mode.side;
+}
+function sideText(mode) {
+  const ts = tradeSide(mode);
+  if (ts === 'NONE') return 'No new trades.';
+  if (ts === 'LONG') return 'Autopilot opens futures longs.';
+  if (ts === 'SHORT') return 'Autopilot opens futures shorts.';
+  if (mode.side === 'BOTH') return 'Autopilot follows each coin\'s own 1h trend.';
+  return mode.side === 'LONG' ? 'Autopilot opens futures longs, and shorts where a coin\'s own 1h trend is down.'
+    : 'Autopilot opens futures shorts, and longs where a coin\'s own 1h trend is up.';
+}
+
 async function refreshMarketMode(tickers) {
   const top = tickers
     .filter((t) => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && !/^(USDC|FDUSD|TUSD|EUR|USD1|RLUSD|PAXG)/.test(t.symbol))
@@ -316,9 +334,9 @@ async function refreshMarketMode(tickers) {
   const [btc, ...coins] = await Promise.all(['BTCUSDT', ...top].map((s) => getKlinesStrict(s, '1h', 200)));
   const r = Strategy.evaluateMarketMode(btc ? Strategy.closedOnly(btc) : null, coins.filter(Boolean).map((k) => Strategy.closedOnly(k)));
   const before = State.subsystems.marketMode.mode;
-  State.subsystems.marketMode = { ...r, breadth: r.breadth === null || r.breadth === undefined ? null : Number(r.breadth.toFixed(2)), updatedAt: Date.now() };
+  State.subsystems.marketMode = { ...r, tradeSide: tradeSide(r), breadth: r.breadth === null || r.breadth === undefined ? null : Number(r.breadth.toFixed(2)), updatedAt: Date.now() };
   if (before !== r.mode) {
-    logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${r.side === 'LONG' ? 'Autopilot opens futures longs.' : r.side === 'SHORT' ? 'Autopilot opens futures shorts.' : r.side === 'BOTH' ? 'Autopilot follows each coin\'s own 1h trend.' : 'No new trades.'} Open positions keep their exits.`, 'warning');
+    logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${sideText(r)} Open positions keep their exits.`, 'warning');
   }
   return r;
 }
@@ -564,6 +582,7 @@ async function runDynamicScreener() {
     await refreshPerpetuals();
     await refreshFundingRates();
     const mode = await refreshMarketMode(tickers);
+    const ts = tradeSide(mode);
 
     // v6.7: the radar is built from USD-M futures (every trading USDT perpetual with $10M+ of 24h futures volume,
     // the biggest SCREENER_MAX_COINS). Market mode above still reads the spot list, exactly as every back test did.
@@ -601,7 +620,8 @@ async function runDynamicScreener() {
       }
 
       // Bull: strongest coins. Bear: weakest coins. Neutral: upper half of the day's range ranks as a long, lower half as a short.
-      const side = mode.side === 'SHORT' || (mode.side === 'BOTH' && posInRange < 0.5) ? 'SHORT' : 'LONG';
+      // BOTH: lower half of the day's range ranks as a short, upper half as a long (the entry rules need exactly that anyway).
+      const side = ts === 'SHORT' || (ts === 'BOTH' && posInRange < 0.5) ? 'SHORT' : 'LONG';
       const bearMode = side === 'SHORT';
       const tradeBlock = !perpetuals.has(sym) ? 'no USD-M contract'
         : Strategy.futuresExclusion({ side, volumeUSD: volQuote, fundingRate: currentFundingRate(sym), listedAt: perpetuals.get(sym).listedAt });
@@ -655,7 +675,10 @@ async function runDynamicScreener() {
             if (open1h > 0 && ((closeNow - open1h) / open1h) * 100 > 0.30) universe[topSym].score = Math.max(0, universe[topSym].score - 12);
           }
           const sp = Strategy.assessShortCandles(closed15m);
-          if (sp.bullish) {
+          const closeMs = closed15m.length ? Number(closed15m[closed15m.length - 1][6]) + 1 : 0;
+          if (sp.sell && !Strategy.patternEntryOpen(closeMs, sp.signalAge)) {
+            universe[topSym].candlestickPattern = `${sp.pattern} (entry window passed)`;
+          } else if (sp.bullish) {
             universe[topSym].candlestickPattern = `⚠️ ${sp.bullPattern}`;
             universe[topSym].score = Math.max(0, universe[topSym].score - 18);
           } else if (sp.sell) {
@@ -675,7 +698,10 @@ async function runDynamicScreener() {
             }
           }
 
-          if (pat.bearish) {
+          const closeMsL = closed15m.length ? Number(closed15m[closed15m.length - 1][6]) + 1 : 0;
+          if (pat.buy && !pat.bearish && !Strategy.patternEntryOpen(closeMsL, pat.signalAge)) {
+            universe[topSym].candlestickPattern = `${pat.pattern} (entry window passed)`;
+          } else if (pat.bearish) {
             universe[topSym].candlestickPattern = `⚠️ ${pat.bearPattern}`;
             universe[topSym].score = Math.max(0, universe[topSym].score - 18);
           } else if (pat.buy) {
@@ -694,7 +720,7 @@ async function runDynamicScreener() {
       liquidityFloorUSD: '$10M+ futures volume', binanceWeight1m: FAPI_WEIGHT.minute === Math.floor(Date.now() / 60000) ? FAPI_WEIGHT.used : 0 });
     State.subsystems.screener.qualifiedCandidatesCount = Object.values(universe).filter(c => c.score >= (State.activeThresholds?.scoreThreshold || 65) && !c.isPumpAndDump).length;
 
-    logOperation('RADAR_SCREENER', `[${mode.mode}] Scanned ${Object.keys(universe).length} futures contracts (the biggest of ${eligible.length} with $10M+ volume, ${perpetuals.size} listed) for ${mode.side === 'SHORT' ? 'futures shorts' : mode.side === 'LONG' ? 'futures longs' : 'futures longs and shorts'}. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
+    logOperation('RADAR_SCREENER', `[${mode.mode}] Scanned ${Object.keys(universe).length} futures contracts (the biggest of ${eligible.length} with $10M+ volume, ${perpetuals.size} listed) for ${ts === 'SHORT' ? 'futures shorts' : ts === 'LONG' ? 'futures longs' : 'futures longs and shorts'}. ${State.subsystems.screener.qualifiedCandidatesCount} candidates qualified (Score >= ${State.activeThresholds?.scoreThreshold || 65}). Candlestick Sentinel active.`, 'info');
     broadcastStateUpdate({ withUniverse: true });
   } catch (err) {
     console.error('[Screener] Error running scan:', err.message);
@@ -851,6 +877,16 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
 let isEvaluatingEntries = false;
 const noticeTimes = {};
 const candidateCooldownMemo = new Map();
+// v6.10: a pattern trade opens only within Strategy.PATTERN_ENTRY.windowMin minutes of its signal candle's close.
+// A late pattern counts as no pattern (a breakdown / ignition can still trade); the feed says so once per coin per candle.
+const lateNoted = new Set();
+function lateCheck(pairKey, side, closeMs, barsAgo, name) {
+  if (Strategy.patternEntryOpen(closeMs, barsAgo)) return '';
+  const msg = `${name} signal is ${Math.round(Strategy.patternSignalAgeMin(closeMs, barsAgo))} min old. Pattern trades open only in the first ${Strategy.PATTERN_ENTRY.windowMin} min after the signal candle closes; later the price has usually moved.`;
+  const key = `${pairKey}|${side}|${closeMs}`;
+  if (!lateNoted.has(key)) { if (lateNoted.size > 2000) lateNoted.clear(); lateNoted.add(key); logOperation('CANDLE_LATE', `${pairKey} ${side === 'SHORT' ? 'short' : 'long'}: ${msg}`, 'info'); }
+  return msg;
+}
 
 function throttledNotice(key, category, message, level = 'info', everyMs = 60000) {
   if (Date.now() - (noticeTimes[key] || 0) < everyMs) return;
@@ -878,7 +914,8 @@ async function checkCandlestickSentry(symbol, futures = false) {
     const patternName = bear !== 'NONE' ? bear : bull;
     if (patternName !== 'NONE') State.subsystems.candlestickSentry.lastPatternDetected = `${pairSym}: ${patternName}`;
     const sh = Strategy.assessShortCandles(closed15, { major: a.major });
-    return { isShortEntry: sh.sell, shortPatternName: sh.pattern !== 'NONE' ? `${sh.pattern} (15m)` : 'NONE', isBullishSignal: sh.bullish, bullSignalName: sh.bullPattern !== 'NONE' ? `${sh.bullPattern} (15m)` : 'NONE',
+    return { lastCloseMs: Number(closed15[closed15.length - 1][6]) + 1, shortSignalBarsAgo: sh.signalAge || 0, bullSignalBarsAgo: a.signalAge || 0,
+      isShortEntry: sh.sell, shortPatternName: sh.pattern !== 'NONE' ? `${sh.pattern} (15m)` : 'NONE', isBullishSignal: sh.bullish, bullSignalName: sh.bullPattern !== 'NONE' ? `${sh.bullPattern} (15m)` : 'NONE',
       isBearishReversal: a.bearish, isBullishEntry: a.buy, bullishPatternName: bull, bearishPatternName: bear, patternName,
       confidence: a.score, patternRvol: a.rvol, convergence: a.convergence, major: a.major, vetoes: a.vetoes };
   } catch (e) {
@@ -1135,7 +1172,7 @@ async function leverageFor(pairKey) {
 
 async function evaluateShortEntries(maxBagsLimit) {
   if (!perpetuals.size) {
-    throttledNotice('noperps', 'FUTURES', 'Market is bearish, but Binance Futures data is unavailable. No shorts opened.', 'danger', 60000);
+    throttledNotice('noperps', 'FUTURES', 'Binance Futures data is unavailable. No shorts opened.', 'danger', 60000);
     return;
   }
   const minScore = State.activeThresholds?.scoreThreshold || 65;
@@ -1160,7 +1197,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       const change24h = Number(coin.change24h || 0), rangePct = Number(coin.intradayRangePct || 0);
       if (change24h > -0.20 && rangePct < 3.0) continue;
       if (Number(coin.pricePositionInRange ?? 0.3) > 0.50) continue;
-      if (State.subsystems.marketMode.mode === 'NEUTRAL' && !(await coinTrendAgrees(pairKey, 'SHORT'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
+      if (State.subsystems.marketMode.side !== 'SHORT' && !(await coinTrendAgrees(pairKey, 'SHORT'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
 
       let flow = await checkShortOrderFlow(pairKey);
       if (!flow.passed) { veto(pairKey, 30000, 'FLOW_VETO', flow.reason); continue; }
@@ -1169,9 +1206,12 @@ async function evaluateShortEntries(maxBagsLimit) {
       if (!mom.passed) { veto(pairKey, 30000, 'MOM_VETO', mom.reason); continue; }
       const trend = await checkShort1hTrend(pairKey);
       if (!trend.passed) { veto(pairKey, 30000, 'TREND_VETO', trend.reason); continue; }
-      const candle = await checkCandlestickSentry(pairKey, true);
+      let candle = await checkCandlestickSentry(pairKey, true);
       if (candle.isBullishSignal) { veto(pairKey, 20000, 'CANDLE_VETO', `bullish pattern [${candle.bullSignalName}].`); continue; }
+      const late = candle.isShortEntry ? lateCheck(pairKey, 'SHORT', candle.lastCloseMs, candle.shortSignalBarsAgo, candle.shortPatternName) : '';
+      if (late) candle = { ...candle, isShortEntry: false, shortPatternName: 'NONE' };
       const breakdown = mom.change15mPct <= -0.80 && mom.rvol >= 1.35 && flow.takerBuyRatio <= 48;
+      if (late && !breakdown) { candidateCooldownMemo.set(pairKey, now + 30000); continue; }
       if (!candle.isShortEntry && !breakdown) { veto(pairKey, 30000, 'CANDLE_WAIT', `waiting for a completed bearish pattern on 15m (1h trend ${candle.major}) or a breakdown (15m <= -0.80%).`, 'info'); continue; }
       const label = candle.isShortEntry ? candle.shortPatternName : 'HIGH_VOL_BREAKDOWN';
       // v6.8: a breakdown is read from the live 15m candle, and the checks above may have used candles up to 45 s
@@ -1272,7 +1312,8 @@ async function evaluateAutopilotEntries() {
 
   // Market mode decides which side may trade. Open positions are managed either way.
   const mode = State.subsystems.marketMode;
-  if (mode.side === 'NONE') {
+  const side = tradeSide(mode);
+  if (side === 'NONE') {
     throttledNotice('mode', 'MARKET_MODE', `No new trades: ${mode.reason}.`, 'info', 120000);
     return;
   }
@@ -1285,8 +1326,8 @@ async function evaluateAutopilotEntries() {
     throttledNotice('weight', 'AUTOPILOT', `New-trade checks paused: ${busy}. Open positions and bags are still managed.`, 'warning', 60000);
     return;
   }
-  if (mode.side !== 'LONG') await evaluateShortEntries(maxBagsLimit);
-  if (mode.side === 'SHORT') return;
+  if (side !== 'LONG') await evaluateShortEntries(maxBagsLimit);
+  if (side === 'SHORT') return;
 
   if (learningEngine.recalculateDynamicHurdles) learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
 
@@ -1327,7 +1368,7 @@ async function evaluateAutopilotEntries() {
 
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
       if (posInRange < 0.50) continue;
-      if (State.subsystems.marketMode.mode === 'NEUTRAL' && !(await coinTrendAgrees(pairKey, 'LONG'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
+      if (State.subsystems.marketMode.side !== 'LONG' && !(await coinTrendAgrees(pairKey, 'LONG'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
 
       const volQuote = (coin.volumeM || 0) * 1000000;
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
@@ -1367,15 +1408,18 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
-      const candleCheck = await checkCandlestickSentry(pairKey, true);
+      let candleCheck = await checkCandlestickSentry(pairKey, true);
       if (candleCheck.isBearishReversal) {
         candidateCooldownMemo.set(pairKey, now + 20000);
         logOperation('CANDLE_VETO', `${pairKey} halted: Bearish pattern detected [${candleCheck.patternName}]. Rejecting distribution wick.`, 'warning');
         continue;
       }
 
+      const lateLong = candleCheck.isBullishEntry ? lateCheck(pairKey, 'LONG', candleCheck.lastCloseMs, candleCheck.bullSignalBarsAgo, candleCheck.bullishPatternName) : '';
+      if (lateLong) candleCheck = { ...candleCheck, isBullishEntry: false, bullishPatternName: 'NONE' };
       const isConfirmedPatternEntry = candleCheck.isBullishEntry;
       const isAuthenticIgnition = (microMom.change15mPct >= 0.80 && microMom.rvol >= 1.35 && orderFlow.takerBuyRatio >= 52.0);
+      if (lateLong && !isAuthenticIgnition) { candidateCooldownMemo.set(pairKey, now + 30000); continue; }
       if (!isConfirmedPatternEntry && !isAuthenticIgnition) {
         candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('CANDLE_WAIT', `${pairKey} on standby: Awaiting a completed Nison pattern on 15m (1h trend ${candleCheck.major}) or Ignition (15m >= +0.80%).`, 'info');
@@ -1908,6 +1952,7 @@ function saveDiskState() {
       manual: State.manual,
       positionPct: State.positionPct,
       leverageAuto: State.leverageAuto,
+      bothSides: State.bothSides,
       breakdownSide: State.breakdownSide,
       breakdownLongs: State.breakdownLongs,
       masterLedgerUrl: State.masterLedgerUrl,
@@ -1929,6 +1974,7 @@ function loadDiskState() {
       if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
       if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
       if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
+      if (typeof parsed.bothSides === 'boolean') State.bothSides = parsed.bothSides;
       if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
       if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
       if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
@@ -2199,6 +2245,25 @@ function checkManualLiquidation(sym, price) {
 function syncLeverageStatus() {
   State.subsystems.leverage = { on: State.leverageAuto, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct };
 }
+
+function syncSidesStatus() {
+  State.subsystems.sides = { on: State.bothSides };
+  const mm = State.subsystems.marketMode;
+  if (mm) mm.tradeSide = tradeSide(mm);
+}
+
+app.post('/api/both-sides', (req, res) => {
+  const v = req.body.on, on = v === true || v === 'true' || v === 'on', off = v === false || v === 'false' || v === 'off';
+  if (!on && !off) return res.status(400).json({ success: false, error: 'on must be true or false' });
+  State.bothSides = on;
+  syncSidesStatus();
+  logOperation('ENTRIES', on
+    ? 'Both sides ON: longs and shorts in every market mode. A trade against the market mode needs the coin\'s own 1h trend to agree. Open positions keep their exits.'
+    : 'Both sides OFF: Bullish market longs only, Bearish market shorts only, Neutral follows each coin. Open positions keep their exits.', 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, on });
+});
 
 app.post('/api/leverage', (req, res) => {
   const v = req.body.on, on = v === true || v === 'true' || v === 'on', off = v === false || v === 'false' || v === 'off';
@@ -2597,6 +2662,7 @@ loadDiskState();
 syncBreakdownStatus();
 syncSizingStatus();
 syncLeverageStatus();
+syncSidesStatus();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
