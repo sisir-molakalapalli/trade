@@ -895,15 +895,52 @@ function coinTrend(closes, R = MODE_RULES) {
   return null;
 }
 
-/** Compounding: each trade is positionPct of current account value, so profits and losses change the next size. */
+/**
+ * Compounding: each trade puts positionPct of current account value up as margin, so profits and losses change the
+ * next size. The position is margin x cfg.leverage (1x: the position is the margin, as before v6.8). Free cash must
+ * cover the margin plus the opening fee on the whole position.
+ */
 function planCompoundEntry(signal, livePrice, equityUSDT, freeCashUSDT, cfg = FUTURES, minNotional = CONFIG.minNotional) {
   if (!signal || !signal.ok) return reject('no signal');
   if (!(livePrice > 0)) return reject('no live price');
-  const wanted = Math.max(minNotional, equityUSDT * (cfg.positionPct / 100));
-  const notional = Math.floor(Math.min(wanted, freeCashUSDT / (1 + cfg.feePct / 100)) * 100) / 100;
+  const L = Math.max(1, Math.floor(Number(cfg.leverage) || 1));
+  const wanted = Math.max(minNotional / L, equityUSDT * (cfg.positionPct / 100));
+  const margin = Math.floor(Math.min(wanted, freeCashUSDT / (1 + L * cfg.feePct / 100)) * 100) / 100;
+  const notional = Math.round(margin * L * 100) / 100;
   if (notional < minNotional) return reject(`free cash covers only $${notional.toFixed(2)}, minimum position is $${minNotional}`);
-  return { ok: true, entryPrice: livePrice, stopPrice: signal.stopPrice, stopPct: signal.stopPct, notional, qty: notional / livePrice,
+  return { ok: true, entryPrice: livePrice, stopPrice: signal.stopPrice, stopPct: signal.stopPct, notional, margin, leverage: L, qty: notional / livePrice,
     riskUSDT: Number((notional * signal.stopPct / 100).toFixed(4)) };
+}
+
+/* =========================================================================
+ * AUTO LEVERAGE (v6.8, paper test, Settings > Leverage). Off: every trade is 1x, as before.
+ * On: the autopilot picks 1x to 3x from the coin's volatility, floor(1.5 / 15m ATR%) on closed candles:
+ * ATR under 0.5% -> 3x, 0.5% to 0.75% -> 2x, more -> 1x. Isolated margin, liquidation as Binance computes it
+ * with a 1% maintenance rate (Binance's lowest tier is 0.4% to 1.5%, so this errs early). When a leveraged
+ * trade moves to a recovery bag, free cash is added to its margin to bring it back to 1x (bagTopUp), so a
+ * bag waiting for +0.30% cannot be liquidated unless there was not enough free cash.
+ * ========================================================================= */
+const LEVERAGE = { maxLeverage: 3, atrTargetPct: 1.5, mmrPct: 1.0 };
+
+function autoLeverage({ atrPct } = {}, R = LEVERAGE) {
+  const a = Number(atrPct);
+  if (!Number.isFinite(a) || !(a > 0)) return 1;
+  return Math.max(1, Math.min(R.maxLeverage, Math.floor(R.atrTargetPct / a)));
+}
+
+/** Isolated-margin liquidation price. 1x: a short at about +99% (as before v6.8), a long never (0). */
+function liquidationPrice(entryPrice, side, leverage = 1, R = LEVERAGE) {
+  const L = Number(leverage) || 1;
+  if (L <= 1.0001) return side === 'SHORT' ? shortLiquidationPrice(entryPrice) : 0;
+  const m = R.mmrPct / 100;
+  return side === 'SHORT' ? (entryPrice * (1 + 1 / L)) / (1 + m) : (entryPrice * (1 - 1 / L)) / (1 - m);
+}
+
+/** Free cash to add to a bag's margin to bring it back to 1x: all that is needed, or as much as there is. */
+function bagTopUp(marginUSDT, notionalUSDT, freeCashUSDT) {
+  const need = num(notionalUSDT) - num(marginUSDT), free = num(freeCashUSDT) - 0.01;
+  if (!(need > 0.005) || !(free > 0)) return 0;
+  return need <= free ? need : Math.floor(free * 100) / 100;
 }
 
 function netPnlLongFutures(qty, entryPrice, exitPrice, cfg = FUTURES) {
@@ -1023,6 +1060,10 @@ module.exports = {
   futuresUniverse,
   coinTrend,
   planCompoundEntry,
+  LEVERAGE,
+  autoLeverage,
+  liquidationPrice,
+  bagTopUp,
   POSITION_SIZE,
   validPositionPct,
   netPnlLongFutures,
