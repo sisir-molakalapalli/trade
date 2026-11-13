@@ -106,6 +106,7 @@ const State = {
   },
   activePositions: {},
   recoveryBags: {},
+  ledgerSync: { okAt: 0, triedAt: 0, rows: 0, note: 'not read yet' },   // v6.11: last read of the Google Sheet ledger
   tradeLogs: [],
   universe: {},
   cooldowns: {},
@@ -865,9 +866,11 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
     `Net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} after fees${fullyClosed ? '' : ' • runner continues'}`,
     pnl >= 0 ? 'success' : 'warning');
 
+  // v6.11: record first (the list update is synchronous), so this one frame carries the cash, the closed position and the
+  // trade, and Realized P&L / Take-home move together with the account value. The sheet write continues in the background.
+  recordTradeToCloudLedger(tradePayload, { announce: false }).catch((e) => console.error('[Ledger Dispatch Notice]', e.message));
   saveDiskState();
   broadcastStateUpdate();
-  recordTradeToCloudLedger(tradePayload).catch((e) => console.error('[Ledger Dispatch Notice]', e.message));
   return tradePayload;
 }
 
@@ -1834,26 +1837,39 @@ function sanitizeAndAuditTradeHistory(logs) {
   }).sort((a, b) => getTradeTimeMs(b) - getTradeTimeMs(a));
 }
 
+// v6.11: Google Apps Script answers a GET with a 302 redirect to Google's content server. safeFetch does not follow redirects,
+// so the engine never actually read the sheet. This does (Node 18+ fetch); safeFetch stays as the fallback.
+async function fetchLedgerJson(url, timeoutMs = 20000) {
+  if (typeof fetch !== 'function') return safeFetch(url, timeoutMs);
+  const r = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) });
+  const text = await r.text();
+  try { return JSON.parse(text); } catch (e) { return text; }
+}
+
 async function syncTradesFromGoogleSheets() {
   const masterUrl = State.masterLedgerUrl;
 
   try {
     const fullUrl = masterUrl.includes('?') ? `${masterUrl}&action=GET_ALL` : `${masterUrl}?action=GET_ALL`;
-    const data = await safeFetch(fullUrl, 10000);
+    const data = await fetchLedgerJson(fullUrl, 20000);
     let fetchedTrades = [];
     if (data && Array.isArray(data.trades) && data.trades.length > 0) {
       fetchedTrades = data.trades;
     } else if (Array.isArray(data) && data.length > 0) {
       fetchedTrades = data;
     }
+    const answered = Boolean(data && (Array.isArray(data) || Array.isArray(data.trades)));
+    State.ledgerSync = answered ? { okAt: Date.now(), triedAt: Date.now(), rows: fetchedTrades.length, note: '' }
+      : { ...State.ledgerSync, triedAt: Date.now(), note: 'the sheet did not answer with trades' };
 
     if (fetchedTrades.length > 0) {
-      const merged = [...fetchedTrades];
-      (State.tradeLogs || []).forEach(localTrade => {
-        if (!merged.some(f => f.id === localTrade.id || (f.pair === localTrade.pair && f.date === localTrade.date && f.time === localTrade.time))) {
-          merged.push(localTrade);
-        }
-      });
+      // v6.11: for a trade the engine holds, its own record wins: the sheet has no side / market / funding / leverage
+      // columns and gives a size worked back from the net P&L (15-45% too small). The sheet adds the trades the engine
+      // does not hold (from before a restart), and trades only the engine holds are kept.
+      const same = (a, b) => (Number(a.id) > 0 && Number(a.id) === Number(b.id) && a.pair === b.pair) || (a.pair === b.pair && a.date === b.date && a.time === b.time);
+      const local = State.tradeLogs || [];
+      const merged = fetchedTrades.map((f) => { const l = local.find((x) => same(x, f)); return l ? { ...f, ...l } : f; });
+      local.forEach((l) => { if (!merged.some((f) => same(f, l))) merged.push(l); });
       State.tradeLogs = sanitizeAndAuditTradeHistory(merged);
       saveDiskState();
       broadcastStateUpdate();
@@ -1861,12 +1877,13 @@ async function syncTradesFromGoogleSheets() {
       return State.tradeLogs;
     }
   } catch (err) {
+    State.ledgerSync = { ...State.ledgerSync, triedAt: Date.now(), note: err.message };
     console.warn(`[Sync Ledger] Notice:`, err.message);
   }
   return State.tradeLogs;
 }
 
-async function recordTradeToCloudLedger(trade) {
+async function recordTradeToCloudLedger(trade, { announce = true } = {}) {
   const tradeId = Number(trade.id || Date.now());
   const now = new Date();
   const cleanDate = normalizeDateToIndianFormat(trade.date || now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }), tradeId);
@@ -1899,8 +1916,11 @@ async function recordTradeToCloudLedger(trade) {
     recentTradeDispatches.delete(first);
   }
 
-  State.tradeLogs.unshift(record);
+  // v6.11: the app gets the trade now, not after the sheet write (that took up to 30 s). A diagnostic test write goes to the
+  // sheet only, never into the trade list or P&L.
+  if (!Strategy.isTestTrade(record)) State.tradeLogs.unshift(record);
   saveDiskState();
+  if (announce) broadcastStateUpdate();
 
   const targetUrl = (trade.targetUrl || State.masterLedgerUrl || '').trim();
   let success = false;
@@ -1938,7 +1958,6 @@ async function recordTradeToCloudLedger(trade) {
     1.0
   );
 
-  broadcastStateUpdate();
   return { success: true };
 }
 
@@ -2057,7 +2076,8 @@ app.get('/api/state', (req, res) => {
     learningEngineState: learningEngine.state || {},
     riskConfig: Strategy.CONFIG,
     equityUSDT: computeEquity(),
-    manual: manualView()
+    manual: manualView(),
+    pnl: pnlNow()
   });
 });
 
@@ -2423,6 +2443,12 @@ const sendAll = (msg) => wss.clients.forEach((c) => { if (c.readyState === WebSo
 // unchanged price frames be skipped instead of re-sent.
 const omitTickStamps = (key, value) => (key === 'lastTickAt' ? undefined : value);
 
+// v6.11: the P&L statement the app shows (Realized P&L, Take-home after tax, the statement sheet), over every trade the
+// engine holds, with when the Google Sheet ledger was last read.
+function pnlNow() {
+  return { ...Strategy.pnlStatement(State.tradeLogs), ledger: { ...State.ledgerSync } };
+}
+
 // withUniverse: only the screener changes the radar list, so only it re-sends it.
 function broadcastStateUpdate({ withUniverse = false } = {}) {
   if (!hasClients()) return;
@@ -2435,7 +2461,8 @@ function broadcastStateUpdate({ withUniverse = false } = {}) {
     subsystems: State.subsystems,
     riskConfig: Strategy.CONFIG,
     equityUSDT: computeEquity(),
-    manual: manualView()
+    manual: manualView(),
+    pnl: pnlNow()
   };
   if (withUniverse) payload.universe = State.universe;
   sendAll(JSON.stringify(payload, omitTickStamps));
@@ -2623,7 +2650,8 @@ wss.on('connection', (ws) => {
     tradeLogs: State.tradeLogs.slice(0, 150),
     subsystems: State.subsystems,
     riskConfig: Strategy.CONFIG,
-    manual: manualView()
+    manual: manualView(),
+    pnl: pnlNow()
   }, omitTickStamps));
 
   ws.on('message', (data) => {
