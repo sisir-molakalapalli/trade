@@ -27,7 +27,6 @@
  * =========================================================================
  */
 'use strict';
-const Candles = require('./candles');
 
 const CONFIG = {
   feePct: 0.10,              // Binance spot taker fee per side, in %
@@ -55,14 +54,14 @@ const CONFIG = {
   maxExtensionPct: 3.0,      // max distance above the 1h EMA20 (no FOMO)
   minRvol: 1.3,              // breakout bar volume vs prior 20 bars
   breakoutLookback: 8,       // 8 x 15m = 2h range
-  btcMax15mDropPct: -0.35,   // BTC Macro Weather Gate: pause entries when the LIVE 15m candle is <= this
+  btcMax15mDropPct: -0.40,   // last closed BTC 15m bar must not be worse than this
   maxChaseR: 0.5,            // skip if live price already ran > 0.5R past signal close
 
   // ---- portfolio guard ----
   riskPerTradePct: 0.50,     // a full stop-out costs 0.5% of equity
   maxAllocPct: 15,           // never more than 15% of equity in one position
   maxConcurrent: 3,
-  minNotional: 5.0,          // every position is at least $5 (Binance spot min notional is $5)
+  minNotional: 10.5,         // Binance min notional is $10
   dailyLossLimitPct: 2.0,    // stop trading for the day after -2% realized
   maxConsecutiveLosses: 3,   // ... or after 3 losses in a row
   lossStreakPauseMin: 120,   // pause length after the loss streak
@@ -114,27 +113,26 @@ const reject = (reason) => ({ ok: false, reason });
 
 // ------------------------------------------------------------- BTC regime
 /**
- * BTC MACRO WEATHER GATE (exchange-wide circuit breaker) — per the
- * "Bitcoin Macro Weather Gate" specification:
- *   Δ = (close_cur - open_cur) / open_cur × 100 on the CURRENT (live) BTCUSDT 15m candle.
- *   Δ <= btcMax15mDropPct (-0.35%) -> PAUSED: no new altcoin entries.
- *   Δ >  -0.35%                    -> NORMAL.
- * Resets on its own: a new 15m candle opens with Δ = 0. Exits are never affected.
- * FAIL-OPEN: missing/failed BTC data returns ok (spec §5), so a network blip can't freeze entries.
- *
- * (btc1h is accepted only so older callers keep working; the gate no longer uses the 1h trend.)
+ * BTC must be above its 1h EMA50 and its last closed 15m bar must not be a dump.
+ * Altcoin longs opened while BTC is falling are the #1 source of stop-outs.
  */
 function evaluateBtcRegime(btc1h, btc15, now = Date.now(), cfg = CONFIG) {
-  const live = Array.isArray(btc15) && btc15.length ? toBars(btc15.filter((k) => Array.isArray(k) && num(k[0]) <= now)) : [];
-  const cur = live[live.length - 1];
-  if (!cur || !(cur.o > 0) || !(cur.c > 0)) {
-    return { ok: true, chg15: 0, failOpen: true, reason: 'BTC data unavailable — gate fails open' };
+  const h = toBars(closedOnly(btc1h, now));
+  const m = toBars(closedOnly(btc15, now));
+  if (h.length < 55 || m.length < 2) return { ok: false, reason: 'BTC data unavailable' };
+  const closes = h.map((b) => b.c);
+  const e50 = emaSeries(closes, 50);
+  const e20 = emaSeries(closes, 20);
+  const last = closes[closes.length - 1];
+  const lastM = m[m.length - 1];
+  const chg15 = lastM.o > 0 ? ((lastM.c - lastM.o) / lastM.o) * 100 : 0;
+  if (last < e50[e50.length - 1]) {
+    return { ok: false, reason: `BTC below 1h EMA50 (downtrend)`, chg15 };
   }
-  const chg15 = ((cur.c - cur.o) / cur.o) * 100;
   if (chg15 <= cfg.btcMax15mDropPct) {
-    return { ok: false, chg15, btcOpen15: cur.o, reason: `BTC 15m dip ${chg15.toFixed(2)}% <= ${cfg.btcMax15mDropPct}%` };
+    return { ok: false, reason: `BTC 15m bar ${chg15.toFixed(2)}% <= ${cfg.btcMax15mDropPct}%`, chg15 };
   }
-  return { ok: true, chg15, btcOpen15: cur.o };
+  return { ok: true, chg15, btcAboveEma20: last >= e20[e20.length - 1] };
 }
 
 // ------------------------------------------------------------ entry check
@@ -232,13 +230,10 @@ function planEntry(signal, livePrice, equityUSDT, freeCashUSDT, cfg = CONFIG) {
   const riskUSDT = equityUSDT * (cfg.riskPerTradePct / 100);
   let notional = Math.min(riskUSDT / (stopPct / 100), equityUSDT * (cfg.maxAllocPct / 100), freeCashUSDT);
   if (notional < cfg.minNotional) {
-    // Small account ($21): round the order UP to the $5 floor so no position is ever
-    // smaller than minNotional — only if the loss at the stop stays <= 2x plan and free
-    // cash covers the order plus the buy fee. Otherwise skip the trade.
+    // Small account: allow the $10.50 minimum only if the risk stays <= 2x plan.
     const minRisk = cfg.minNotional * (stopPct / 100);
-    const needCash = cfg.minNotional * (1 + cfg.feePct / 100);
-    if (freeCashUSDT >= needCash && minRisk <= riskUSDT * 2) notional = cfg.minNotional;
-    else return reject(`size $${notional.toFixed(2)} below the $${cfg.minNotional} minimum position`);
+    if (freeCashUSDT >= cfg.minNotional && minRisk <= riskUSDT * 2) notional = cfg.minNotional;
+    else return reject(`size $${notional.toFixed(2)} below Binance minimum`);
   }
   return {
     ok: true,
@@ -362,9 +357,9 @@ function inSymbolCooldown(trades, pair, now = Date.now(), cfg = CONFIG) {
     now - num(t.id) < cfg.symbolCooldownMin * 60000);
 }
 
-// ------------------------------------------------ legacy candlestick analyzer (v4.3)
-// Kept only for comparison tests. The engine now uses the Nison engine in candles.js.
-function analyzeCandlestickPatternLegacy(klines) {
+// ------------------------------------------------ Nison candlestick analyzer
+// (unchanged from v4.3; now always fed CLOSED candles so it cannot repaint)
+function analyzeCandlestickPattern(klines) {
   if (!Array.isArray(klines) || klines.length < 5) {
     return { 
       isBearishReversal: false, 
@@ -671,375 +666,6 @@ function analyzeCandlestickPatternLegacy(klines) {
   };
 }
 
-// ------------------------------------------------ Nison candlestick analyzer (v5.5)
-/**
- * Full pattern set from Nison's "Japanese Candlestick Charting Techniques" (candles.js), with
- * the book's rules: required prior trend for reversals, next-candle confirmation for the weaker
- * signals, and convergence with volume / support-resistance / RSI. Returns the same fields the
- * screener and evaluateEntry always used, plus the full list of detected patterns.
- * Feed CLOSED candles only (oldest first).
- */
-function analyzeCandlestickPattern(klines) {
-  const r = Candles.scan(klines);
-  const last = Array.isArray(klines) && klines.length ? klines[klines.length - 1] : null;
-  const o = last ? num(last[1]) : 0, c = last ? num(last[4]) : 0;
-  const bull = r.bull[0], bear = r.bear[0];
-  const bullishPatternName = bull ? bull.name : 'NONE';
-  const bearishPatternName = bear ? bear.name : 'NONE';
-  return {
-    isBearishReversal: !!bear,
-    isBullishReversal: r.bull.some((p) => p.kind === 'reversal'),
-    isBullishEntry: !!bull && !bear,
-    bullishPatternName,
-    bearishPatternName,
-    patternName: bear ? bearishPatternName : bullishPatternName,
-    confidence: (bear || bull || {}).strength || 0,
-    patternRvol: (bull || bear || {}).rvol || 1.0,
-    bodyPct: o > 0 ? (Math.abs(c - o) / o) * 100 : 0,
-    trend: r.trend,
-    patterns: r.patterns,       // everything detected, incl. warnings and signals awaiting confirmation
-    warnings: r.warnings
-  };
-}
-
-/* =========================================================================
- * NO-LOSS EXITS + SPOT RECOVERY BAG (v5.8)
- * An open position is never closed below its minimum exit (+0.30% long, +0.20% short: both about
- * +0.10% after fees) by the engine. If it falls 3.50% it moves to a
- * recovery bag, and a bag closes only at +0.30%. There is no loss cap and no time decay.
- * ========================================================================= */
-const EXIT_RULES = {
-  floorPct: 0.30, shortFloorPct: 0.20, profitLockAtPct: 0.70, profitLockPct: 0.50, trailAtPct: 1.00, trailPct: 0.35,
-  tp1Pct: 1.80, runnerTrailPct: 0.50, scratchMinutes: 45,
-  demotePct: -3.50,
-  bagTargetPct: 0.30, minPartialUSDT: 10
-};
-
-/**
- * @param signals { bearishPattern: string|null, peakExhausted: bool, upsideDead: bool }
- * @returns { action: 'HOLD'|'PARTIAL'|'EXIT'|'DEMOTE', fraction?, reason? }
- */
-function manageNoLoss(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES) {
-  const entry = num(pos.entryPriceUSDT);
-  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
-  const gain = Number((((price - entry) / entry) * 100).toFixed(3));
-  const held = (now - num(pos.openedAt || now)) / 60000;
-  pos.peakGainPct = Math.max(num(pos.peakGainPct) || 0, gain);
-  pos.peakHighPrice = Math.max(num(pos.peakHighPrice) || entry, price);
-  const peak = pos.peakGainPct, floor = entry * (1 + R.floorPct / 100);
-  const stage = pos.ratchetStage || 'INITIAL';
-
-  if (peak >= R.floorPct && stage === 'INITIAL') { pos.ratchetStage = 'BREAKEVEN_LOCKED'; pos.sl = floor; }
-  if (peak >= R.profitLockAtPct && ['INITIAL', 'BREAKEVEN_LOCKED'].includes(pos.ratchetStage)) {
-    pos.ratchetStage = 'PROFIT_LOCKED'; pos.sl = Math.max(floor, entry * (1 + R.profitLockPct / 100));
-  }
-  if (peak >= R.trailAtPct && pos.ratchetStage !== 'RUNNER_TRAIL') {
-    pos.ratchetStage = 'DYNAMIC_TRAIL'; pos.sl = Math.max(floor, num(pos.sl) || 0, pos.peakHighPrice * (1 - R.trailPct / 100));
-  }
-  let partial = null;
-  if (gain >= R.tp1Pct && !pos.tp1Secured) {
-    pos.tp1Secured = true; pos.ratchetStage = 'RUNNER_TRAIL';
-    partial = { action: 'PARTIAL', fraction: 0.5, reason: 'TP1 1.8%' };
-  }
-  if (pos.ratchetStage === 'RUNNER_TRAIL') pos.sl = Math.max(floor, num(pos.sl) || 0, pos.peakHighPrice * (1 - R.runnerTrailPct / 100));
-
-  if (price >= floor) {
-    if (signals.bearishPattern) return { action: 'EXIT', reason: `CANDLE HARVEST [${signals.bearishPattern}]` };
-    if (signals.peakExhausted) return { action: 'EXIT', reason: 'PEAK HARVEST' };
-    if (pos.ratchetStage !== 'INITIAL' && price <= num(pos.sl)) return { action: 'EXIT', reason: pos.tp1Secured ? 'RUNNER EXIT' : 'TRAILING STOP' };
-    if (held >= R.scratchMinutes) return { action: 'EXIT', reason: 'TIME SCRATCH 45M' };
-    if (partial) return partial;
-    return { action: 'HOLD' };
-  }
-  if (gain <= R.demotePct) {
-    return { action: 'DEMOTE', reason: `${gain.toFixed(2)}%` };
-  }
-  return { action: 'HOLD' };
-}
-
-/** A recovery bag closes only at entry +0.30% or better. */
-function manageBag(bag, price, R = EXIT_RULES) {
-  const entry = num(bag.entryPriceUSDT);
-  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
-  // A futures bag also has to earn back any funding it paid. Spot bags never pay funding.
-  const notional = num(bag.qty) * entry;
-  const fundingCostPct = bag.market === 'FUTURES' && notional > 0 ? Math.max(0, -(num(bag.fundingUSDT) || 0) / notional * 100) : 0;
-  bag.targetExitPriceUSDT = entry * (1 + (R.bagTargetPct + fundingCostPct) / 100);
-  bag.targetStep = 'CLOSES AT +0.30%';
-  bag.troughPrice = Math.min(num(bag.troughPrice) || price, price);
-  return price >= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
-}
-
-/* =========================================================================
- * HIGH VOL BREAKDOWN AS A LONG (v6.5, paper test, Settings > High vol breakdown > Long)
- * A breakdown signal is bought instead of shorted. The long closes only at its target: +0.30% on the
- * bid (about +0.20% after both fees), plus any funding it has paid. No harvest, trailing, time scratch or
- * partial exits. At -3.50% it moves to a normal recovery bag, which also closes at +0.30%.
- * ========================================================================= */
-const BREAKDOWN_LONG = { targetPct: 0.30 };
-
-function manageTargetLong(pos, price, R = EXIT_RULES) {
-  const entry = num(pos.entryPriceUSDT);
-  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
-  const gain = Number((((price - entry) / entry) * 100).toFixed(3));
-  pos.peakGainPct = Math.max(num(pos.peakGainPct) || 0, gain);
-  pos.peakHighPrice = Math.max(num(pos.peakHighPrice) || entry, price);
-  const targetPct = num(pos.targetOnlyPct) || BREAKDOWN_LONG.targetPct;
-  const notional = num(pos.qty) * entry;
-  const fundingCostPct = notional > 0 ? Math.max(0, -(num(pos.fundingUSDT) || 0) / notional * 100) : 0;
-  pos.targetPrice = entry * (1 + (targetPct + fundingCostPct) / 100);
-  if (price >= pos.targetPrice) return { action: 'EXIT', reason: `TARGET +${targetPct.toFixed(2)}%` };
-  if (gain <= R.demotePct) return { action: 'DEMOTE', reason: `${gain.toFixed(2)}%` };
-  return { action: 'HOLD' };
-}
-
-/* =========================================================================
- * MARKET MODE + PAPER USD-M SHORTS (v5.9)
- * Every new trade is paper USD-M at 1x. BULL: longs. BEAR: shorts. NEUTRAL: each coin follows its own 1h trend.
- * Without enough market data: no new trades.
- * Replaces the BTC gate. Read on CLOSED 1h candles, and both of the last two hours must agree.
- * ========================================================================= */
-const MODE_RULES = { bullBreadth: 0.60, bearBreadth: 0.40, minCoins: 10, slopeBars: 6 };
-const FUTURES = { feePct: 0.05, leverage: 1, maintenancePct: 0.5, positionPct: 20 };   // positionPct: default size, Settings can change it (v6.6)
-const POSITION_SIZE = { minPct: 1, maxPct: 100 };
-/** A position size the user may pick: 1% to 100% of account value, at most 2 decimals. Anything else is null. */
-function validPositionPct(x) {
-  const v = Number(x);
-  if (x === null || x === undefined || x === '' || !Number.isFinite(v) || v < POSITION_SIZE.minPct || v > POSITION_SIZE.maxPct) return null;
-  return Math.round(v * 100) / 100;
-}
-
-function modeAt(btcBars, coins, back, R) {
-  const c = btcBars.map((b) => b.c), n = c.length - 1 - back;
-  const e20 = emaSeries(c, 20), e50 = emaSeries(c, 50);
-  const close = c[n], slope = e50[n] - e50[n - R.slopeBars];
-  let above = 0, seen = 0;
-  coins.forEach((bars) => {
-    if (bars.length < 55) return;
-    const closes = bars.map((b) => b.c), i = closes.length - 1 - back;
-    seen++;
-    if (closes[i] > emaSeries(closes, 50)[i]) above++;
-  });
-  const breadth = seen ? above / seen : null;
-  const btcUp = close > e50[n] && e20[n] > e50[n] && slope > 0;
-  const btcDown = close < e50[n] && e20[n] < e50[n] && slope < 0;
-  let mode = 'NEUTRAL';
-  if (seen >= R.minCoins && btcUp && breadth >= R.bullBreadth) mode = 'BULL';
-  if (seen >= R.minCoins && btcDown && breadth <= R.bearBreadth) mode = 'BEAR';
-  return { mode, breadth, seen, close, ema20: e20[n], ema50: e50[n], slope, btcUp, btcDown };
-}
-
-/** @param btc1h closed 1h klines for BTC (70+ bars). @param coins1h array of closed 1h klines. Missing data => NEUTRAL. */
-function evaluateMarketMode(btc1h, coins1h = [], R = MODE_RULES) {
-  const btc = Array.isArray(btc1h) ? toBars(btc1h) : [];
-  if (btc.length < 70) return { mode: 'NEUTRAL', side: 'NONE', reason: 'BTC 1h data unavailable, no new trades', breadth: null, seen: 0 };
-  const coins = (coins1h || []).filter(Array.isArray).map(toBars);
-  const now = modeAt(btc, coins, 0, R), prev = modeAt(btc, coins, 1, R);
-  const pct = now.breadth === null ? '--' : `${Math.round(now.breadth * 100)}%`;
-  const base = { breadth: now.breadth, seen: now.seen, btcClose: now.close, ema20: now.ema20, ema50: now.ema50, btcUp: now.btcUp, btcDown: now.btcDown };
-  if (now.seen < R.minCoins) return { ...base, mode: 'NEUTRAL', side: 'NONE', reason: `Only ${now.seen} coins readable, no new trades` };
-  if (now.mode === prev.mode && now.mode === 'BULL') return { ...base, mode: 'BULL', side: 'LONG', reason: `BTC uptrend and ${pct} of coins above their 1h EMA50` };
-  if (now.mode === prev.mode && now.mode === 'BEAR') return { ...base, mode: 'BEAR', side: 'SHORT', reason: `BTC downtrend and only ${pct} of coins above their 1h EMA50` };
-  const reason = now.mode !== 'NEUTRAL' ? `${now.mode === 'BULL' ? 'Bullish' : 'Bearish'} for one hour, waiting for a second hour` : `Mixed market: ${pct} of coins above their 1h EMA50`;
-  return { ...base, mode: 'NEUTRAL', side: 'BOTH', reason };
-}
-
-/**
- * Coins that must not be shorted. Backtested over 180 days: the volume floor improved results in
- * both halves of the sample and the funding limit cost almost nothing. Unknown funding blocks the short.
- */
-const SHORT_RULES = { minVolumeUSD: 10000000, minFundingRate: -0.0003, minListedDays: 3 };
-function shortExclusion({ volumeUSD, fundingRate, listedAt, now = Date.now() }, R = SHORT_RULES) {
-  if (!(volumeUSD >= R.minVolumeUSD)) return 'under $10M daily volume';
-  if (!Number.isFinite(fundingRate)) return 'funding unknown';
-  if (fundingRate <= R.minFundingRate) return `funding ${(fundingRate * 100).toFixed(3)}%, crowded shorts`;
-  if (listedAt && now - listedAt < R.minListedDays * 86400000) return 'listed under 3 days ago';
-  return null;
-}
-
-/** Same limits for both directions. Funding must not be crowded on the side being opened. */
-/* =========================================================================
- * FUTURES SCREENER (v6.7). The radar is built from USD-M futures, not spot: every trading USDT perpetual
- * with at least $10M of 24h futures volume (the same floor futuresExclusion trades at), biggest first,
- * at most maxCoins. Indexes, stablecoins and names that are not plain letters / digits are left out.
- * ========================================================================= */
-const SCREENER = { minVolumeUSD: SHORT_RULES.minVolumeUSD, maxCoins: 150 };
-const SCREENER_EXCLUDE = /^(USDC|FDUSD|TUSD|USDP|USDE|USD1|RLUSD|DAI|EUR|BTCDOM|DEFI)USDT$/;
-
-function futuresUniverse(tickers, perps, R = SCREENER) {
-  if (!Array.isArray(tickers) || !perps || typeof perps.has !== 'function') return [];
-  return tickers
-    .filter((t) => t && typeof t.symbol === 'string' && /^[A-Z0-9]+USDT$/.test(t.symbol) && perps.has(t.symbol) && !SCREENER_EXCLUDE.test(t.symbol))
-    .map((t) => ({ t, vol: parseFloat(t.quoteVolume) }))
-    .filter((x) => x.vol >= R.minVolumeUSD && parseFloat(x.t.lastPrice) > 0)
-    .sort((a, b) => b.vol - a.vol)
-    .slice(0, R.maxCoins)
-    .map((x) => x.t);
-}
-
-function futuresExclusion({ side = 'SHORT', volumeUSD, fundingRate, listedAt, now = Date.now() }, R = SHORT_RULES) {
-  if (side === 'SHORT') return shortExclusion({ volumeUSD, fundingRate, listedAt, now }, R);
-  if (!(volumeUSD >= R.minVolumeUSD)) return 'under $10M daily volume';
-  if (!Number.isFinite(fundingRate)) return 'funding unknown';
-  if (fundingRate >= -R.minFundingRate) return `funding ${(fundingRate * 100).toFixed(3)}%, crowded longs`;
-  if (listedAt && now - listedAt < R.minListedDays * 86400000) return 'listed under 3 days ago';
-  return null;
-}
-
-/** A coin's own 1h direction from closed closes (55+ bars): 'LONG', 'SHORT' or null when it has no clear trend. */
-function coinTrend(closes, R = MODE_RULES) {
-  if (!Array.isArray(closes) || closes.length < 55 + R.slopeBars) return null;
-  const n = closes.length - 1, e20 = emaSeries(closes, 20), e50 = emaSeries(closes, 50), slope = e50[n] - e50[n - R.slopeBars];
-  if (closes[n] > e50[n] && e20[n] > e50[n] && slope > 0) return 'LONG';
-  if (closes[n] < e50[n] && e20[n] < e50[n] && slope < 0) return 'SHORT';
-  return null;
-}
-
-/**
- * Compounding: each trade puts positionPct of current account value up as margin, so profits and losses change the
- * next size. The position is margin x cfg.leverage (1x: the position is the margin, as before v6.8). Free cash must
- * cover the margin plus the opening fee on the whole position.
- */
-function planCompoundEntry(signal, livePrice, equityUSDT, freeCashUSDT, cfg = FUTURES, minNotional = CONFIG.minNotional) {
-  if (!signal || !signal.ok) return reject('no signal');
-  if (!(livePrice > 0)) return reject('no live price');
-  const L = Math.max(1, Math.floor(Number(cfg.leverage) || 1));
-  const wanted = Math.max(minNotional / L, equityUSDT * (cfg.positionPct / 100));
-  const margin = Math.floor(Math.min(wanted, freeCashUSDT / (1 + L * cfg.feePct / 100)) * 100) / 100;
-  const notional = Math.round(margin * L * 100) / 100;
-  if (notional < minNotional) return reject(`free cash covers only $${notional.toFixed(2)}, minimum position is $${minNotional}`);
-  return { ok: true, entryPrice: livePrice, stopPrice: signal.stopPrice, stopPct: signal.stopPct, notional, margin, leverage: L, qty: notional / livePrice,
-    riskUSDT: Number((notional * signal.stopPct / 100).toFixed(4)) };
-}
-
-/* =========================================================================
- * AUTO LEVERAGE (v6.8, paper test, Settings > Leverage). Off: every trade is 1x, as before.
- * On: the autopilot picks 1x to 3x from the coin's volatility, floor(1.5 / 15m ATR%) on closed candles:
- * ATR under 0.5% -> 3x, 0.5% to 0.75% -> 2x, more -> 1x. Isolated margin, liquidation as Binance computes it
- * with a 1% maintenance rate (Binance's lowest tier is 0.4% to 1.5%, so this errs early). When a leveraged
- * trade moves to a recovery bag, free cash is added to its margin to bring it back to 1x (bagTopUp), so a
- * bag waiting for +0.30% cannot be liquidated unless there was not enough free cash.
- * ========================================================================= */
-/**
- * v6.10: a candle-pattern trade opens only in the first windowMin minutes after the close of the candle that completed
- * or confirmed the pattern. Back test (180 days, 49 coins): pattern trades entered 5 / 10 / 15 minutes after that close
- * made +0.015% / -0.030% / -0.057% each; allowing only the first 5 minutes beat the old rule in both halves of the data.
- */
-const PATTERN_ENTRY = { windowMin: 5, barMs: 900000 };
-function patternSignalAgeMin(lastCloseMs, signalBarsAgo = 0, now = Date.now(), R = PATTERN_ENTRY) {
-  return (now - (Number(lastCloseMs) - (Number(signalBarsAgo) || 0) * R.barMs)) / 60000;
-}
-function patternEntryOpen(lastCloseMs, signalBarsAgo = 0, now = Date.now(), R = PATTERN_ENTRY) {
-  const a = patternSignalAgeMin(lastCloseMs, signalBarsAgo, now, R);
-  return Number.isFinite(a) && a >= 0 && a <= R.windowMin;
-}
-
-const LEVERAGE = { maxLeverage: 3, atrTargetPct: 1.5, mmrPct: 1.0 };
-
-function autoLeverage({ atrPct } = {}, R = LEVERAGE) {
-  const a = Number(atrPct);
-  if (!Number.isFinite(a) || !(a > 0)) return 1;
-  return Math.max(1, Math.min(R.maxLeverage, Math.floor(R.atrTargetPct / a)));
-}
-
-/** Isolated-margin liquidation price. 1x: a short at about +99% (as before v6.8), a long never (0). */
-function liquidationPrice(entryPrice, side, leverage = 1, R = LEVERAGE) {
-  const L = Number(leverage) || 1;
-  if (L <= 1.0001) return side === 'SHORT' ? shortLiquidationPrice(entryPrice) : 0;
-  const m = R.mmrPct / 100;
-  return side === 'SHORT' ? (entryPrice * (1 + 1 / L)) / (1 + m) : (entryPrice * (1 - 1 / L)) / (1 - m);
-}
-
-/** Free cash to add to a bag's margin to bring it back to 1x: all that is needed, or as much as there is. */
-function bagTopUp(marginUSDT, notionalUSDT, freeCashUSDT) {
-  const need = num(notionalUSDT) - num(marginUSDT), free = num(freeCashUSDT) - 0.01;
-  if (!(need > 0.005) || !(free > 0)) return 0;
-  return need <= free ? need : Math.floor(free * 100) / 100;
-}
-
-function netPnlLongFutures(qty, entryPrice, exitPrice, cfg = FUTURES) {
-  return qty * (exitPrice - entryPrice) - (qty * entryPrice + qty * exitPrice) * (cfg.feePct / 100);
-}
-
-/* =========================================================================
- * MANUAL PAPER FUTURES (separate account). The user opens and closes; nothing here exits on its own.
- * ========================================================================= */
-const MANUAL = { startUSDT: 110, minNotional: 5, historyKeep: 200 };
-
-/** Can a manual position of `notional` USDT be opened at `price`? 1x margin, so the cost is the notional plus the opening fee. */
-function manualOpenPlan(cashUSDT, notional, price, side, cfg = FUTURES, minNotional = MANUAL.minNotional) {
-  if (side !== 'LONG' && side !== 'SHORT') return reject('side must be LONG or SHORT');
-  if (!(price > 0)) return reject('no live price');
-  if (!(notional >= minNotional)) return reject(`minimum position is $${minNotional}`);
-  const cost = notional * (1 + cfg.feePct / 100);
-  if (cost > cashUSDT + 1e-9) return reject(`needs $${cost.toFixed(2)} with the fee, free cash is $${Number(cashUSDT).toFixed(2)}`);
-  return { ok: true, cost, notional, qty: notional / price, entryPrice: price, liquidationPrice: side === 'SHORT' ? shortLiquidationPrice(price, cfg) : null };
-}
-
-/** Closing value of a manual position at `price` (exit fee and booked funding included). */
-function manualClose(pos, price, cfg = FUTURES) {
-  const q = num(pos.qty), e = num(pos.entryPriceUSDT), f = num(pos.fundingUSDT) || 0, short = pos.side === 'SHORT';
-  const proceeds = (short ? q * (2 * e - price) : q * price) - q * price * (cfg.feePct / 100) + f;
-  const pnl = (short ? netPnlShort(q, e, price, cfg) : netPnlLongFutures(q, e, price, cfg)) + f;
-  return { proceeds, pnl, gainPct: ((short ? e - price : price - e) / e) * 100 };
-}
-
-/** Price move of a manual position in its favour, in % of entry (the figure the Manual tab shows). */
-function manualGainPct(pos, price) {
-  const e = num(pos.entryPriceUSDT);
-  return e > 0 ? ((pos.side === 'SHORT' ? e - price : price - e) / e) * 100 : 0;
-}
-/** A take-profit is a price move of 0.1% to 100% in the position's favour; null turns it off. */
-function manualTakeProfit(pct) {
-  if (pct === null || pct === undefined || pct === '' || pct === 0 || pct === '0') return { ok: true, pct: null };
-  const v = Number(pct);
-  if (!Number.isFinite(v) || v < 0.1 || v > 100) return { ok: false, reason: 'take profit must be between 0.1% and 100%' };
-  return { ok: true, pct: Math.round(v * 100) / 100 };
-}
-const manualTakeProfitPrice = (pos) => (pos.takeProfitPct ? num(pos.entryPriceUSDT) * (1 + (pos.side === 'SHORT' ? -1 : 1) * pos.takeProfitPct / 100) : null);
-
-/** Value of a manual position marked at `price`, before the exit fee. */
-function manualMark(pos, price) {
-  const q = num(pos.qty), e = num(pos.entryPriceUSDT), f = num(pos.fundingUSDT) || 0;
-  return (pos.side === 'SHORT' ? q * (2 * e - price) : q * price) + f;
-}
-
-function netPnlShort(qty, entryPrice, exitPrice, cfg = FUTURES) {
-  return qty * (entryPrice - exitPrice) - (qty * entryPrice + qty * exitPrice) * (cfg.feePct / 100);
-}
-
-/** Isolated-margin short: the price where margin is used up, less maintenance. */
-function shortLiquidationPrice(entryPrice, cfg = FUTURES) {
-  return (entryPrice * (1 + 1 / cfg.leverage)) / (1 + cfg.maintenancePct / 100);
-}
-
-/** Same no-loss rules as a long, run on the mirror image of the price (entry*2 - price), so gains and locks are identical. */
-function manageShort(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES) {
-  const entry = num(pos.entryPriceUSDT);
-  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
-  const mirror = (x) => 2 * entry - x;
-  const shadow = { ...pos, sl: mirror(num(pos.sl) || entry), peakHighPrice: mirror(num(pos.peakLowPrice) || entry) };
-  const r = manageNoLoss(shadow, mirror(price), signals, now, { ...R, floorPct: R.shortFloorPct });
-  pos.peakGainPct = shadow.peakGainPct;
-  pos.peakLowPrice = mirror(shadow.peakHighPrice);
-  pos.ratchetStage = shadow.ratchetStage;
-  pos.tp1Secured = shadow.tp1Secured;
-  pos.sl = mirror(shadow.sl);
-  return r;
-}
-
-/** A short bag closes at 0.30% below entry. Funding it has paid moves the target further, so the close is still not a loss. */
-function manageShortBag(bag, price, R = EXIT_RULES) {
-  const entry = num(bag.entryPriceUSDT);
-  if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
-  const notional = num(bag.qty) * entry;
-  const fundingCostPct = notional > 0 ? Math.max(0, -(num(bag.fundingUSDT) || 0) / notional * 100) : 0;
-  bag.targetExitPriceUSDT = entry * (1 - (R.bagTargetPct + fundingCostPct) / 100);
-  bag.targetStep = 'CLOSES AT +0.30%';
-  bag.troughPrice = Math.max(num(bag.troughPrice) || price, price);
-  return price <= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
-}
-
 module.exports = {
   CONFIG,
   closedOnly,
@@ -1054,45 +680,5 @@ module.exports = {
   netPnl,
   portfolioGuard,
   inSymbolCooldown,
-  analyzeCandlestickPattern,
-  analyzeCandlestickPatternLegacy,
-  assessCandles: Candles.assess,
-  assessShortCandles: Candles.assessShort,
-  MODE_RULES,
-  FUTURES,
-  evaluateMarketMode,
-  SHORT_RULES,
-  MANUAL,
-  manualOpenPlan,
-  manualClose,
-  manualMark,
-  manualGainPct,
-  manualTakeProfit,
-  manualTakeProfitPrice,
-  futuresExclusion,
-  SCREENER,
-  futuresUniverse,
-  coinTrend,
-  planCompoundEntry,
-  PATTERN_ENTRY,
-  patternSignalAgeMin,
-  patternEntryOpen,
-  LEVERAGE,
-  autoLeverage,
-  liquidationPrice,
-  bagTopUp,
-  POSITION_SIZE,
-  validPositionPct,
-  netPnlLongFutures,
-  shortExclusion,
-  netPnlShort,
-  shortLiquidationPrice,
-  manageShort,
-  manageShortBag,
-  majorTrendOf: Candles.majorTrendOf,
-  EXIT_RULES,
-  manageNoLoss,
-  manageBag,
-  BREAKDOWN_LONG,
-  manageTargetLong
+  analyzeCandlestickPattern
 };
