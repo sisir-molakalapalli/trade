@@ -335,7 +335,7 @@ function scan(klines) {
   };
   for (const p of P) {
     const now = test(p, n);
-    if (now && !(p.confirm || now.confirm)) { found.push({ p, at: n, status: 'complete' }); continue; }
+    if (now && !(p.confirm || now.confirm)) { found.push({ p, at: n, status: 'complete', sigAgo: 0 }); continue; }
     if (now) { found.push({ p, at: n, status: 'awaiting confirmation' }); continue; }
     // confirmation window: the next one or two candles
     let settled = false;
@@ -346,20 +346,22 @@ function scan(klines) {
       settled = true;
       const sig = B[n - back], after = B.slice(n - back + 1, n + 1), last = B[n];
       const lvl = p.confirmAbove === 'mother' ? Math.max(B[n - back - 1].h, sig.h) : sig.top;
+      // v6.10: confirmed two candles after the signal line, the confirmation may already have come one candle ago
+      const prev = B[n - 1], sigAgo = back === 2 && (p.dir === 'bull' ? prev.white && prev.c > lvl : prev.black && prev.c < sig.bot) ? 1 : 0;
       if (p.dir === 'bull') {
         if (after.some((x) => x.c < low(n - back, p.bars))) continue;            // pattern voided
-        if (last.white && last.c > lvl) found.push({ p, at: n - back, status: 'confirmed' });
+        if (last.white && last.c > lvl) found.push({ p, at: n - back, status: 'confirmed', sigAgo });
         else if (back === 1) found.push({ p, at: n - back, status: 'awaiting confirmation' });
       } else if (p.dir === 'bear') {
-        if (last.black && last.c < sig.bot) found.push({ p, at: n - back, status: 'confirmed' });
+        if (last.black && last.c < sig.bot) found.push({ p, at: n - back, status: 'confirmed', sigAgo });
         else if (back === 1) found.push({ p, at: n - back, status: 'awaiting confirmation' });
       }
     }
   }
-  const out = found.map(({ p, at, status }) => {
+  const out = found.map(({ p, at, status, sigAgo }) => {
     const conv = convergence(C, at, p.dir);
     const strength = Math.min(99, Math.round(55 + 10 * p.weight + 6 * conv.notes.length + (status === 'confirmed' ? 6 : 0)));
-    return { name: p.name, dir: p.dir, kind: p.kind, status, strength, convergence: conv.notes, rvol: Number(conv.rvol.toFixed(2)), barsAgo: n - at, patternLow: low(at, p.bars), patternHigh: high(at, p.bars) };
+    return { name: p.name, dir: p.dir, kind: p.kind, status, strength, convergence: conv.notes, rvol: Number(conv.rvol.toFixed(2)), barsAgo: n - at, signalBarsAgo: sigAgo || 0, patternLow: low(at, p.bars), patternHigh: high(at, p.bars) };
   }).sort((a, b) => b.strength - a.strength);
   const actionable = (f) => f.status !== 'awaiting confirmation';
   return {
@@ -402,6 +404,7 @@ function assess(klines, opts = {}) {
   const best = r.bull.filter((f) => f.barsAgo <= 1)[0] || r.bull[0];
   if (!best) { res.vetoes.push('no completed bullish pattern'); return res; }
   res.pattern = best.name; res.status = best.status; res.score = best.strength; res.convergence = best.convergence; res.rvol = best.rvol; res.stop = best.patternLow;
+  res.signalAge = best.signalBarsAgo || 0;   // 0: tradable since the last closed candle; 1: since the one before
   const needConv = best.kind === 'continuation' ? 0 : cfg.minConvergence;
   if (best.convergence.length < needConv && best.name !== 'SPRING') res.vetoes.push('no second technique agrees');
   // trade location: risk = pattern low, objective = nearest resistance above
@@ -429,6 +432,7 @@ function assessShort(klines, opts = {}) {
   const best = r.bear.filter((f) => f.barsAgo <= 1)[0] || r.bear[0];
   if (!best) { res.vetoes.push('no completed bearish pattern'); return res; }
   res.pattern = best.name; res.status = best.status; res.score = best.strength; res.convergence = best.convergence; res.rvol = best.rvol; res.stop = best.patternHigh;
+  res.signalAge = best.signalBarsAgo || 0;
   res.sell = res.vetoes.length === 0;
   return res;
 }
