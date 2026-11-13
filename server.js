@@ -83,10 +83,12 @@ const MANUAL_START_USDT = Number(process.env.MANUAL_START_USDT) || Strategy.MANU
 // shorted (SHORT, the normal process) or, as a paper test, bought and closed only at +0.30% (LONG): Settings > High vol breakdown.
 const BREAKDOWN_SIDES = { SHORT: 'Short (normal exits)', LONG: 'Long, closes only at +0.30% (test)' };
 // Each new autopilot trade is positionPct of account value (1% to 100%, default 20%): Settings > Position size.
-const sizeConfig = () => ({ ...Strategy.FUTURES, positionPct: State.positionPct });
+const sizeConfig = (leverage = 1) => ({ ...Strategy.FUTURES, positionPct: State.positionPct, leverage });
 const State = {
   autopilotEnabled: true,
   positionPct: Strategy.validPositionPct(process.env.POSITION_PCT) || Strategy.FUTURES.positionPct,
+  // Settings > Leverage (v6.8, paper test): off = every trade 1x; on = the autopilot picks 1x to 3x per coin.
+  leverageAuto: ['on', '1', 'true'].includes(String(process.env.LEVERAGE_AUTO || '').toLowerCase()),
   breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
   // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
@@ -120,6 +122,7 @@ const State = {
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
+    leverage: { on: false, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct },
     sizing: { positionPct: Strategy.FUTURES.positionPct, minPct: Strategy.POSITION_SIZE.minPct, maxPct: Strategy.POSITION_SIZE.maxPct },
     breakdown: { side: 'SHORT', label: BREAKDOWN_SIDES.SHORT, longs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' } },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
@@ -463,7 +466,9 @@ function computeEquity() {
   const add = (p) => {
     const px = Number(p.livePriceUSDT || p.entryPriceUSDT) || 0;
     const qty = Number(p.qty) || (Number(p.notionalUSDT) / Number(p.entryPriceUSDT || 1));
-    eq += isShort(p) ? qty * (2 * Number(p.entryPriceUSDT) - px) + (Number(p.fundingUSDT) || 0) : qty * px + (isFutures(p) ? Number(p.fundingUSDT) || 0 : 0);
+    if (!isFutures(p)) { eq += qty * px; return; }
+    const entry = Number(p.entryPriceUSDT), margin = Number(p.marginUSDT) > 0 ? Number(p.marginUSDT) : qty * entry;
+    eq += Math.max(0, margin + (isShort(p) ? qty * (entry - px) : qty * (px - entry)) + (Number(p.fundingUSDT) || 0));   // v6.8: margin-based
   };
   Object.values(State.activePositions || {}).forEach(add);
   Object.values(State.recoveryBags || {}).forEach(add);
@@ -706,7 +711,8 @@ function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
   const sym = pairKey.replace(/USDT$/, '');
   const entry = plan.entryPrice;
   const R = Strategy.EXIT_RULES;
-  const cost = plan.notional * (1 + FUT_FEE_RATE); // 1x margin plus the opening fee
+  const lev = Math.max(1, Number(plan.leverage) || 1), margin = Number(plan.margin) > 0 ? Number(plan.margin) : plan.notional;
+  const cost = margin + plan.notional * FUT_FEE_RATE; // margin plus the opening fee on the whole position (1x: margin = position)
   if (State.portfolio.cashUSDT < cost) {
     logOperation('CASH_GUARD', `Cannot long ${sym}/USDT: need $${cost.toFixed(2)}, free cash $${State.portfolio.cashUSDT.toFixed(2)}.`, 'danger');
     return false;
@@ -714,18 +720,18 @@ function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
   State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT - cost).toFixed(6));
   const bagAt = entry * (1 + R.demotePct / 100);
   State.activePositions[pairKey] = {
-    pair: `${sym}/USDT`, pairSymbol: sym, side: 'LONG', market: 'FUTURES', leverage: Strategy.FUTURES.leverage, strategyVersion: 6,
+    pair: `${sym}/USDT`, pairSymbol: sym, side: 'LONG', market: 'FUTURES', leverage: lev, leverageAtEntry: lev, marginUSDT: margin, strategyVersion: 6,
     openedAt: Date.now(), entryPriceUSDT: entry, livePriceUSDT: entry, lastTickAt: Date.now(),
     qty: plan.qty, notionalUSDT: plan.notional, initialNotionalUSDT: plan.notional,
     initialStopPrice: bagAt, sl: bagAt, stopPct: Number(plan.stopPct.toFixed(3)), riskUSDT: plan.riskUSDT, atrPct: Number(signal.atrPct.toFixed(3)),
     breakevenPrice: entry * (1 + R.shortFloorPct / 100), tp1Price: entry * (1 + R.tp1Pct / 100), targetPrice: entry * 1.03,
-    fundingUSDT: 0, nextFundingAt: 0,
+    liquidationPrice: Strategy.liquidationPrice(entry, 'LONG', lev), fundingUSDT: 0, nextFundingAt: 0,
     peakGainPct: 0, peakHighPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern
   };
   // Breakdown long (test): closes only at its fixed target, never by harvest, trail, scratch or partial.
   const target = opts.targetOnlyPct ? entry * (1 + opts.targetOnlyPct / 100) : 0;
   if (target) Object.assign(State.activePositions[pairKey], { targetOnlyPct: opts.targetOnlyPct, entrySource: opts.entrySource, ratchetStage: 'TARGET_ONLY', breakevenPrice: target, tp1Price: target, targetPrice: target });
-  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper) via [${signal.pattern}] • ${target ? `Closes only at +${opts.targetOnlyPct.toFixed(2)}% ($${formatPrecisePrice(target)})` : 'Min exit +0.20%'} • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
+  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''}) via [${signal.pattern}] • ${target ? `Closes only at +${opts.targetOnlyPct.toFixed(2)}% ($${formatPrecisePrice(target)})` : 'Min exit +0.20%'} • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -736,7 +742,8 @@ function openShort(pairKey, signal, plan, takerBuyRatio) {
   const sym = pairKey.replace(/USDT$/, '');
   const entry = plan.entryPrice;
   const R = Strategy.EXIT_RULES;
-  const cost = plan.notional * (1 + FUT_FEE_RATE); // 1x margin plus the opening fee
+  const lev = Math.max(1, Number(plan.leverage) || 1), margin = Number(plan.margin) > 0 ? Number(plan.margin) : plan.notional;
+  const cost = margin + plan.notional * FUT_FEE_RATE; // margin plus the opening fee on the whole position (1x: margin = position)
   if (State.portfolio.cashUSDT < cost) {
     logOperation('CASH_GUARD', `Cannot short ${sym}/USDT: need $${cost.toFixed(2)}, free cash $${State.portfolio.cashUSDT.toFixed(2)}.`, 'danger');
     return false;
@@ -744,15 +751,15 @@ function openShort(pairKey, signal, plan, takerBuyRatio) {
   State.portfolio.cashUSDT = Number((State.portfolio.cashUSDT - cost).toFixed(6));
   const bagAt = entry * (1 - R.demotePct / 100);
   State.activePositions[pairKey] = {
-    pair: `${sym}/USDT`, pairSymbol: sym, side: 'SHORT', market: 'FUTURES', leverage: Strategy.FUTURES.leverage, strategyVersion: 6,
+    pair: `${sym}/USDT`, pairSymbol: sym, side: 'SHORT', market: 'FUTURES', leverage: lev, leverageAtEntry: lev, marginUSDT: margin, strategyVersion: 6,
     openedAt: Date.now(), entryPriceUSDT: entry, livePriceUSDT: entry, lastTickAt: Date.now(),
     qty: plan.qty, notionalUSDT: plan.notional, initialNotionalUSDT: plan.notional,
     initialStopPrice: bagAt, sl: bagAt, stopPct: Number(plan.stopPct.toFixed(3)), riskUSDT: plan.riskUSDT, atrPct: Number(signal.atrPct.toFixed(3)),
     breakevenPrice: entry * (1 - R.shortFloorPct / 100), tp1Price: entry * (1 - R.tp1Pct / 100), targetPrice: entry * 0.97,
-    liquidationPrice: Strategy.shortLiquidationPrice(entry), fundingUSDT: 0, nextFundingAt: 0,
+    liquidationPrice: Strategy.liquidationPrice(entry, 'SHORT', lev), fundingUSDT: 0, nextFundingAt: 0,
     peakGainPct: 0, peakLowPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern
   };
-  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper) via [${signal.pattern}] • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
+  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''}) via [${signal.pattern}] • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -779,11 +786,21 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   const qtySold = fraction >= 1 ? totalQty : totalQty * fraction;
   const fut = isFutures(pos);
   const fundingShare = fut ? (Number(pos.fundingUSDT) || 0) * (fraction >= 1 ? 1 : fraction) : 0;
-  const proceeds = short ? qtySold * (2 * entry - price) - qtySold * price * FUT_FEE_RATE + fundingShare
-    : fut ? qtySold * price - qtySold * price * FUT_FEE_RATE + fundingShare : qtySold * price * (1 - FEE_RATE);
-  const pnl = short ? Strategy.netPnlShort(qtySold, entry, price) + fundingShare
+  // v6.8: a futures position holds its own margin (1x: the whole position, so these are the old formulas). Closing
+  // returns the margin plus the move, less the exit fee; a liquidation loses all of the margin (isolated), as on Binance.
+  const part = fraction >= 1 ? 1 : fraction;
+  const marginTotal = fut ? (Number(pos.marginUSDT) > 0 ? Number(pos.marginUSDT) : totalQty * entry) : 0;
+  const marginPart = marginTotal * part;
+  const liquidated = fut && typeLabel === 'LIQUIDATED';
+  const move = short ? qtySold * (entry - price) : qtySold * (price - entry);
+  const proceeds = liquidated ? 0
+    : fut ? marginPart + move - qtySold * price * FUT_FEE_RATE + fundingShare : qtySold * price * (1 - FEE_RATE);
+  const pnl = liquidated ? -(marginPart + qtySold * entry * FUT_FEE_RATE)
+    : short ? Strategy.netPnlShort(qtySold, entry, price) + fundingShare
     : fut ? Strategy.netPnlLongFutures(qtySold, entry, price) + fundingShare : Strategy.netPnl(qtySold, entry, price);
   if (fut && fraction < 1) pos.fundingUSDT = Number(((Number(pos.fundingUSDT) || 0) - fundingShare).toFixed(6));
+  if (fut && fraction < 1 && Number(pos.marginUSDT) > 0) pos.marginUSDT = Number((marginTotal - marginPart).toFixed(6));
+  const levAtEntry = fut ? Number(pos.leverageAtEntry || pos.leverage) || 1 : 1;
 
   State.portfolio.cashUSDT = Number((Number(State.portfolio.cashUSDT) + proceeds).toFixed(6));
   State.portfolio.realizedPnL = Number((Number(State.portfolio.realizedPnL || 0) + pnl).toFixed(6));
@@ -813,7 +830,8 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
     holdMinutes: Math.round((Date.now() - Number(pos.openedAt || Date.now())) / 60000),
     feesIncluded: true, // v5 P&L is already net of both 0.10% fees
     strategyVersion: 6,
-    reason: reasonText
+    leverage: levAtEntry,
+    reason: levAtEntry > 1 ? `${reasonText} • ${levAtEntry}x leverage` : reasonText
   };
 
   logOperation(pnl >= 0 ? 'SENTRY_EXIT' : 'RISK_STOP',
@@ -868,9 +886,9 @@ async function checkCandlestickSentry(symbol, futures = false) {
   }
 }
 
-async function checkVeteranOrderFlowAndVSA(symbol) {
+async function checkVeteranOrderFlowAndVSA(symbol, maxAgeMs = 20000) {
   try {
-    const klines = await getCachedKlines(symbol, '5m', 8, 2500, 20000, true);
+    const klines = await getCachedKlines(symbol, '5m', 8, 2500, maxAgeMs, true);
     if (!Array.isArray(klines) || klines.length < 3) {
       return { passed: false, reason: 'Futures data unavailable' };
     }
@@ -901,9 +919,9 @@ async function checkVeteranOrderFlowAndVSA(symbol) {
   }
 }
 
-async function checkMicrostructureMomentumAndVwap(symbol) {
+async function checkMicrostructureMomentumAndVwap(symbol, maxAgeMs = 45000) {
   try {
-    const klines = await getCachedKlines(symbol, '15m', 16, 2500, 45000, true);
+    const klines = await getCachedKlines(symbol, '15m', 16, 2500, maxAgeMs, true);
     if (!Array.isArray(klines) || klines.length < 8) {
       return { passed: false, reason: 'Futures data unavailable' };
     }
@@ -1056,8 +1074,8 @@ async function check1hTrendAlignment(symbol) {
 // -------------------------------------------------------------
 // SHORT ENTRY GATES: the long gates mirrored. These fail closed: no data, no short.
 // -------------------------------------------------------------
-async function checkShortOrderFlow(symbol) {
-  const k = await getCachedKlines(symbol, '5m', 8, 2500, 20000, true).catch(() => null);
+async function checkShortOrderFlow(symbol, maxAgeMs = 20000) {
+  const k = await getCachedKlines(symbol, '5m', 8, 2500, maxAgeMs, true).catch(() => null);
   if (!Array.isArray(k) || k.length < 3) return { passed: false, reason: '5m data unavailable' };
   let vol = 0, buy = 0;
   k.slice(-3).forEach((b) => { vol += parseFloat(b[5]); buy += parseFloat(b[9]); });
@@ -1068,8 +1086,8 @@ async function checkShortOrderFlow(symbol) {
   return { passed: true, takerBuyRatio };
 }
 
-async function checkShortMomentum(symbol) {
-  const k = await getCachedKlines(symbol, '15m', 16, 2500, 45000, true).catch(() => null);
+async function checkShortMomentum(symbol, maxAgeMs = 45000) {
+  const k = await getCachedKlines(symbol, '15m', 16, 2500, maxAgeMs, true).catch(() => null);
   if (!Array.isArray(k) || k.length < 8) return { passed: false, reason: '15m data unavailable' };
   const [o, h, l, c, v] = k[k.length - 1].slice(1, 6).map(parseFloat);
   const change15mPct = o > 0 ? Number((((c - o) / o) * 100).toFixed(2)) : 0;
@@ -1106,6 +1124,15 @@ async function coinTrendAgrees(pairKey, side) {
   return Strategy.coinTrend(Strategy.closedOnly(k).map((b) => parseFloat(b[4]))) === side;
 }
 
+// Settings > Leverage (v6.8): 1x when off; when on, from the coin's 15m ATR on closed candles, as back-tested.
+async function leverageFor(pairKey) {
+  if (!State.leverageAuto) return 1;
+  const k = await getCachedKlines(pairKey, '15m', 16, 2500, 45000, true).catch(() => null);
+  const closed = Array.isArray(k) ? Strategy.closedOnly(k) : [];
+  const atr = closed.length >= 15 ? Strategy.atrPct(Strategy.toBars(closed), 14) : NaN;
+  return Strategy.autoLeverage({ atrPct: atr });
+}
+
 async function evaluateShortEntries(maxBagsLimit) {
   if (!perpetuals.size) {
     throttledNotice('noperps', 'FUTURES', 'Market is bearish, but Binance Futures data is unavailable. No shorts opened.', 'danger', 60000);
@@ -1135,10 +1162,10 @@ async function evaluateShortEntries(maxBagsLimit) {
       if (Number(coin.pricePositionInRange ?? 0.3) > 0.50) continue;
       if (State.subsystems.marketMode.mode === 'NEUTRAL' && !(await coinTrendAgrees(pairKey, 'SHORT'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
 
-      const flow = await checkShortOrderFlow(pairKey);
+      let flow = await checkShortOrderFlow(pairKey);
       if (!flow.passed) { veto(pairKey, 30000, 'FLOW_VETO', flow.reason); continue; }
       if (Number(coin.priceUSDT || 0) >= 0.50 && rangePct < 4.0 && change24h > -0.60) { veto(pairKey, 30000, 'VOL_VETO', `low volatility (range ${rangePct.toFixed(2)}%).`, 'info'); continue; }
-      const mom = await checkShortMomentum(pairKey);
+      let mom = await checkShortMomentum(pairKey);
       if (!mom.passed) { veto(pairKey, 30000, 'MOM_VETO', mom.reason); continue; }
       const trend = await checkShort1hTrend(pairKey);
       if (!trend.passed) { veto(pairKey, 30000, 'TREND_VETO', trend.reason); continue; }
@@ -1147,6 +1174,17 @@ async function evaluateShortEntries(maxBagsLimit) {
       const breakdown = mom.change15mPct <= -0.80 && mom.rvol >= 1.35 && flow.takerBuyRatio <= 48;
       if (!candle.isShortEntry && !breakdown) { veto(pairKey, 30000, 'CANDLE_WAIT', `waiting for a completed bearish pattern on 15m (1h trend ${candle.major}) or a breakdown (15m <= -0.80%).`, 'info'); continue; }
       const label = candle.isShortEntry ? candle.shortPatternName : 'HIGH_VOL_BREAKDOWN';
+      // v6.8: a breakdown is read from the live 15m candle, and the checks above may have used candles up to 45 s
+      // (order flow 20 s) old. Before entering, read both fresh: the breakdown, and every momentum check, must still hold.
+      if (!candle.isShortEntry) {
+        const [fm, ff] = await Promise.all([checkShortMomentum(pairKey, 1000), checkShortOrderFlow(pairKey, 1000)]);
+        if (!fm.passed || !ff.passed || !(fm.change15mPct <= -0.80 && fm.rvol >= 1.35 && ff.takerBuyRatio <= 48)) {
+          const now15 = !fm.passed ? fm.reason : !ff.passed ? ff.reason : `15m ${fm.change15mPct}%, volume ${fm.rvol}x, taker buy ${ff.takerBuyRatio}%`;
+          veto(pairKey, 30000, 'MOM_VETO', `breakdown gone on fresh data: ${now15} (cached: ${mom.change15mPct}%, ${mom.rvol}x, ${flow.takerBuyRatio}%).`, 'info');
+          continue;
+        }
+        mom = fm; flow = ff;
+      }
 
       const book = await fetchRealOrderBookDepth(pairKey, true);
       if (!book) { veto(pairKey, 30000, 'BOOK_VETO', 'futures order book unavailable.'); continue; }
@@ -1157,7 +1195,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       if (!candle.isShortEntry && State.breakdownSide === 'LONG') {
         const ask = book.bestAsk, tPct = Strategy.BREAKDOWN_LONG.targetPct;
         const lsig = await buildEntrySignal(pairKey, ask, 'HIGH_VOL_BREAKDOWN LONG', mom);
-        const lplan = Strategy.planCompoundEntry(lsig, ask, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig());
+        const lplan = Strategy.planCompoundEntry(lsig, ask, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey)));
         if (!lplan.ok) { candidateCooldownMemo.set(pairKey, now + 30000); logOperation('CASH_GUARD', `${pairKey} breakdown long: ${lplan.reason}`, 'warning'); continue; }
         const minNL = perpetuals.get(pairKey)?.minNotional || 5;
         if (lplan.notional < minNL) { candidateCooldownMemo.set(pairKey, now + 300000); logOperation('CASH_GUARD', `${pairKey} breakdown long: Binance minimum for this contract is $${minNL}, position would be $${lplan.notional.toFixed(2)}.`, 'info'); continue; }
@@ -1181,7 +1219,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       }
       const stopPct = Math.min(cfg.maxStopPct, Math.max(structPct, (atr || 0) * cfg.atrStopMult, cfg.minStopPct));
       const signal = { ok: true, pattern: label, refPrice: px, stopPrice: px * (1 - stopPct / 100), stopPct, atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: mom.rvol };
-      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig());
+      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey)));
       if (!plan.ok) { veto(pairKey, 30000, 'CASH_GUARD', plan.reason); continue; }
       const minN = perpetuals.get(pairKey)?.minNotional || 5;
       if (plan.notional < minN) { veto(pairKey, 300000, 'CASH_GUARD', `Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
@@ -1301,7 +1339,7 @@ async function evaluateAutopilotEntries() {
         }
       }
 
-      const orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
+      let orderFlow = await checkVeteranOrderFlowAndVSA(pairKey);
       if (!orderFlow.passed) {
         candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('FLOW_VETO', `${pairKey} halted: ${orderFlow.reason || 'Negative Taker CVD'}`, 'warning');
@@ -1315,7 +1353,7 @@ async function evaluateAutopilotEntries() {
         continue;
       }
 
-      const microMom = await checkMicrostructureMomentumAndVwap(pairKey);
+      let microMom = await checkMicrostructureMomentumAndVwap(pairKey);
       if (!microMom.passed) {
         candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('MOM_VETO', `${pairKey} halted: ${microMom.reason}`, 'warning');
@@ -1344,6 +1382,17 @@ async function evaluateAutopilotEntries() {
         continue;
       }
       const patternLabel = isConfirmedPatternEntry ? candleCheck.bullishPatternName : 'HIGH_VOL_IGNITION';
+      // v6.8: an ignition is read from the live 15m candle (cached up to 45 s, flow 20 s). Confirm it on fresh data first.
+      if (!isConfirmedPatternEntry) {
+        const [fm, ff] = await Promise.all([checkMicrostructureMomentumAndVwap(pairKey, 1000), checkVeteranOrderFlowAndVSA(pairKey, 1000)]);
+        if (!fm.passed || !ff.passed || !(fm.change15mPct >= 0.80 && fm.rvol >= 1.35 && ff.takerBuyRatio >= 52.0)) {
+          const now15 = !fm.passed ? fm.reason : !ff.passed ? ff.reason : `15m +${fm.change15mPct}%, volume ${fm.rvol}x, taker buy ${ff.takerBuyRatio}%`;
+          candidateCooldownMemo.set(pairKey, now + 30000);
+          logOperation('MOM_VETO', `${pairKey} ignition gone on fresh data: ${now15} (cached: +${microMom.change15mPct}%, ${microMom.rvol}x, ${orderFlow.takerBuyRatio}%).`, 'info');
+          continue;
+        }
+        microMom = fm; orderFlow = ff;
+      }
 
       const book = await fetchRealOrderBookDepth(pairKey, true);
       if (!book) {
@@ -1360,7 +1409,7 @@ async function evaluateAutopilotEntries() {
       logOperation('BOOK_CLEAR', `${pairKey} confirmed [${patternLabel}]: OBI ${Math.round(book.obi * 100)}%, Spread ${book.spreadPct.toFixed(2)}%, Taker Buy ${orderFlow.takerBuyRatio}%. Entering...`, 'success');
 
       const signal = await buildEntrySignal(pairKey, book.bestAsk, patternLabel, microMom);
-      const plan = Strategy.planCompoundEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig());
+      const plan = Strategy.planCompoundEntry(signal, book.bestAsk, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey)));
       if (!plan.ok) {
         candidateCooldownMemo.set(pairKey, now + 30000);
         logOperation('CASH_GUARD', `${pairKey}: ${plan.reason}`, 'warning');
@@ -1415,6 +1464,26 @@ async function checkSelfAwareOrderFlow(symbol, futures = false) {
   } catch (e) { return quiet; }
 }
 
+// v6.8: a leveraged trade that moves to a recovery bag gets free cash added to its margin, back to 1x (or as close as
+// free cash allows), so it cannot be liquidated while it waits for +0.30%. Done once, when it becomes a bag (as back-tested).
+function topUpBag(k, bag) {
+  const notional = Number(bag.qty) * Number(bag.entryPriceUSDT), margin = Number(bag.marginUSDT);
+  if (!(margin > 0) || margin >= notional - 0.005) return;
+  const add = Strategy.bagTopUp(margin, notional, Number(State.portfolio.cashUSDT));
+  if (!(add > 0)) {
+    logOperation('RECOVERY', `${bag.pair}: no free cash to add to the bag's margin. It stays ${Number(bag.leverage).toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)}.`, 'warning');
+    return;
+  }
+  State.portfolio.cashUSDT = Number((Number(State.portfolio.cashUSDT) - add).toFixed(6));
+  bag.marginUSDT = Number((margin + add).toFixed(6));
+  const L = notional / bag.marginUSDT;
+  bag.leverage = Number(L.toFixed(2));
+  bag.liquidationPrice = Strategy.liquidationPrice(Number(bag.entryPriceUSDT), isShort(bag) ? 'SHORT' : 'LONG', L);
+  logOperation('RECOVERY', `${bag.pair}: $${add.toFixed(2)} of free cash added to the bag's margin, now ${L <= 1.0001
+    ? `1x (${isShort(bag) ? `liquidation only at $${formatPrecisePrice(bag.liquidationPrice)}, about +99%` : 'no liquidation'})`
+    : `${L.toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)} (not enough free cash for 1x)`}.`, L <= 1.0001 ? 'success' : 'warning');
+}
+
 function demoteToBag(k, pos, price, reason) {
   State.recoveryBags[k] = {
     pair: pos.pair, pairSymbol: pos.pairSymbol, openedAt: pos.openedAt, movedAt: Date.now(),
@@ -1423,9 +1492,10 @@ function demoteToBag(k, pos, price, reason) {
     side: isShort(pos) ? 'SHORT' : 'LONG', market: isFutures(pos) ? 'FUTURES' : 'SPOT', fundingUSDT: pos.fundingUSDT || 0, nextFundingAt: pos.nextFundingAt || 0, liquidationPrice: pos.liquidationPrice,
     targetStep: 'CLOSES AT +0.30%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + (isShort(pos) ? -1 : 1) * Strategy.EXIT_RULES.bagTargetPct / 100),
     troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6,
-    entrySource: pos.entrySource
+    entrySource: pos.entrySource, leverage: pos.leverage, leverageAtEntry: pos.leverageAtEntry, marginUSDT: pos.marginUSDT
   };
   delete State.activePositions[k];
+  if (isFutures(State.recoveryBags[k])) topUpBag(k, State.recoveryBags[k]);
   logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at +0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
@@ -1495,7 +1565,8 @@ async function runPredictiveSentry() {
 
       const entry = Number(pos.entryPriceUSDT);
       const short = isShort(pos);
-      if (short && price >= Number(pos.liquidationPrice)) {
+      const liqPx = Number(pos.liquidationPrice);
+      if (liqPx > 0 && (short ? price >= liqPx : price <= liqPx)) {
         realizeExit('activePositions', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
         continue;
       }
@@ -1557,7 +1628,8 @@ async function runPredictiveSentry() {
       const price = await livePriceFor(k, bag);
       if (!price) continue;
       bag.livePriceUSDT = price;
-      if (isShort(bag) && price >= Number(bag.liquidationPrice)) {
+      const bagLiq = Number(bag.liquidationPrice);
+      if (isFutures(bag) && bagLiq > 0 && (isShort(bag) ? price >= bagLiq : price <= bagLiq)) {
         realizeExit('recoveryBags', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
         continue;
       }
@@ -1835,6 +1907,7 @@ function saveDiskState() {
       tradeLogs: State.tradeLogs.slice(0, 150),
       manual: State.manual,
       positionPct: State.positionPct,
+      leverageAuto: State.leverageAuto,
       breakdownSide: State.breakdownSide,
       breakdownLongs: State.breakdownLongs,
       masterLedgerUrl: State.masterLedgerUrl,
@@ -1855,6 +1928,7 @@ function loadDiskState() {
       if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
       if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
       if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
+      if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
       if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
       if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
       if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
@@ -2121,6 +2195,23 @@ function checkManualLiquidation(sym, price) {
     if (p.symbol === sym && p.side === 'SHORT' && p.liquidationPrice && price >= p.liquidationPrice) closeManual(id, p.liquidationPrice, 'LIQUIDATED');
   });
 }
+
+function syncLeverageStatus() {
+  State.subsystems.leverage = { on: State.leverageAuto, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct };
+}
+
+app.post('/api/leverage', (req, res) => {
+  const v = req.body.on, on = v === true || v === 'true' || v === 'on', off = v === false || v === 'false' || v === 'off';
+  if (!on && !off) return res.status(400).json({ success: false, error: 'on must be true or false' });
+  State.leverageAuto = on;
+  syncLeverageStatus();
+  logOperation('ENTRIES', on
+    ? `Auto leverage ON (test): new trades use 1x to ${Strategy.LEVERAGE.maxLeverage}x from each coin's volatility (${Strategy.LEVERAGE.atrTargetPct} / 15m ATR%). A trade that moves to a recovery bag gets free cash added to its margin, back to 1x. Open positions keep their leverage.`
+    : 'Auto leverage OFF: new trades are 1x. Open positions and bags keep their leverage.', 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, on });
+});
 
 function syncSizingStatus() {
   State.subsystems.sizing = { positionPct: State.positionPct, minPct: Strategy.POSITION_SIZE.minPct, maxPct: Strategy.POSITION_SIZE.maxPct };
@@ -2505,6 +2596,7 @@ wss.on('connection', (ws) => {
 loadDiskState();
 syncBreakdownStatus();
 syncSizingStatus();
+syncLeverageStatus();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
