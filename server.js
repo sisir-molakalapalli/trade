@@ -130,7 +130,7 @@ const State = {
     breakdown: { side: 'SHORT', label: BREAKDOWN_SIDES.SHORT, longs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' } },
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
-    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • Trail • Failing trades move to recovery bags' },
+    predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • From +0.50%, trail 0.20% behind the peak • Failing trades move to recovery bags' },
     recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at +0.30% only', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
@@ -1541,9 +1541,15 @@ function demoteToBag(k, pos, price, reason) {
     troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6,
     entrySource: pos.entrySource, leverage: pos.leverage, leverageAtEntry: pos.leverageAtEntry, marginUSDT: pos.marginUSDT
   };
+  // v6.12: your take profit stays with the trade when it becomes a bag (in place of the bag's +0.30%)
+  const mine = Number(pos.userTpPct) > 0;
+  if (mine) {
+    Object.assign(State.recoveryBags[k], { userTpPct: pos.userTpPct, userTpSetAt: pos.userTpSetAt });
+    Strategy.manageUserTp(State.recoveryBags[k], price, { inBag: true });
+  }
   delete State.activePositions[k];
   if (isFutures(State.recoveryBags[k])) topUpBag(k, State.recoveryBags[k]);
-  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at +0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
+  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at ${mine ? `your take profit +${pos.userTpPct}%` : '+0.30%'} ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
 }
@@ -1571,7 +1577,7 @@ async function refreshExitSignals() {
   try {
     for (const k of Object.keys(State.activePositions || {})) {
       const pos = State.activePositions[k];
-      if (pos.targetOnlyPct) { exitSignals.delete(k); continue; }
+      if (pos.targetOnlyPct || Number(pos.userTpPct) > 0) { exitSignals.delete(k); continue; }
       const entry = Number(pos.entryPriceUSDT), live = Number(pos.livePriceUSDT) || entry, short = isShort(pos);
       const gainPct = (short ? entry - live : live - entry) / entry * 100;
       const R = Strategy.EXIT_RULES;
@@ -1615,6 +1621,19 @@ async function runPredictiveSentry() {
       const liqPx = Number(pos.liquidationPrice);
       if (liqPx > 0 && (short ? price >= liqPx : price <= liqPx)) {
         realizeExit('activePositions', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
+        continue;
+      }
+      // v6.12: your take profit replaces the autopilot's exits for this trade; the -3.50% move to a bag stays.
+      if (Number(pos.userTpPct) > 0) {
+        const r = Strategy.manageUserTp(pos, price);
+        if (r.action === 'EXIT') {
+          const fill = (await executableExitPrice(k, pos)) || price;
+          if (State.activePositions[k] === pos && Strategy.manageUserTp(pos, fill).action === 'EXIT') {
+            realizeExit('activePositions', k, 1, fill, r.reason, `Your take profit +${Number(pos.userTpPct).toFixed(2)}% reached @ $${formatPrecisePrice(fill)}`);
+          }
+        } else if (r.action === 'DEMOTE') {
+          demoteToBag(k, pos, price, r.reason);
+        }
         continue;
       }
       // Breakdown long (test): its +0.30% target on the real bid, or a recovery bag at -3.50%. Nothing else.
@@ -1680,13 +1699,18 @@ async function runPredictiveSentry() {
         realizeExit('recoveryBags', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
         continue;
       }
-      const r = isShort(bag) ? Strategy.manageShortBag(bag, price) : Strategy.manageBag(bag, price);
+      // v6.12: a bag with your take profit closes there instead of at +0.30%
+      const mine = Number(bag.userTpPct) > 0;
+      const manage = (px) => (mine ? Strategy.manageUserTp(bag, px, { inBag: true }) : isShort(bag) ? Strategy.manageShortBag(bag, px) : Strategy.manageBag(bag, px));
+      const r = manage(price);
       if (r.action === 'EXIT') {
         const fill = (await executableExitPrice(k, bag)) || price;
-        const check = isShort(bag) ? Strategy.manageShortBag(bag, fill) : Strategy.manageBag(bag, fill);
+        const check = State.recoveryBags[k] === bag ? manage(fill) : { action: 'HOLD' };
         if (check.action === 'EXIT') {
           const bdl = bag.entrySource === 'BREAKDOWN_LONG';
-          if (realizeExit('recoveryBags', k, 1, fill, r.reason, `Recovery bag${bdl ? ' (breakdown long test)' : ''} closed at +0.30% or better @ $${formatPrecisePrice(fill)}`) && bdl) {
+          const why = mine ? `Recovery bag closed at your take profit +${Number(bag.userTpPct).toFixed(2)}% @ $${formatPrecisePrice(fill)}`
+            : `Recovery bag${bdl ? ' (breakdown long test)' : ''} closed at +0.30% or better @ $${formatPrecisePrice(fill)}`;
+          if (realizeExit('recoveryBags', k, 1, fill, r.reason, why) && bdl && !mine) {
             State.breakdownLongs.bagClosed++; saveDiskState();
           }
         }
@@ -2198,6 +2222,46 @@ app.post('/api/positions/close', async (req, res) => {
   const fill = (await executableExitPrice(pairKey, pos)) || price;
   const trade = realizeExit('activePositions', pairKey, 1, fill, 'MANUAL EXIT', `Manual close at $${formatPrecisePrice(fill)}`);
   res.json({ success: Boolean(trade), trade });
+});
+
+// v6.12: your take profit on autopilot trades, at any time. { pairKey, book? } sets one trade, { all: true } every open
+// position and recovery bag. takeProfitPct 0.1 to 100; null, '' or 0 clears it (the trade goes back to the autopilot's exits).
+app.post('/api/tp', (req, res) => {
+  const body = req.body || {};
+  const tp = Strategy.userTakeProfit(body.takeProfitPct);
+  if (!tp.ok) return res.status(400).json({ success: false, error: tp.reason });
+  const all = body.all === true;
+  if (!all && !body.pairKey) return res.status(400).json({ success: false, error: 'Missing pairKey' });
+  const books = ['activePositions', 'recoveryBags'].filter((b) => all || !body.book || body.book === b);
+  const hits = [];
+  books.forEach((book) => Object.entries(State[book] || {}).forEach(([k, p]) => {
+    if (p && !p.exitInProgress && (all || k === body.pairKey)) hits.push({ book, k, p });
+  }));
+  if (!hits.length) return res.status(404).json({ success: false, error: all ? 'No open positions or bags' : 'Position not found' });
+  hits.forEach(({ book, k, p }) => {
+    const bag = book === 'recoveryBags', px = Number(p.livePriceUSDT) || Number(p.entryPriceUSDT);
+    if (tp.pct) {
+      p.userTpPct = tp.pct; p.userTpSetAt = Date.now(); p.userTpPrice = Strategy.userTpPrice(p);
+      if (bag) Strategy.manageUserTp(p, px, { inBag: true });
+    } else {
+      delete p.userTpPct; delete p.userTpPrice; delete p.userTpSetAt;
+      if (bag) { if (isShort(p)) Strategy.manageShortBag(p, px); else Strategy.manageBag(p, px); }   // the bag's own +0.30% target again
+    }
+    if (!all) {
+      logOperation('SENTRY', tp.pct
+        ? `${p.pair}: your take profit +${tp.pct}% ($${formatPrecisePrice(p.userTpPrice)}). It closes only there${bag ? ', in place of the bag\'s +0.30%' : '; the autopilot\'s exits are off for it, the -3.50% move to a bag stays'}.`
+        : `${p.pair}: your take profit removed. ${bag ? 'The bag closes at +0.30% again' : 'Back to the autopilot\'s exits'}.`, 'info');
+    }
+  });
+  if (all) {
+    logOperation('SENTRY', tp.pct
+      ? `Your take profit +${tp.pct}% set on ${hits.length} open trade${hits.length === 1 ? '' : 's'} (${hits.map((h) => h.p.pair).join(', ')}). Each closes only there; the autopilot's exits are off for them, the -3.50% move to a bag stays.`
+      : `Your take profit removed from ${hits.length} open trade${hits.length === 1 ? '' : 's'}. Back to the autopilot's exits (bags: +0.30%).`, 'info');
+  }
+  saveDiskState();
+  broadcastStateUpdate();
+  kickSentry();   // a take profit the price has already passed closes on this pass, at what the book pays
+  res.json({ success: true, takeProfitPct: tp.pct, updated: hits.map(({ book, k, p }) => ({ book, pairKey: k, pair: p.pair, userTpPct: p.userTpPct || null, userTpPrice: p.userTpPrice || null })) });
 });
 
 // -------------------------------------------------------------
