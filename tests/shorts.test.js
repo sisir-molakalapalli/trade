@@ -42,7 +42,8 @@ test('short never exits in loss, and moves to a bag at -3.50%', () => {
 test('short locks profit below entry and trails down', () => {
   const p = shortPos();
   S.manageShort(p, 99.3, {}, 2000);
-  assert.strictEqual(p.ratchetStage, 'PROFIT_LOCKED');
+  // v6.13: from +0.50% the stop trails 0.20% behind the peak: +0.70% peak -> +0.50% (99.5), as a trail
+  assert.strictEqual(p.ratchetStage, 'DYNAMIC_TRAIL');
   assert.ok(Math.abs(p.sl - 99.5) < 1e-6);
   assert.strictEqual(S.manageShort(p, 99.51, {}, 3000).action, 'EXIT');
   const q = shortPos();
