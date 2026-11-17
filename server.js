@@ -1900,6 +1900,23 @@ async function syncTradesFromGoogleSheets() {
     State.ledgerSync = answered ? { okAt: Date.now(), triedAt: Date.now(), rows: fetchedTrades.length, note: '' }
       : { ...State.ledgerSync, triedAt: Date.now(), note: 'the sheet did not answer with trades' };
 
+    // v6.16: our ledger script answers { success: true, trades: [...] }. That answer is the trade list, so a row deleted in
+    // the sheet leaves the app here (a trade closed in the last hour that the sheet has not shown yet is kept).
+    if (data && data.success === true && Array.isArray(data.trades)) {
+      const { trades, removed } = Strategy.ledgerReconcile(fetchedTrades, State.tradeLogs || []);
+      State.tradeLogs = sanitizeAndAuditTradeHistory(trades);
+      State.ledgerSync.removed = removed.length;
+      if (removed.length) {
+        const names = removed.slice(0, 5).map((t) => `${t.pair} ${t.date || ''}`.trim()).join(', ');
+        logOperation('LEDGER', `${removed.length} trade${removed.length === 1 ? '' : 's'} deleted in your sheet ${removed.length === 1 ? 'was' : 'were'} removed from the trade list (${names}${removed.length > 5 ? ', ...' : ''}). Balance and open positions are unchanged.`, 'info');
+        console.log(`[Sync Ledger] Removed ${removed.length} trades that are no longer in the sheet:`, removed.map((t) => `${t.id} ${t.pair} ${t.date} ${t.time} ${t.pnlUSDT}`).join(' | '));
+      }
+      saveDiskState();
+      broadcastStateUpdate();
+      console.log(`[Sync Ledger] ${State.tradeLogs.length} trades, as in the sheet (${fetchedTrades.length} rows).`);
+      return State.tradeLogs;
+    }
+
     if (fetchedTrades.length > 0) {
       // v6.11: for a trade the engine holds, its own record wins: the sheet has no side / market / funding / leverage
       // columns and gives a size worked back from the net P&L (15-45% too small). The sheet adds the trades the engine
@@ -2269,12 +2286,15 @@ app.post('/api/trades/purge-empty', (req, res) => {
   res.json({ success: true, trades: State.tradeLogs });
 });
 
+// v6.16: the app's sync button and its 2-minute sync come here, so the engine (which holds each trade's exact record)
+// does the matching and the app shows the result. sheet.okAt tells the app whether the sheet answered this time.
 app.post('/api/trades/sync-strict-sheet', async (req, res) => {
+  const t0 = Date.now();
   try {
     const trades = await syncTradesFromGoogleSheets();
-    res.json({ success: true, count: trades.length, trades });
+    res.json({ success: true, count: trades.length, trades, sheet: { ...State.ledgerSync, answered: State.ledgerSync.okAt >= t0 } });
   } catch (err) {
-    res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs });
+    res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs, sheet: { ...State.ledgerSync, answered: false } });
   }
 });
 
@@ -2923,7 +2943,7 @@ server.listen(PORT, '0.0.0.0', () => {
   connectBinanceGlobalStream();
 });
 
-// The engine writes its own trades, so this only picks up edits made in the sheet.
+// The engine writes its own trades, so this picks up edits and (v6.16) deletions made in the sheet.
 setInterval(() => {
   syncTradesFromGoogleSheets().catch(() => {});
 }, 600000);
