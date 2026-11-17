@@ -716,8 +716,25 @@ const EXIT_RULES = {
   earlyTrailAtPct: 0.50, earlyTrailPct: 0.20,
   tp1Pct: 1.80, runnerTrailPct: 0.50, scratchMinutes: 45,
   demotePct: -3.50,
-  bagTargetPct: 0.30, minPartialUSDT: 10
+  bagTargetPct: 0.30, minPartialUSDT: 10,
+  // v6.17: one hour after a trade moved to a recovery bag, the bag closes once the price is back to -2.00% (a loss)
+  bagCutPct: -2.00, bagCutAfterMin: 60
 };
+
+/**
+ * v6.17: what a recovery bag closes at now. For its first `bagCutAfterMin` minutes (from the move to the bag), +0.30%
+ * as before; from then on `bagCutPct` (-2.00%). Back test (180 days, 47 and 115 coins, both bar orders): bags reach
+ * -2.00% far more often and sooner than +0.30% (98% ever, 75% within a day, against 92% and 40%), and freeing the money
+ * and the bag slots more than paid for the losses. Starting the -2.00% one hour in beat starting it at once in 13 of 16
+ * checks; 8 hours or later lost most of the gain. A bag with no move time (from an old build) counts from its opening.
+ */
+function bagStage(bag, now = Date.now(), R = EXIT_RULES) {
+  const since = num(bag && bag.movedAt) || num(bag && bag.openedAt);
+  const cutAt = since > 0 ? since + R.bagCutAfterMin * 60000 : 0;
+  const cut = cutAt > 0 && now >= cutAt;
+  return { pct: cut ? R.bagCutPct : R.bagTargetPct, cut, cutAt };
+}
+const pctLabel = (p) => `${p >= 0 ? '+' : ''}${p.toFixed(2)}%`;
 
 /**
  * @param signals { bearishPattern: string|null, peakExhausted: bool, upsideDead: bool }
@@ -768,17 +785,19 @@ function manageNoLoss(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES
   return { action: 'HOLD' };
 }
 
-/** A recovery bag closes only at entry +0.30% or better. */
-function manageBag(bag, price, R = EXIT_RULES) {
+/** A recovery bag closes at entry +0.30% or better in its first hour, then (v6.17) at -2.00% or better. */
+function manageBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const entry = num(bag.entryPriceUSDT);
   if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
   // A futures bag also has to earn back any funding it paid. Spot bags never pay funding.
   const notional = num(bag.qty) * entry;
   const fundingCostPct = bag.market === 'FUTURES' && notional > 0 ? Math.max(0, -(num(bag.fundingUSDT) || 0) / notional * 100) : 0;
-  bag.targetExitPriceUSDT = entry * (1 + (R.bagTargetPct + fundingCostPct) / 100);
-  bag.targetStep = 'CLOSES AT +0.30%';
+  const st = bagStage(bag, now, R);
+  bag.targetExitPriceUSDT = entry * (1 + (st.pct + fundingCostPct) / 100);
+  bag.targetStep = `CLOSES AT ${pctLabel(st.pct)}`;
+  bag.cutAt = st.cutAt;
   bag.troughPrice = Math.min(num(bag.troughPrice) || price, price);
-  return price >= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
+  return price >= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: st.cut ? `BAG CUT ${pctLabel(st.pct)}` : 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
 }
 
 /* =========================================================================
@@ -853,6 +872,34 @@ function evaluateMarketMode(btc1h, coins1h = [], R = MODE_RULES) {
   if (now.mode === prev.mode && now.mode === 'BEAR') return { ...base, mode: 'BEAR', side: 'SHORT', reason: `BTC downtrend and only ${pct} of coins above their 1h EMA50` };
   const reason = now.mode !== 'NEUTRAL' ? `${now.mode === 'BULL' ? 'Bullish' : 'Bearish'} for one hour, waiting for a second hour` : `Mixed market: ${pct} of coins above their 1h EMA50`;
   return { ...base, mode: 'NEUTRAL', side: 'BOTH', reason };
+}
+
+/**
+ * v6.17: the last BULL or BEAR the market mode gave (two closed hours in a row, as evaluateMarketMode needs), looking
+ * back through the 1h history it reads, or null if there was none in it. Used once after a start; afterwards the
+ * engine remembers each BULL / BEAR as it happens.
+ */
+function lastTrendMode(btc1h, coins1h = [], R = MODE_RULES, maxBack = 120) {
+  const btc = Array.isArray(btc1h) ? toBars(btc1h) : [];
+  const coins = (coins1h || []).filter(Array.isArray).map(toBars);
+  for (let back = 0; back <= maxBack && btc.length - 2 - back >= 60; back++) {
+    const a = modeAt(btc, coins, back, R);
+    if (a.mode !== 'NEUTRAL' && a.mode === modeAt(btc, coins, back + 1, R).mode) return a.mode;
+  }
+  return null;
+}
+
+/**
+ * v6.17: a NEUTRAL market that came after a BULL one, with BTC's last closed 1h candle below its 1h EMA50: the
+ * autopilot opens only shorts, each still needing its own 1h downtrend (as in any neutral market); no new longs.
+ * Back test (180 days, 47 and 115 coins, both bar orders, with the 1-hour -2.00% bag close): in those hours shorts made
+ * 0.21% to 0.59% a trade and longs 0.08% to 0.22%, in every run and both halves; shorts only raised the average end in
+ * all 8 halves and passed both halves on average and worst start in 3 of 4 runs. The mirror (longs only after BEAR
+ * with BTC above the EMA50) did not hold up: there longs and shorts did about the same.
+ */
+function neutralShortsOnly(mode, lastTrend) {
+  return Boolean(mode && mode.mode === 'NEUTRAL' && mode.side === 'BOTH' && lastTrend === 'BULL'
+    && num(mode.btcClose) > 0 && num(mode.ema50) > 0 && num(mode.btcClose) < num(mode.ema50));
 }
 
 /**
@@ -1170,15 +1217,17 @@ function manageShort(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES)
 }
 
 /** A short bag closes at 0.30% below entry. Funding it has paid moves the target further, so the close is still not a loss. */
-function manageShortBag(bag, price, R = EXIT_RULES) {
+function manageShortBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const entry = num(bag.entryPriceUSDT);
   if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
   const notional = num(bag.qty) * entry;
   const fundingCostPct = notional > 0 ? Math.max(0, -(num(bag.fundingUSDT) || 0) / notional * 100) : 0;
-  bag.targetExitPriceUSDT = entry * (1 - (R.bagTargetPct + fundingCostPct) / 100);
-  bag.targetStep = 'CLOSES AT +0.30%';
+  const st = bagStage(bag, now, R);
+  bag.targetExitPriceUSDT = entry * (1 - (st.pct + fundingCostPct) / 100);
+  bag.targetStep = `CLOSES AT ${pctLabel(st.pct)}`;
+  bag.cutAt = st.cutAt;
   bag.troughPrice = Math.max(num(bag.troughPrice) || price, price);
-  return price <= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
+  return price <= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: st.cut ? `BAG CUT ${pctLabel(st.pct)}` : 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
 }
 
 /* =========================================================================
@@ -1239,6 +1288,8 @@ module.exports = {
   MODE_RULES,
   FUTURES,
   evaluateMarketMode,
+  lastTrendMode,
+  neutralShortsOnly,
   SHORT_RULES,
   MANUAL,
   manualOpenPlan,
@@ -1281,6 +1332,7 @@ module.exports = {
   EXIT_RULES,
   manageNoLoss,
   manageBag,
+  bagStage,
   BREAKDOWN_LONG,
   manageTargetLong
 };
