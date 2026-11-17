@@ -1037,6 +1037,26 @@ function liquidationPrice(entryPrice, side, leverage = 1, R = LEVERAGE) {
   return side === 'SHORT' ? (entryPrice * (1 + 1 / L)) / (1 + m) : (entryPrice * (1 - 1 / L)) / (1 - m);
 }
 
+/**
+ * v6.14: which of the engine's own trade records a row read back from the Google Sheet is. By its id first (same coin);
+ * a row whose id the engine does not hold falls back to the same coin, day and minute at the same entry price (to
+ * 0.001% of the price). The old rule took the first record of the coin on that day with an entry within a fixed $0.0001,
+ * about 3% on a $0.003 coin, so two PUMP trades on one day took each other's size. Returns the record or null.
+ */
+function ledgerMatch(local, row) {
+  const list = Array.isArray(local) ? local : [];
+  if (!row || typeof row !== 'object') return null;
+  const id = num(row.id), pair = row.pair, entry = num(row.entryPriceUSDT);
+  if (id > 0) {
+    const hit = list.find((x) => x && num(x.id) === id && x.pair === pair);
+    if (hit) return hit;
+  }
+  const minute = String(row.time || '').slice(0, 5);
+  if (!minute || !(entry > 0)) return null;
+  return list.find((x) => x && x.pair === pair && x.date === row.date && String(x.time || '').slice(0, 5) === minute
+    && Math.abs(num(x.entryPriceUSDT) - entry) <= entry * 1e-5) || null;
+}
+
 /** Free cash to add to a bag's margin to bring it back to 1x: all that is needed, or as much as there is. */
 function bagTopUp(marginUSDT, notionalUSDT, freeCashUSDT) {
   const need = num(notionalUSDT) - num(marginUSDT), free = num(freeCashUSDT) - 0.01;
@@ -1211,6 +1231,7 @@ module.exports = {
   autoLeverage,
   liquidationPrice,
   bagTopUp,
+  ledgerMatch,
   POSITION_SIZE,
   validPositionPct,
   netPnlLongFutures,
