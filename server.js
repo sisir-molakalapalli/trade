@@ -5,8 +5,8 @@
  * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
  * No orders are sent to Binance from this file.
  *
- * Exits: the engine never closes below +0.30% (long) or +0.20% (short). A failing position moves to a Spot
- * Recovery Bag, which closes only at +0.30%. See CHANGES.md v5.8.
+ * Exits: the engine never closes below +0.30% (long) or +0.20% (short). A failing position moves to a Recovery Bag,
+ * which closes at +0.30% in its first hour and from then on at -2.00% (v6.17). See CHANGES.md v5.8 and v6.17.
  * Strategy logic lives in strategy.js (shared with backtest.js).
  * =========================================================================
  */
@@ -117,6 +117,7 @@ const State = {
   activePositions: {},
   recoveryBags: {},
   ledgerSync: { okAt: 0, triedAt: 0, rows: 0, note: 'not read yet' },   // v6.11: last read of the Google Sheet ledger
+  lastTrendMode: null,   // v6.17: the last BULL / BEAR market mode (for "neutral after bullish: shorts only")
   tradeLogs: [],
   universe: {},
   cooldowns: {},
@@ -141,7 +142,7 @@ const State = {
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • From +0.50%, trail 0.20% behind the peak • Failing trades move to recovery bags' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at +0.30% only', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at +0.30% in their first hour, then at -2.00%', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -326,11 +327,13 @@ async function getKlinesStrict(symbol, interval, limit) {
 // A trade against the market mode's side needs the coin's own 1h trend to agree, as every trade in NEUTRAL does.
 function tradeSide(mode = State.subsystems.marketMode) {
   if (!mode || !mode.side || mode.side === 'NONE') return 'NONE';
+  if (mode.shortsOnly) return 'SHORT';   // v6.17: neutral after bullish with BTC below its 1h EMA50 (also with Both sides on)
   return State.bothSides ? 'BOTH' : mode.side;
 }
 function sideText(mode) {
   const ts = tradeSide(mode);
   if (ts === 'NONE') return 'No new trades.';
+  if (mode.shortsOnly) return 'Autopilot opens only futures shorts, where a coin\'s own 1h trend is down. No new longs.';
   if (ts === 'LONG') return 'Autopilot opens futures longs.';
   if (ts === 'SHORT') return 'Autopilot opens futures shorts.';
   if (mode.side === 'BOTH') return 'Autopilot follows each coin\'s own 1h trend.';
@@ -343,10 +346,17 @@ async function refreshMarketMode(tickers) {
     .filter((t) => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && !/^(USDC|FDUSD|TUSD|EUR|USD1|RLUSD|PAXG)/.test(t.symbol))
     .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume)).slice(0, 30).map((t) => t.symbol);
   const [btc, ...coins] = await Promise.all(['BTCUSDT', ...top].map((s) => getKlinesStrict(s, '1h', 200)));
-  const r = Strategy.evaluateMarketMode(btc ? Strategy.closedOnly(btc) : null, coins.filter(Boolean).map((k) => Strategy.closedOnly(k)));
-  const before = State.subsystems.marketMode.mode;
+  const btcC = btc ? Strategy.closedOnly(btc) : null, coinsC = coins.filter(Boolean).map((k) => Strategy.closedOnly(k));
+  let r = Strategy.evaluateMarketMode(btcC, coinsC);
+  // v6.17: remember the last BULL / BEAR. After a start it is read once from the 1h history (up to about 5 days back).
+  if (r.mode === 'BULL' || r.mode === 'BEAR') State.lastTrendMode = r.mode;
+  else if (!State.lastTrendMode && btcC) State.lastTrendMode = Strategy.lastTrendMode(btcC, coinsC);
+  const shortsOnly = Strategy.neutralShortsOnly(r, State.lastTrendMode);
+  if (shortsOnly) r = { ...r, reason: `${r.reason}; came after a bullish market and BTC is below its 1h EMA50, so shorts only` };
+  r = { ...r, shortsOnly, lastTrend: State.lastTrendMode };
+  const before = State.subsystems.marketMode.mode, beforeShorts = Boolean(State.subsystems.marketMode.shortsOnly);
   State.subsystems.marketMode = { ...r, tradeSide: tradeSide(r), breadth: r.breadth === null || r.breadth === undefined ? null : Number(r.breadth.toFixed(2)), updatedAt: Date.now() };
-  if (before !== r.mode) {
+  if (before !== r.mode || beforeShorts !== shortsOnly) {
     logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${sideText(r)} Open positions keep their exits.`, 'warning');
   }
   return r;
@@ -815,9 +825,11 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   if (!pos || pos.exitInProgress || tradingPaused()) return null;
 
   const entry = Number(pos.entryPriceUSDT);
-  // Hard rule: only the user's own manual close can realize a loss.
+  // Hard rule: only the user's own manual close can realize a loss. v6.17: and a recovery bag's -2.00% close
+  // (Strategy.bagStage), from an hour after the move to the bag; nothing else.
   const short = isShort(pos);
-  if (!/MANUAL|LIQUIDATED/.test(typeLabel) && (short ? price > entry : price < entry)) {
+  const bagCut = bookName === 'recoveryBags' && /^BAG CUT /.test(typeLabel);
+  if (!/MANUAL|LIQUIDATED/.test(typeLabel) && !bagCut && (short ? price > entry : price < entry)) {
     logOperation('SENTRY', `${pos.pair}: blocked ${typeLabel} below entry. Position stays open.`, 'warning');
     return null;
   }
@@ -1550,6 +1562,7 @@ function demoteToBag(k, pos, price, reason) {
     notionalUSDT: pos.notionalUSDT, qty: pos.qty,
     side: isShort(pos) ? 'SHORT' : 'LONG', market: isFutures(pos) ? 'FUTURES' : 'SPOT', fundingUSDT: pos.fundingUSDT || 0, nextFundingAt: pos.nextFundingAt || 0, liquidationPrice: pos.liquidationPrice,
     targetStep: 'CLOSES AT +0.30%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + (isShort(pos) ? -1 : 1) * Strategy.EXIT_RULES.bagTargetPct / 100),
+    cutAt: Date.now() + Strategy.EXIT_RULES.bagCutAfterMin * 60000,   // v6.17: from here the bag closes at -2.00%
     troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6,
     entrySource: pos.entrySource, leverage: pos.leverage, leverageAtEntry: pos.leverageAtEntry, marginUSDT: pos.marginUSDT
   };
@@ -1561,7 +1574,7 @@ function demoteToBag(k, pos, price, reason) {
   }
   delete State.activePositions[k];
   if (isFutures(State.recoveryBags[k])) topUpBag(k, State.recoveryBags[k]);
-  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at ${mine ? `your take profit +${pos.userTpPct}%` : '+0.30%'} ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}).`, 'warning');
+  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at ${mine ? `your take profit +${pos.userTpPct}%` : `+0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}) in the next hour, then at ${Strategy.EXIT_RULES.bagCutPct.toFixed(2)}%`}${mine ? ` ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)})` : ''}.`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
 }
@@ -1699,7 +1712,7 @@ async function runPredictiveSentry() {
       }
     }
 
-    // ---- recovery bags: close at +0.30%, never in loss ----
+    // ---- recovery bags: close at +0.30% in the first hour, then (v6.17) at -2.00% ----
     for (const k of Object.keys(State.recoveryBags || {})) {
       const bag = State.recoveryBags[k];
       if (!bag || bag.exitInProgress) continue;
@@ -1719,8 +1732,9 @@ async function runPredictiveSentry() {
         const fill = (await executableExitPrice(k, bag)) || price;
         const check = State.recoveryBags[k] === bag ? manage(fill) : { action: 'HOLD' };
         if (check.action === 'EXIT') {
-          const bdl = bag.entrySource === 'BREAKDOWN_LONG';
+          const bdl = bag.entrySource === 'BREAKDOWN_LONG', cut = /^BAG CUT /.test(r.reason);
           const why = mine ? `Recovery bag closed at your take profit +${Number(bag.userTpPct).toFixed(2)}% @ $${formatPrecisePrice(fill)}`
+            : cut ? `Recovery bag${bdl ? ' (breakdown long test)' : ''} closed at ${Strategy.EXIT_RULES.bagCutPct.toFixed(2)}% or better, ${Math.round((Date.now() - Number(bag.movedAt || bag.openedAt)) / 60000)} min after it moved to the bag @ $${formatPrecisePrice(fill)}`
             : `Recovery bag${bdl ? ' (breakdown long test)' : ''} closed at +0.30% or better @ $${formatPrecisePrice(fill)}`;
           if (realizeExit('recoveryBags', k, 1, fill, r.reason, why) && bdl && !mine) {
             State.breakdownLongs.bagClosed++; saveDiskState();
@@ -2031,7 +2045,8 @@ function persistableState(keepTrades = 150, live = false) {
     breakdownLongs: State.breakdownLongs,
     masterLedgerUrl: State.masterLedgerUrl,
     learningSheetUrl: State.learningSheetUrl,
-    capitalResetId: State.capitalResetId || CAPITAL_RESET_ID
+    capitalResetId: State.capitalResetId || CAPITAL_RESET_ID,
+    lastTrendMode: State.lastTrendMode
   };
   if (live) Object.assign(data, { autopilotEnabled: State.autopilotEnabled, cooldowns: State.cooldowns, usdtToInrRate: State.usdtToInrRate, marketMode: State.subsystems.marketMode });
   return data;
@@ -2067,6 +2082,7 @@ function applyPersistedState(parsed, live = false) {
     State.learningSheetUrl = 'https://script.google.com/macros/s/AKfycbwut72lTkCVcqIV2k7YlzlsIOwO3GXCKqlF-4UBxvTvJHckJApKKxzbfFp5JN0VLND8/exec';
   }
   State.capitalResetId = parsed.capitalResetId;
+  if (parsed.lastTrendMode === 'BULL' || parsed.lastTrendMode === 'BEAR') State.lastTrendMode = parsed.lastTrendMode;
   if (live) {
     if (typeof parsed.autopilotEnabled === 'boolean') State.autopilotEnabled = parsed.autopilotEnabled;
     if (parsed.cooldowns && typeof parsed.cooldowns === 'object') State.cooldowns = parsed.cooldowns;
@@ -2392,18 +2408,18 @@ app.post('/api/tp', (req, res) => {
       if (bag) Strategy.manageUserTp(p, px, { inBag: true });
     } else {
       delete p.userTpPct; delete p.userTpPrice; delete p.userTpSetAt;
-      if (bag) { if (isShort(p)) Strategy.manageShortBag(p, px); else Strategy.manageBag(p, px); }   // the bag's own +0.30% target again
+      if (bag) { if (isShort(p)) Strategy.manageShortBag(p, px); else Strategy.manageBag(p, px); }   // the bag's own target again (+0.30%, or -2.00% after its first hour)
     }
     if (!all) {
       logOperation('SENTRY', tp.pct
-        ? `${p.pair}: your take profit +${tp.pct}% ($${formatPrecisePrice(p.userTpPrice)}). It closes only there${bag ? ', in place of the bag\'s +0.30%' : '; the autopilot\'s exits are off for it, the -3.50% move to a bag stays'}.`
-        : `${p.pair}: your take profit removed. ${bag ? 'The bag closes at +0.30% again' : 'Back to the autopilot\'s exits'}.`, 'info');
+        ? `${p.pair}: your take profit +${tp.pct}% ($${formatPrecisePrice(p.userTpPrice)}). It closes only there${bag ? ', in place of the bag\'s own target (+0.30%, -2.00% after its first hour)' : '; the autopilot\'s exits are off for it, the -3.50% move to a bag stays'}.`
+        : `${p.pair}: your take profit removed. ${bag ? `The bag is back on its own target: ${String(p.targetStep || '').toLowerCase()}` : 'Back to the autopilot\'s exits'}.`, 'info');
     }
   });
   if (all) {
     logOperation('SENTRY', tp.pct
       ? `Your take profit +${tp.pct}% set on ${hits.length} open trade${hits.length === 1 ? '' : 's'} (${hits.map((h) => h.p.pair).join(', ')}). Each closes only there; the autopilot's exits are off for them, the -3.50% move to a bag stays.`
-      : `Your take profit removed from ${hits.length} open trade${hits.length === 1 ? '' : 's'}. Back to the autopilot's exits (bags: +0.30%).`, 'info');
+      : `Your take profit removed from ${hits.length} open trade${hits.length === 1 ? '' : 's'}. Back to the autopilot's exits (bags: +0.30% in their first hour, then -2.00%).`, 'info');
   }
   saveDiskState();
   broadcastStateUpdate();
