@@ -67,6 +67,16 @@ const Strategy = require('./strategy');
 const PORT = process.env.PORT || 3000;
 const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
 
+// v6.15: a new build takes over the open trades of the build it replaces. On Render a deploy starts the new instance
+// while the old one still answers the public URL, and the new instance's disk starts empty. Before it opens its port,
+// the new instance asks the old one (through the public URL, which still reaches it) to pause trading and hand over its
+// whole account (POST /api/handoff). The old one stays paused; it resumes only if the new build never goes live.
+const BOOT_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const HANDOFF_URL = String(process.env.HANDOFF_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
+const Handover = { ready: false, frozen: false, to: '', at: 0, how: 'none', from: '', restoredAt: 0, note: '' };
+// Nothing may open, close or change a trade while this build is starting or after it handed its account over.
+const tradingPaused = () => !Handover.ready || Handover.frozen;
+
 // Paper account size. On the first boot with a new CAPITAL_RESET_ID the saved account is
 // re-based so total value (cash + open positions) equals STARTING_EQUITY_USDT.
 const STARTING_EQUITY_USDT = Number(process.env.STARTING_EQUITY_USDT) || 110;
@@ -437,7 +447,7 @@ async function fetchFuturesPrice(pairKey) {
 // Funding is booked per position when each settlement passes. Positive rate: shorts receive it, longs pay it.
 let fundingBusy = false;
 async function settleFunding() {
-  if (fundingBusy) return;
+  if (fundingBusy || tradingPaused()) return;
   fundingBusy = true;
   try {
     const held = [...Object.entries(State.activePositions || {}), ...Object.entries(State.recoveryBags || {})].filter(([, p]) => isFutures(p))
@@ -735,6 +745,7 @@ async function runDynamicScreener() {
 const FEE_RATE = Strategy.CONFIG.feePct / 100;
 
 function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
+  if (tradingPaused()) return false;
   const sym = pairKey.replace(/USDT$/, '');
   const entry = plan.entryPrice;
   const R = Strategy.EXIT_RULES;
@@ -766,6 +777,7 @@ function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
 }
 
 function openShort(pairKey, signal, plan, takerBuyRatio) {
+  if (tradingPaused()) return false;
   const sym = pairKey.replace(/USDT$/, '');
   const entry = plan.entryPrice;
   const R = Strategy.EXIT_RULES;
@@ -800,7 +812,7 @@ function openShort(pairKey, signal, plan, takerBuyRatio) {
 function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   const bookObj = State[bookName];
   const pos = bookObj && bookObj[key];
-  if (!pos || pos.exitInProgress) return null;
+  if (!pos || pos.exitInProgress || tradingPaused()) return null;
 
   const entry = Number(pos.entryPriceUSDT);
   // Hard rule: only the user's own manual close can realize a loss.
@@ -1293,7 +1305,7 @@ async function buildEntrySignal(pairKey, price, pattern, microMom) {
 }
 
 async function evaluateAutopilotEntries() {
-  if (!State.autopilotEnabled || isEvaluatingEntries) return;
+  if (!State.autopilotEnabled || isEvaluatingEntries || tradingPaused()) return;
 
   const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
   const maxBagsLimit = State.tradeFrequencyController?.maxRecoveryBagsLimit || 5;
@@ -1604,7 +1616,7 @@ function kickSentry() {
 }
 
 async function runPredictiveSentry() {
-  if (sentryBusy) return;
+  if (sentryBusy || tradingPaused()) return;
   sentryBusy = true;
   try {
     // ---- active positions ----
@@ -1816,7 +1828,9 @@ function sanitizeAndAuditTradeHistory(logs) {
     const cleanDate = normalizeDateToIndianFormat(t.date, tradeId, t.time);
     const cleanTime = String(t.time || '').trim() || '00:00:00';
 
-    const existingLocal = (State.tradeLogs || []).find(x => x.id === tradeId || (x.pair === pair && x.date === cleanDate && Math.abs(Number(x.entryPriceUSDT || 0) - entry) < 0.0001));
+    // v6.14: the engine's own record of this trade, by id first (the old fixed $0.0001 price window matched other trades
+    // of a cheap coin on the same day and gave this row their size)
+    const existingLocal = Strategy.ledgerMatch(State.tradeLogs, { id: tradeId, pair, date: cleanDate, time: cleanTime, entryPriceUSDT: entry });
     let notional = existingLocal && existingLocal.notionalUSDT && existingLocal.notionalUSDT !== 50
       ? Number(existingLocal.notionalUSDT)
       : Number(t.notionalUSDT || t['Notional (USDT)'] || t.notional || 0);
@@ -1985,53 +1999,68 @@ async function recordTradeToCloudLedger(trade, { announce = true } = {}) {
   return { success: true };
 }
 
+// Everything the account needs to carry on: saved to disk, and (v6.15, with the live extras) handed to the next build.
+function persistableState(keepTrades = 150, live = false) {
+  const data = {
+    portfolio: State.portfolio,
+    activePositions: State.activePositions,
+    recoveryBags: State.recoveryBags,
+    tradeLogs: State.tradeLogs.slice(0, keepTrades),
+    manual: State.manual,
+    positionPct: State.positionPct,
+    leverageAuto: State.leverageAuto,
+    bothSides: State.bothSides,
+    breakdownSide: State.breakdownSide,
+    breakdownLongs: State.breakdownLongs,
+    masterLedgerUrl: State.masterLedgerUrl,
+    learningSheetUrl: State.learningSheetUrl,
+    capitalResetId: State.capitalResetId || CAPITAL_RESET_ID
+  };
+  if (live) Object.assign(data, { autopilotEnabled: State.autopilotEnabled, cooldowns: State.cooldowns, usdtToInrRate: State.usdtToInrRate, marketMode: State.subsystems.marketMode });
+  return data;
+}
+
 function saveDiskState() {
   try {
-    const data = {
-      portfolio: State.portfolio,
-      activePositions: State.activePositions,
-      recoveryBags: State.recoveryBags,
-      tradeLogs: State.tradeLogs.slice(0, 150),
-      manual: State.manual,
-      positionPct: State.positionPct,
-      leverageAuto: State.leverageAuto,
-      bothSides: State.bothSides,
-      breakdownSide: State.breakdownSide,
-      breakdownLongs: State.breakdownLongs,
-      masterLedgerUrl: State.masterLedgerUrl,
-      learningSheetUrl: State.learningSheetUrl,
-      capitalResetId: State.capitalResetId || CAPITAL_RESET_ID
-    };
-    fs.writeFileSync(DISK_STATE_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    fs.writeFileSync(DISK_STATE_FILE, JSON.stringify(persistableState(), null, 2), 'utf-8');
   } catch (e) {}
+}
+
+// The saved fields onto State: from the disk file, or (live = true) from the account a previous build handed over.
+function applyPersistedState(parsed, live = false) {
+  if (!parsed || typeof parsed !== 'object') return;
+  if (parsed.portfolio) State.portfolio = parsed.portfolio;
+  if (parsed.activePositions) State.activePositions = parsed.activePositions;
+  if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
+  if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
+  if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
+  if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
+  if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
+  if (typeof parsed.bothSides === 'boolean') State.bothSides = parsed.bothSides;
+  if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
+  if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
+  if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
+    State.masterLedgerUrl = parsed.masterLedgerUrl;
+  } else {
+    State.masterLedgerUrl = 'https://script.google.com/macros/s/AKfycbwwFkRk4O2oJYmgrRcQBpx3z5KBKEOCJoX6YzL1yJXdot93V1T08ewIGaF78O1n6Z1ktg/exec';
+  }
+  if (parsed.learningSheetUrl && !parsed.learningSheetUrl.includes('AKfycbxzrxMMq')) {
+    State.learningSheetUrl = parsed.learningSheetUrl;
+  } else {
+    State.learningSheetUrl = 'https://script.google.com/macros/s/AKfycbwut72lTkCVcqIV2k7YlzlsIOwO3GXCKqlF-4UBxvTvJHckJApKKxzbfFp5JN0VLND8/exec';
+  }
+  State.capitalResetId = parsed.capitalResetId;
+  if (live) {
+    if (typeof parsed.autopilotEnabled === 'boolean') State.autopilotEnabled = parsed.autopilotEnabled;
+    if (parsed.cooldowns && typeof parsed.cooldowns === 'object') State.cooldowns = parsed.cooldowns;
+    if (Number(parsed.usdtToInrRate) > 0) State.usdtToInrRate = Number(parsed.usdtToInrRate);
+    if (parsed.marketMode && parsed.marketMode.mode) State.subsystems.marketMode = parsed.marketMode;
+  }
 }
 
 function loadDiskState() {
   try {
-    if (fs.existsSync(DISK_STATE_FILE)) {
-      const parsed = JSON.parse(fs.readFileSync(DISK_STATE_FILE, 'utf-8'));
-      if (parsed.portfolio) State.portfolio = parsed.portfolio;
-      if (parsed.activePositions) State.activePositions = parsed.activePositions;
-      if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
-      if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
-      if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
-      if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
-      if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
-      if (typeof parsed.bothSides === 'boolean') State.bothSides = parsed.bothSides;
-      if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
-      if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
-      if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
-        State.masterLedgerUrl = parsed.masterLedgerUrl;
-      } else {
-        State.masterLedgerUrl = 'https://script.google.com/macros/s/AKfycbwwFkRk4O2oJYmgrRcQBpx3z5KBKEOCJoX6YzL1yJXdot93V1T08ewIGaF78O1n6Z1ktg/exec';
-      }
-      if (parsed.learningSheetUrl && !parsed.learningSheetUrl.includes('AKfycbxzrxMMq')) {
-        State.learningSheetUrl = parsed.learningSheetUrl;
-      } else {
-        State.learningSheetUrl = 'https://script.google.com/macros/s/AKfycbwut72lTkCVcqIV2k7YlzlsIOwO3GXCKqlF-4UBxvTvJHckJApKKxzbfFp5JN0VLND8/exec';
-      }
-      State.capitalResetId = parsed.capitalResetId;
-    }
+    if (fs.existsSync(DISK_STATE_FILE)) applyPersistedState(JSON.parse(fs.readFileSync(DISK_STATE_FILE, 'utf-8')));
   } catch (e) {}
   applyCapitalReset();
 }
@@ -2063,6 +2092,14 @@ app.use((req, res, next) => {
   next();
 });
 
+// v6.15: while this build is starting or has handed its account to a new build, nothing may change the account here.
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.path === '/api/handoff' || !tradingPaused()) return next();
+  res.status(503).json({ success: false, error: Handover.frozen
+    ? 'This build has handed its trades to the new build. Reload the app in a few seconds.'
+    : 'The engine is starting. Try again in a few seconds.' });
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.static(__dirname));
 
@@ -2083,6 +2120,95 @@ app.get(['/pnl_dashboard', '/pnl_dashboard.html'], (req, res) => {
 });
 
 // REST API Endpoints
+// v6.15, build handover. whoami: which build answers the public URL now.
+app.get('/api/whoami', (req, res) => res.json({ bootId: BOOT_ID, ready: Handover.ready, frozen: Handover.frozen }));
+
+// A new build asks for the account: trading stops here (for good, unless the new build never goes live) and the whole
+// account is returned. A repeated ask gets the same paused account. Nothing here takes an account from outside.
+app.post('/api/handoff', (req, res) => {
+  const to = String((req.body && req.body.boot) || '').slice(0, 40);
+  if (!to || to === BOOT_ID) return res.status(400).json({ ok: false, error: 'the new build must send its boot id' });
+  if (!Handover.ready) return res.status(409).json({ ok: false, error: 'this build is still starting' });
+  if (!Handover.frozen) {
+    Object.assign(Handover, { frozen: true, to, at: Date.now() });
+    const n = Object.keys(State.activePositions || {}).length, b = Object.keys(State.recoveryBags || {}).length;
+    logOperation('HANDOVER', `A new build is starting: trading paused here, ${n} open trade${n === 1 ? '' : 's'} and ${b} bag${b === 1 ? '' : 's'} handed over to it.`, 'warning');
+    saveDiskState();
+    broadcastStateUpdate();
+    watchHandover();
+  }
+  res.json({ ok: true, bootId: BOOT_ID, frozenAt: Handover.at, state: persistableState(Infinity, true) });
+});
+
+// The old build, paused: once the public URL answers from another build, it stays paused (Render stops it about a
+// minute later). If after 5 minutes the public URL still answers from here, the new build never went live: resume.
+function watchHandover() {
+  const since = Date.now();
+  const check = async () => {
+    if (!Handover.frozen) return;
+    let who = '';
+    if (HANDOFF_URL && typeof fetch === 'function') {
+      try { const r = await fetch(`${HANDOFF_URL}/api/whoami`, { signal: AbortSignal.timeout(8000) }); if (r.ok) who = String((await r.json()).bootId || ''); } catch (e) {}
+    }
+    if (who && who !== BOOT_ID) {
+      logOperation('HANDOVER', 'The new build is live and has the account. This build stays paused until Render stops it.', 'success');
+      broadcastStateUpdate();
+      return;
+    }
+    if (Date.now() - since >= 5 * 60000 && (who === BOOT_ID || !HANDOFF_URL)) {
+      Object.assign(Handover, { frozen: false, to: '', at: 0 });
+      logOperation('HANDOVER', 'The new build did not go live within 5 minutes: trading resumed here.', 'warning');
+      broadcastStateUpdate();
+      return;
+    }
+    setTimeout(check, 10000);
+  };
+  setTimeout(check, 10000);
+}
+
+// An older build's public /api/state as saved fields (its settings are shown under subsystems). Its capital reset is
+// the current one, so the account is not re-based.
+function legacyHandover(st) {
+  const sub = st.subsystems || {}, m = st.manual;
+  return {
+    portfolio: st.portfolio, activePositions: st.activePositions, recoveryBags: st.recoveryBags, tradeLogs: st.tradeLogs,
+    manual: m && m.positions ? { startUSDT: m.startUSDT, cashUSDT: m.cashUSDT, realizedPnL: m.realizedPnL, positions: m.positions, history: m.history || [] } : undefined,
+    positionPct: sub.sizing && sub.sizing.positionPct, leverageAuto: sub.leverage && sub.leverage.on, bothSides: sub.sides && sub.sides.on,
+    breakdownSide: sub.breakdown && sub.breakdown.side, breakdownLongs: sub.breakdown && sub.breakdown.longs,
+    masterLedgerUrl: st.masterLedgerUrl, learningSheetUrl: st.learningSheetUrl, capitalResetId: CAPITAL_RESET_ID,
+    usdtToInrRate: st.usdtToInrRate, marketMode: sub.marketMode
+  };
+}
+
+// The new build, before it opens its port: take the account from the build that still answers the public URL.
+async function takeOverFromPreviousBuild() {
+  if (!HANDOFF_URL || typeof fetch !== 'function') { Handover.note = 'no public URL to ask'; return; }
+  const call = async (p, opts = {}) => {
+    const r = await fetch(`${HANDOFF_URL}${p}`, { ...opts, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return null;
+    try { return await r.json(); } catch (e) { return null; }
+  };
+  try {
+    const j = await call('/api/handoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ boot: BOOT_ID }) });
+    if (j && j.ok && j.state && j.bootId && j.bootId !== BOOT_ID) {
+      applyPersistedState(j.state, true);
+      Object.assign(Handover, { how: 'handoff', from: j.bootId, restoredAt: Date.now() });
+      return;
+    }
+  } catch (e) {   // nothing answered (no previous build running, e.g. a wake-up after Render put the service to sleep)
+    Handover.note = e && e.name === 'TimeoutError' ? 'no previous build answered' : `previous build not reached (${e && e.message})`;
+    return;
+  }
+  // A build from before v6.15 has no handover: read its public state. It keeps trading until Render stops it.
+  try {
+    const st = await call('/api/state');
+    if (st && !st.handover && st.portfolio && st.activePositions && st.recoveryBags) {
+      applyPersistedState(legacyHandover(st), true);
+      Object.assign(Handover, { how: 'state', from: 'a build from before v6.15', restoredAt: Date.now() });
+    } else Handover.note = st && st.handover ? 'the previous build did not hand over its account' : 'no previous build answered';
+  } catch (e) { Handover.note = `previous build not read (${e && e.message})`; }
+}
+
 app.get('/api/state', (req, res) => {
   res.json({
     portfolio: State.portfolio,
@@ -2101,7 +2227,8 @@ app.get('/api/state', (req, res) => {
     riskConfig: Strategy.CONFIG,
     equityUSDT: computeEquity(),
     manual: manualView(),
-    pnl: pnlNow()
+    pnl: pnlNow(),
+    handover: { bootId: BOOT_ID, ready: Handover.ready, frozen: Handover.frozen, how: Handover.how, restoredAt: Handover.restoredAt }
   });
 });
 
@@ -2286,7 +2413,7 @@ function manualView() {
 
 function closeManual(id, price, label) {
   const m = State.manual, p = m.positions[id];
-  if (!p || p.closing) return null;
+  if (!p || p.closing || tradingPaused()) return null;
   p.closing = true;
   const r = Strategy.manualClose(p, price);
   m.cashUSDT = Number((Number(m.cashUSDT) + r.proceeds).toFixed(6));
@@ -2721,6 +2848,7 @@ wss.on('connection', (ws) => {
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
+      if (tradingPaused() && msg.type !== 'SYNC_STATE') return;   // v6.15: no changes while paused
       if (msg.type === 'SYNC_STATE') {
         broadcastStateUpdate();
       } else if (msg.type === 'TOGGLE_AUTOPILOT') {
@@ -2750,12 +2878,33 @@ wss.on('connection', (ws) => {
 // -------------------------------------------------------------
 // BOOTSTRAP TIMERS & SERVICE INITIALIZATION
 // -------------------------------------------------------------
-loadDiskState();
-syncBreakdownStatus();
-syncSizingStatus();
-syncLeverageStatus();
-syncSidesStatus();
+// v6.15: the saved file, then the account of the previous build if one still answers the public URL (it wins: it is
+// live). Only then does this build open its port (Render moves traffic here once it does) and start trading.
+async function boot() {
+  const hadFile = fs.existsSync(DISK_STATE_FILE);
+  loadDiskState();
+  const t0 = Date.now();
+  await takeOverFromPreviousBuild();
+  applyCapitalReset();
+  if (Handover.restoredAt) saveDiskState();
+  syncBreakdownStatus();
+  syncSizingStatus();
+  syncLeverageStatus();
+  syncSidesStatus();
+  Handover.ready = true;
+  const n = Object.keys(State.activePositions || {}).length, b = Object.keys(State.recoveryBags || {}).length;
+  const what = `${n} open trade${n === 1 ? '' : 's'}, ${b} bag${b === 1 ? '' : 's'}, free cash $${Number(State.portfolio.cashUSDT).toFixed(2)}`;
+  if (Handover.how === 'handoff') logOperation('HANDOVER', `New build: took over from the previous build (${what}). Trading was paused for ${Math.max(1, Math.round((Date.now() - t0) / 1000))} s during the switch.`, 'success');
+  else if (Handover.how === 'state') logOperation('HANDOVER', `New build: took over from the previous build (${what}). That build is from before v6.15 and keeps trading until Render stops it, about a minute: a trade it closes in that minute can show twice in the sheet.`, 'warning');
+  else if (HANDOFF_URL) logOperation('HANDOVER', `New build: ${Handover.note || 'no previous build answered'}. Started from ${hadFile ? 'the saved file' : 'a fresh account'} (${what}).`, 'warning');
+  console.log(`[Handover] boot ${BOOT_ID}: ${Handover.how}${Handover.note ? ` (${Handover.note})` : ''}`);
+  startServerAndTimers();
+}
 
+let serverStarted = false;
+function startServerAndTimers() {
+if (serverStarted) return;
+serverStarted = true;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`SISIR QUANT ENGINE ONLINE ON PORT ${PORT}`);
@@ -2780,6 +2929,7 @@ setInterval(() => {
 }, 600000);
 
 setInterval(async () => {
+  if (tradingPaused()) return;
   try {
     await runPredictiveSentry();
     await evaluateAutopilotEntries();
@@ -2791,6 +2941,7 @@ setInterval(async () => {
 
 setInterval(() => { settleFunding().catch((e) => console.error('[Funding]', e.message)); }, 60000);
 setInterval(async () => {
+  if (tradingPaused()) return;
   for (const p of Object.values(State.manual.positions || {})) {
     if (Date.now() - Number(p.lastTickAt || 0) < 15000) continue;
     const px = await fetchFuturesPrice(p.symbol);
@@ -2800,3 +2951,18 @@ setInterval(async () => {
 setInterval(broadcastPriceStream, 250);
 setInterval(() => { refreshExitSignals().catch(() => {}); }, 3000);
 setInterval(runDynamicScreener, 60000);
+}
+
+// Render stops an old instance with SIGTERM (about a minute after the new build goes live): stop trading and save.
+process.on('SIGTERM', () => {
+  Handover.frozen = true;
+  saveDiskState();
+  console.log('[Handover] SIGTERM: trading stopped, state saved.');
+  setTimeout(() => process.exit(0), 1000);
+});
+
+boot().catch((e) => {
+  console.error('[Boot]', e && e.message);
+  Handover.ready = true;
+  startServerAndTimers();
+});
