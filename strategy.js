@@ -1057,6 +1057,40 @@ function ledgerMatch(local, row) {
     && Math.abs(num(x.entryPriceUSDT) - entry) <= entry * 1e-5) || null;
 }
 
+/**
+ * v6.16: the sheet is the ledger. When the sheet answers a read, its rows are the trade list (the engine's copy of a
+ * row wins its exact fields, and the row is marked inSheet). A trade the engine holds that the sheet does not have is
+ * kept only while it may still be on its way there: closed within the last hour and never seen in the sheet. Anything
+ * else was deleted in the sheet and leaves the list. Returns { trades, removed }.
+ */
+const LEDGER_GRACE_MS = 60 * 60000;
+const ledgerPair = (p) => { const s = String(p || '').trim().toUpperCase(); return s.includes('/') ? s : `${s.replace(/USDT$/, '')}/USDT`; };
+function sameLedgerTrade(a, b) {
+  if (!a || !b || ledgerPair(a.pair) !== ledgerPair(b.pair)) return false;
+  if (num(a.id) > 0 && num(a.id) === num(b.id)) return true;
+  const ta = String(a.time || '').trim(), tb = String(b.time || '').trim();
+  return Boolean(a.date) && String(a.date).trim() === String(b.date || '').trim() && Boolean(ta) && ta === tb;
+}
+function ledgerReconcile(sheetRows, local, now = Date.now(), graceMs = LEDGER_GRACE_MS) {
+  const rows = Array.isArray(sheetRows) ? sheetRows.filter((r) => r && typeof r === 'object') : [];
+  const list = Array.isArray(local) ? local : [];
+  const used = new Set();
+  const trades = rows.map((f) => {
+    const k = list.findIndex((x, i) => !used.has(i) && sameLedgerTrade(x, f));
+    if (k < 0) return { ...f, inSheet: true };
+    used.add(k);
+    return { ...f, ...list[k], inSheet: true };
+  });
+  const removed = [];
+  list.forEach((x, i) => {
+    if (used.has(i) || !x || typeof x !== 'object') return;
+    const closedAt = num(x.id) > 1.6e12 ? num(x.id) : 0;
+    if (!x.inSheet && closedAt > 0 && now - closedAt < graceMs) trades.push(x);
+    else removed.push(x);
+  });
+  return { trades, removed };
+}
+
 /** Free cash to add to a bag's margin to bring it back to 1x: all that is needed, or as much as there is. */
 function bagTopUp(marginUSDT, notionalUSDT, freeCashUSDT) {
   const need = num(notionalUSDT) - num(marginUSDT), free = num(freeCashUSDT) - 0.01;
@@ -1232,6 +1266,9 @@ module.exports = {
   liquidationPrice,
   bagTopUp,
   ledgerMatch,
+  ledgerReconcile,
+  sameLedgerTrade,
+  LEDGER_GRACE_MS,
   POSITION_SIZE,
   validPositionPct,
   netPnlLongFutures,
