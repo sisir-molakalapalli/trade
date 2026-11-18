@@ -717,13 +717,14 @@ const EXIT_RULES = {
   tp1Pct: 1.80, runnerTrailPct: 0.50, scratchMinutes: 45,
   demotePct: -3.50,
   minPartialUSDT: 10,
-  // v6.18: what a recovery bag closes at, by minutes since the trade moved to the bag (price move from entry, the trade's
-  // way): +0.10% (about break-even after fees) for the first hour, 0.00% (entry) until 16 hours, then -1.50% (a loss)
-  bagStages: [{ fromMin: 0, pct: 0.10 }, { fromMin: 60, pct: 0.00 }, { fromMin: 960, pct: -1.50 }]
+  // What a recovery bag closes at, by minutes since the trade moved to the bag (price move from entry, the trade's way).
+  // v6.20: 0.00% (entry, about -0.10% after fees) from the moment it forms, then -1.50% (a loss) from 16 hours.
+  // (v6.18 had +0.10% for the first hour, then entry.)
+  bagStages: [{ fromMin: 0, pct: 0.00 }, { fromMin: 960, pct: -1.50 }]
 };
 
 /**
- * v6.18: what a recovery bag closes at now, from `bagStages`. Paper trading of v6.17 (+0.30% for an hour, then -2.00%)
+ * v6.18: what a recovery bag closes at now, from `bagStages` (v6.20: entry at once, -1.50% from 16 hours). Paper trading of v6.17 (+0.30% for an hour, then -2.00%)
  * lost: in its first 14 hours 4 bag cuts (-2.74 USDT, two of them at 2x) took more than 31 winning trades made
  * (+2.40 USDT), and two of the four coins came back past entry within a few hours of their cut. Your schedule gives a bag
  * 16 hours to get back to entry before it takes a loss, and a smaller one (-1.50%). The 180-day replay scores it below
@@ -795,7 +796,7 @@ function manageNoLoss(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES
   return { action: 'HOLD' };
 }
 
-/** A recovery bag closes at its stage's target or better (v6.18: +0.10%, then 0.00% from 1 hour, -1.50% from 16 hours). */
+/** A recovery bag closes at its stage's target or better (v6.20: entry from the start, -1.50% from 16 hours). */
 function manageBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const entry = num(bag.entryPriceUSDT);
   if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
@@ -1162,9 +1163,18 @@ function bagTopUp(marginUSDT, notionalUSDT, freeCashUSDT) {
  * minStepUSDT is free (or the bag is finished), so cash coming back in cents does not make a stream of tiny top-ups.
  * Returns [{ key, add }] in the order to apply.
  */
-const BAG_TOPUP = { minStepUSDT: 1 };
-function planBagTopUps(bags, freeCashUSDT, R = BAG_TOPUP) {
-  let cash = num(freeCashUSDT);
+const BAG_TOPUP = { minStepUSDT: 1, maxLeverage: 3 };
+/**
+ * v6.21: free cash a bag top-up must leave for new trades: one new trade's margin (positionPct of account value) plus its
+ * opening fee at the top leverage. On 18 Nov 2026 three leveraged bags (about 151 USDT of position on a 107 USDT account)
+ * took every USDT under v6.19 and no new trade could open until a bag closed.
+ */
+function bagTopUpReserve(equityUSDT, cfg = FUTURES, R = BAG_TOPUP) {
+  const one = Math.max(0, num(equityUSDT)) * num(cfg.positionPct) / 100;
+  return one * (1 + R.maxLeverage * num(cfg.feePct) / 100);
+}
+function planBagTopUps(bags, freeCashUSDT, R = BAG_TOPUP, reserveUSDT = 0) {
+  let cash = num(freeCashUSDT) - Math.max(0, num(reserveUSDT));   // v6.21: only cash above the reserve for new trades
   const list = Object.entries(bags || {})
     .map(([key, b]) => ({ key, b, notional: num(b && b.qty) * num(b && b.entryPriceUSDT), margin: num(b && b.marginUSDT) }))
     .filter((x) => x.b && !x.b.exitInProgress && (x.b.side === 'SHORT' || x.b.market === 'FUTURES') && x.margin > 0 && x.margin < x.notional - 0.005)
@@ -1251,7 +1261,7 @@ function manageShort(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES)
   return r;
 }
 
-/** A short bag mirrors manageBag: its stage's target below entry (v6.18: 0.10% below, then entry, then 1.50% above).
+/** A short bag mirrors manageBag: its stage's target (v6.20: entry, then 1.50% above entry from 16 hours).
  *  Funding it has paid moves the target further. */
 function manageShortBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const entry = num(bag.entryPriceUSDT);
@@ -1353,6 +1363,7 @@ module.exports = {
   liquidationPrice,
   bagTopUp,
   planBagTopUps,
+  bagTopUpReserve,
   BAG_TOPUP,
   ledgerMatch,
   ledgerReconcile,
