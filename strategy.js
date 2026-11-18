@@ -1155,6 +1155,31 @@ function bagTopUp(marginUSDT, notionalUSDT, freeCashUSDT) {
   return need <= free ? need : Math.floor(free * 100) / 100;
 }
 
+/**
+ * v6.19: a leveraged bag is topped up whenever free cash allows, not only at the move to the bag (where there was often
+ * no cash: it then stayed at 2x or 3x even after other trades closed). The engine runs this every second, before it looks
+ * for new trades, so a bag gets freed cash first. Highest leverage first. A partial top-up waits until at least
+ * minStepUSDT is free (or the bag is finished), so cash coming back in cents does not make a stream of tiny top-ups.
+ * Returns [{ key, add }] in the order to apply.
+ */
+const BAG_TOPUP = { minStepUSDT: 1 };
+function planBagTopUps(bags, freeCashUSDT, R = BAG_TOPUP) {
+  let cash = num(freeCashUSDT);
+  const list = Object.entries(bags || {})
+    .map(([key, b]) => ({ key, b, notional: num(b && b.qty) * num(b && b.entryPriceUSDT), margin: num(b && b.marginUSDT) }))
+    .filter((x) => x.b && !x.b.exitInProgress && (x.b.side === 'SHORT' || x.b.market === 'FUTURES') && x.margin > 0 && x.margin < x.notional - 0.005)
+    .sort((a, b) => b.notional / b.margin - a.notional / a.margin);
+  const out = [];
+  for (const x of list) {
+    const add = bagTopUp(x.margin, x.notional, cash);
+    if (!(add > 0)) break;
+    if (add < x.notional - x.margin - 0.005 && add < R.minStepUSDT) break;   // a part too small to bother with
+    out.push({ key: x.key, add });
+    cash -= add;
+  }
+  return out;
+}
+
 function netPnlLongFutures(qty, entryPrice, exitPrice, cfg = FUTURES) {
   return qty * (exitPrice - entryPrice) - (qty * entryPrice + qty * exitPrice) * (cfg.feePct / 100);
 }
@@ -1327,6 +1352,8 @@ module.exports = {
   autoLeverage,
   liquidationPrice,
   bagTopUp,
+  planBagTopUps,
+  BAG_TOPUP,
   ledgerMatch,
   ledgerReconcile,
   sameLedgerTrade,
