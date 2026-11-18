@@ -6,7 +6,8 @@
  * No orders are sent to Binance from this file.
  *
  * Exits: the engine never closes below +0.30% (long) or +0.20% (short). A failing position moves to a Recovery Bag,
- * which closes at +0.30% in its first hour and from then on at -2.00% (v6.17). See CHANGES.md v5.8 and v6.17.
+ * which closes at +0.10% in its first hour, at entry (0.00%) until 16 hours, then at -1.50% (v6.18). See CHANGES.md v5.8
+ * and v6.18.
  * Strategy logic lives in strategy.js (shared with backtest.js).
  * =========================================================================
  */
@@ -142,7 +143,7 @@ const State = {
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • From +0.50%, trail 0.20% behind the peak • Failing trades move to recovery bags' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at +0.30% in their first hour, then at -2.00%', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at +0.10% in their first hour, at entry until 16 hours, then at -1.50%', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -825,10 +826,10 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   if (!pos || pos.exitInProgress || tradingPaused()) return null;
 
   const entry = Number(pos.entryPriceUSDT);
-  // Hard rule: only the user's own manual close can realize a loss. v6.17: and a recovery bag's -2.00% close
-  // (Strategy.bagStage), from an hour after the move to the bag; nothing else.
+  // Hard rule: only the user's own manual close can realize a loss. v6.17/v6.18: and a recovery bag's own stage close at
+  // entry (BAG BREAKEVEN, from 1 hour) or at -1.50% (BAG CUT, from 16 hours) (Strategy.bagStage); nothing else.
   const short = isShort(pos);
-  const bagCut = bookName === 'recoveryBags' && /^BAG CUT /.test(typeLabel);
+  const bagCut = bookName === 'recoveryBags' && /^BAG (CUT|BREAKEVEN) /.test(typeLabel);
   if (!/MANUAL|LIQUIDATED/.test(typeLabel) && !bagCut && (short ? price > entry : price < entry)) {
     logOperation('SENTRY', `${pos.pair}: blocked ${typeLabel} below entry. Position stays open.`, 'warning');
     return null;
@@ -1561,8 +1562,9 @@ function demoteToBag(k, pos, price, reason) {
     entryPriceUSDT: Number(pos.entryPriceUSDT), livePriceUSDT: price, lastTickAt: Date.now(),
     notionalUSDT: pos.notionalUSDT, qty: pos.qty,
     side: isShort(pos) ? 'SHORT' : 'LONG', market: isFutures(pos) ? 'FUTURES' : 'SPOT', fundingUSDT: pos.fundingUSDT || 0, nextFundingAt: pos.nextFundingAt || 0, liquidationPrice: pos.liquidationPrice,
-    targetStep: 'CLOSES AT +0.30%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + (isShort(pos) ? -1 : 1) * Strategy.EXIT_RULES.bagTargetPct / 100),
-    cutAt: Date.now() + Strategy.EXIT_RULES.bagCutAfterMin * 60000,   // v6.17: from here the bag closes at -2.00%
+    targetStep: 'CLOSES AT +0.10%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + (isShort(pos) ? -1 : 1) * Strategy.EXIT_RULES.bagStages[0].pct / 100),
+    nextStepAt: Date.now() + Strategy.EXIT_RULES.bagStages[1].fromMin * 60000, nextStepPct: Strategy.EXIT_RULES.bagStages[1].pct,   // v6.18
+    lossAt: Date.now() + Strategy.EXIT_RULES.bagStages[2].fromMin * 60000,
     troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6,
     entrySource: pos.entrySource, leverage: pos.leverage, leverageAtEntry: pos.leverageAtEntry, marginUSDT: pos.marginUSDT
   };
@@ -1574,7 +1576,7 @@ function demoteToBag(k, pos, price, reason) {
   }
   delete State.activePositions[k];
   if (isFutures(State.recoveryBags[k])) topUpBag(k, State.recoveryBags[k]);
-  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at ${mine ? `your take profit +${pos.userTpPct}%` : `+0.30% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}) in the next hour, then at ${Strategy.EXIT_RULES.bagCutPct.toFixed(2)}%`}${mine ? ` ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)})` : ''}.`, 'warning');
+  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at ${mine ? `your take profit +${pos.userTpPct}%` : `+0.10% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}) in the next hour, at entry until 16 hours, then at -1.50%`}${mine ? ` ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)})` : ''}.`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
 }
@@ -1712,7 +1714,7 @@ async function runPredictiveSentry() {
       }
     }
 
-    // ---- recovery bags: close at +0.30% in the first hour, then (v6.17) at -2.00% ----
+    // ---- recovery bags: close at their stage's target (v6.18: +0.10% for 1 hour, entry until 16 hours, then -1.50%) ----
     for (const k of Object.keys(State.recoveryBags || {})) {
       const bag = State.recoveryBags[k];
       if (!bag || bag.exitInProgress) continue;
@@ -1732,10 +1734,11 @@ async function runPredictiveSentry() {
         const fill = (await executableExitPrice(k, bag)) || price;
         const check = State.recoveryBags[k] === bag ? manage(fill) : { action: 'HOLD' };
         if (check.action === 'EXIT') {
-          const bdl = bag.entrySource === 'BREAKDOWN_LONG', cut = /^BAG CUT /.test(r.reason);
+          const bdl = bag.entrySource === 'BREAKDOWN_LONG', lvl = (String(r.reason).match(/[-+]?\d+\.\d+%$/) || [''])[0];
+          const inBagMin = Math.round((Date.now() - Number(bag.movedAt || bag.openedAt)) / 60000);
+          const inBag = inBagMin < 120 ? `${inBagMin} min` : `${(inBagMin / 60).toFixed(1)} h`;
           const why = mine ? `Recovery bag closed at your take profit +${Number(bag.userTpPct).toFixed(2)}% @ $${formatPrecisePrice(fill)}`
-            : cut ? `Recovery bag${bdl ? ' (breakdown long test)' : ''} closed at ${Strategy.EXIT_RULES.bagCutPct.toFixed(2)}% or better, ${Math.round((Date.now() - Number(bag.movedAt || bag.openedAt)) / 60000)} min after it moved to the bag @ $${formatPrecisePrice(fill)}`
-            : `Recovery bag${bdl ? ' (breakdown long test)' : ''} closed at +0.30% or better @ $${formatPrecisePrice(fill)}`;
+            : `Recovery bag${bdl ? ' (breakdown long test)' : ''} closed at ${lvl === '0.00%' ? 'entry (0.00%)' : lvl} or better, ${inBag} after it moved to the bag @ $${formatPrecisePrice(fill)}`;
           if (realizeExit('recoveryBags', k, 1, fill, r.reason, why) && bdl && !mine) {
             State.breakdownLongs.bagClosed++; saveDiskState();
           }
@@ -2408,18 +2411,18 @@ app.post('/api/tp', (req, res) => {
       if (bag) Strategy.manageUserTp(p, px, { inBag: true });
     } else {
       delete p.userTpPct; delete p.userTpPrice; delete p.userTpSetAt;
-      if (bag) { if (isShort(p)) Strategy.manageShortBag(p, px); else Strategy.manageBag(p, px); }   // the bag's own target again (+0.30%, or -2.00% after its first hour)
+      if (bag) { if (isShort(p)) Strategy.manageShortBag(p, px); else Strategy.manageBag(p, px); }   // the bag's own target again (v6.18 stages)
     }
     if (!all) {
       logOperation('SENTRY', tp.pct
-        ? `${p.pair}: your take profit +${tp.pct}% ($${formatPrecisePrice(p.userTpPrice)}). It closes only there${bag ? ', in place of the bag\'s own target (+0.30%, -2.00% after its first hour)' : '; the autopilot\'s exits are off for it, the -3.50% move to a bag stays'}.`
+        ? `${p.pair}: your take profit +${tp.pct}% ($${formatPrecisePrice(p.userTpPrice)}). It closes only there${bag ? ', in place of the bag\'s own target' : '; the autopilot\'s exits are off for it, the -3.50% move to a bag stays'}.`
         : `${p.pair}: your take profit removed. ${bag ? `The bag is back on its own target: ${String(p.targetStep || '').toLowerCase()}` : 'Back to the autopilot\'s exits'}.`, 'info');
     }
   });
   if (all) {
     logOperation('SENTRY', tp.pct
       ? `Your take profit +${tp.pct}% set on ${hits.length} open trade${hits.length === 1 ? '' : 's'} (${hits.map((h) => h.p.pair).join(', ')}). Each closes only there; the autopilot's exits are off for them, the -3.50% move to a bag stays.`
-      : `Your take profit removed from ${hits.length} open trade${hits.length === 1 ? '' : 's'}. Back to the autopilot's exits (bags: +0.30% in their first hour, then -2.00%).`, 'info');
+      : `Your take profit removed from ${hits.length} open trade${hits.length === 1 ? '' : 's'}. Back to the autopilot's exits (bags: +0.10% in their first hour, entry until 16 hours, then -1.50%).`, 'info');
   }
   saveDiskState();
   broadcastStateUpdate();
