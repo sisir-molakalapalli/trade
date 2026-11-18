@@ -6,8 +6,9 @@
  * No orders are sent to Binance from this file.
  *
  * Exits: the engine never closes below +0.30% (long) or +0.20% (short). A failing position moves to a Recovery Bag,
- * which closes at +0.10% in its first hour, at entry (0.00%) until 16 hours, then at -1.50% (v6.18). A bag still above 1x
- * gets free cash every second, before new trades, until it is 1x (v6.19). See CHANGES.md v5.8, v6.18 and v6.19.
+ * which closes at entry (0.00%) from the moment it forms until 16 hours, then at -1.50% (v6.20). A bag still above 1x
+ * gets free cash every second until it is 1x (v6.19), but only cash above one new trade's margin (v6.21).
+ * See CHANGES.md v5.8, v6.18 to v6.21.
  * Strategy logic lives in strategy.js (shared with backtest.js).
  * =========================================================================
  */
@@ -143,7 +144,7 @@ const State = {
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • From +0.50%, trail 0.20% behind the peak • Failing trades move to recovery bags' },
-    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at +0.10% in their first hour, at entry until 16 hours, then at -1.50%', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
+    recoveryManager: { status: 'ONLINE', activeRecoveryBagsCount: 0, meanReversionTargetRate: 'Bags close at entry until 16 hours, then at -1.50%', bagsResolvedWinCount: 0, subsidyPoolUSDT: 0.00 },
     quotaManager: { status: 'NORMAL', executed24hCount: 0, maxAllowed: 'UNLIMITED', quotaRemaining: '∞', vipSlotsRemaining: '∞', formattedReset: 'Dynamic Reserve Active' },
     persistence: { status: 'SYNCED', storageEngine: 'Disk JSON + Google Sheet Ledger', googleSheetSync: 'STANDBY', retainedTradesCount: 0 }
   },
@@ -1538,12 +1539,16 @@ async function checkSelfAwareOrderFlow(symbol, futures = false) {
 
 // v6.8: a leveraged trade that moves to a recovery bag gets free cash added to its margin, back to 1x (or as close as
 // free cash allows), so it cannot be liquidated while it waits for +0.30%. Done once, when it becomes a bag (as back-tested).
+// v6.21: cash a top-up leaves free for new trades (one new trade's margin plus its opening fee).
+const bagReserve = () => Strategy.bagTopUpReserve(computeEquity(), sizeConfig(1));
+
 function topUpBag(k, bag) {
   const notional = Number(bag.qty) * Number(bag.entryPriceUSDT), margin = Number(bag.marginUSDT);
   if (!(margin > 0) || margin >= notional - 0.005) return;
-  const add = Strategy.bagTopUp(margin, notional, Number(State.portfolio.cashUSDT));
+  const reserve = bagReserve();
+  const add = Strategy.bagTopUp(margin, notional, Number(State.portfolio.cashUSDT) - reserve);
   if (!(add > 0)) {
-    logOperation('RECOVERY', `${bag.pair}: no free cash to add to the bag's margin yet. It stays ${Number(bag.leverage).toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)}, until cash frees up.`, 'warning');
+    logOperation('RECOVERY', `${bag.pair}: no free cash above the $${reserve.toFixed(2)} kept for new trades, so nothing added to the bag's margin yet. It stays ${Number(bag.leverage).toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)}, until more cash frees up.`, 'warning');
     return;
   }
   applyBagTopUp(bag, add);
@@ -1562,24 +1567,25 @@ function applyBagTopUp(bag, add, later = false) {
     : `${L.toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)} (more is added as cash frees up)`}.`, L <= 1.0001 ? 'success' : 'warning');
 }
 
-// v6.19: a bag that is still leveraged (no free cash when it moved to the bag) gets cash as soon as it frees up, until it
-// is back to 1x. Runs every second before the entry checks, so freed cash goes to bags before new trades.
+// v6.19: a bag that is still leveraged (no free cash when it moved to the bag) gets cash as it frees up, until it is back
+// to 1x. Runs every second before the entry checks. v6.21: only cash above one new trade's margin goes to bags, so the
+// autopilot can always open its next trade.
 function topUpBags() {
   if (tradingPaused()) return;
-  const plan = Strategy.planBagTopUps(State.recoveryBags, Number(State.portfolio.cashUSDT));
+  const plan = Strategy.planBagTopUps(State.recoveryBags, Number(State.portfolio.cashUSDT), undefined, bagReserve());
   for (const { key, add } of plan) { const bag = State.recoveryBags[key]; if (bag) applyBagTopUp(bag, add, true); }
   if (plan.length) { saveDiskState(); broadcastStateUpdate(); }
 }
 
 function demoteToBag(k, pos, price, reason) {
+  const now = Date.now(), st = Strategy.bagStage({ movedAt: now }, now), sgn = isShort(pos) ? -1 : 1;   // v6.20: entry at once
   State.recoveryBags[k] = {
-    pair: pos.pair, pairSymbol: pos.pairSymbol, openedAt: pos.openedAt, movedAt: Date.now(),
-    entryPriceUSDT: Number(pos.entryPriceUSDT), livePriceUSDT: price, lastTickAt: Date.now(),
+    pair: pos.pair, pairSymbol: pos.pairSymbol, openedAt: pos.openedAt, movedAt: now,
+    entryPriceUSDT: Number(pos.entryPriceUSDT), livePriceUSDT: price, lastTickAt: now,
     notionalUSDT: pos.notionalUSDT, qty: pos.qty,
     side: isShort(pos) ? 'SHORT' : 'LONG', market: isFutures(pos) ? 'FUTURES' : 'SPOT', fundingUSDT: pos.fundingUSDT || 0, nextFundingAt: pos.nextFundingAt || 0, liquidationPrice: pos.liquidationPrice,
-    targetStep: 'CLOSES AT +0.10%', targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + (isShort(pos) ? -1 : 1) * Strategy.EXIT_RULES.bagStages[0].pct / 100),
-    nextStepAt: Date.now() + Strategy.EXIT_RULES.bagStages[1].fromMin * 60000, nextStepPct: Strategy.EXIT_RULES.bagStages[1].pct,   // v6.18
-    lossAt: Date.now() + Strategy.EXIT_RULES.bagStages[2].fromMin * 60000,
+    targetStep: `CLOSES AT ${st.pct >= 0 ? '+' : ''}${st.pct.toFixed(2)}%`, targetExitPriceUSDT: Number(pos.entryPriceUSDT) * (1 + sgn * st.pct / 100),
+    nextStepAt: st.nextAt, nextStepPct: st.nextPct, lossAt: st.lossAt,   // v6.18 stages, from Strategy.bagStage
     troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6,
     entrySource: pos.entrySource, leverage: pos.leverage, leverageAtEntry: pos.leverageAtEntry, marginUSDT: pos.marginUSDT
   };
@@ -1591,7 +1597,7 @@ function demoteToBag(k, pos, price, reason) {
   }
   delete State.activePositions[k];
   if (isFutures(State.recoveryBags[k])) topUpBag(k, State.recoveryBags[k]);
-  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at ${mine ? `your take profit +${pos.userTpPct}%` : `+0.10% ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}) in the next hour, at entry until 16 hours, then at -1.50%`}${mine ? ` ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)})` : ''}.`, 'warning');
+  logOperation('SENTRY_DEMOTE', `${pos.pair}: ${reason}. Moved to ${isShort(pos) ? 'Short' : isFutures(pos) ? 'Long' : 'Spot'} Recovery Bag, closes at ${mine ? `your take profit +${pos.userTpPct}%` : `entry ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)}) until 16 hours, then at -1.50%`}${mine ? ` ($${formatPrecisePrice(State.recoveryBags[k].targetExitPriceUSDT)})` : ''}.`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
 }
@@ -1729,7 +1735,7 @@ async function runPredictiveSentry() {
       }
     }
 
-    // ---- recovery bags: close at their stage's target (v6.18: +0.10% for 1 hour, entry until 16 hours, then -1.50%) ----
+    // ---- recovery bags: close at their stage's target (v6.20: entry until 16 hours, then -1.50%) ----
     for (const k of Object.keys(State.recoveryBags || {})) {
       const bag = State.recoveryBags[k];
       if (!bag || bag.exitInProgress) continue;
@@ -2437,7 +2443,7 @@ app.post('/api/tp', (req, res) => {
   if (all) {
     logOperation('SENTRY', tp.pct
       ? `Your take profit +${tp.pct}% set on ${hits.length} open trade${hits.length === 1 ? '' : 's'} (${hits.map((h) => h.p.pair).join(', ')}). Each closes only there; the autopilot's exits are off for them, the -3.50% move to a bag stays.`
-      : `Your take profit removed from ${hits.length} open trade${hits.length === 1 ? '' : 's'}. Back to the autopilot's exits (bags: +0.10% in their first hour, entry until 16 hours, then -1.50%).`, 'info');
+      : `Your take profit removed from ${hits.length} open trade${hits.length === 1 ? '' : 's'}. Back to the autopilot's exits (bags: entry until 16 hours, then -1.50%).`, 'info');
   }
   saveDiskState();
   broadcastStateUpdate();
