@@ -716,25 +716,35 @@ const EXIT_RULES = {
   earlyTrailAtPct: 0.50, earlyTrailPct: 0.20,
   tp1Pct: 1.80, runnerTrailPct: 0.50, scratchMinutes: 45,
   demotePct: -3.50,
-  bagTargetPct: 0.30, minPartialUSDT: 10,
-  // v6.17: one hour after a trade moved to a recovery bag, the bag closes once the price is back to -2.00% (a loss)
-  bagCutPct: -2.00, bagCutAfterMin: 60
+  minPartialUSDT: 10,
+  // v6.18: what a recovery bag closes at, by minutes since the trade moved to the bag (price move from entry, the trade's
+  // way): +0.10% (about break-even after fees) for the first hour, 0.00% (entry) until 16 hours, then -1.50% (a loss)
+  bagStages: [{ fromMin: 0, pct: 0.10 }, { fromMin: 60, pct: 0.00 }, { fromMin: 960, pct: -1.50 }]
 };
 
 /**
- * v6.17: what a recovery bag closes at now. For its first `bagCutAfterMin` minutes (from the move to the bag), +0.30%
- * as before; from then on `bagCutPct` (-2.00%). Back test (180 days, 47 and 115 coins, both bar orders): bags reach
- * -2.00% far more often and sooner than +0.30% (98% ever, 75% within a day, against 92% and 40%), and freeing the money
- * and the bag slots more than paid for the losses. Starting the -2.00% one hour in beat starting it at once in 13 of 16
- * checks; 8 hours or later lost most of the gain. A bag with no move time (from an old build) counts from its opening.
+ * v6.18: what a recovery bag closes at now, from `bagStages`. Paper trading of v6.17 (+0.30% for an hour, then -2.00%)
+ * lost: in its first 14 hours 4 bag cuts (-2.74 USDT, two of them at 2x) took more than 31 winning trades made
+ * (+2.40 USDT), and two of the four coins came back past entry within a few hours of their cut. Your schedule gives a bag
+ * 16 hours to get back to entry before it takes a loss, and a smaller one (-1.50%). The 180-day replay scores it below
+ * v6.17 in every run (CHANGES.md v6.18). A bag with no move time counts from its opening; with
+ * neither it stays at the first stage. Returns the stage's target (pct), whether it is a loss stage (cut), and when the
+ * next stage starts and at what (nextAt 0 = none). lossAt is when the loss stage starts.
  */
 function bagStage(bag, now = Date.now(), R = EXIT_RULES) {
-  const since = num(bag && bag.movedAt) || num(bag && bag.openedAt);
-  const cutAt = since > 0 ? since + R.bagCutAfterMin * 60000 : 0;
-  const cut = cutAt > 0 && now >= cutAt;
-  return { pct: cut ? R.bagCutPct : R.bagTargetPct, cut, cutAt };
+  const stages = R.bagStages, since = num(bag && bag.movedAt) || num(bag && bag.openedAt);
+  let k = 0;
+  if (since > 0) while (k + 1 < stages.length && now >= since + stages[k + 1].fromMin * 60000) k++;
+  const next = since > 0 ? stages[k + 1] : null, loss = stages.find((s) => s.pct < 0);
+  return {
+    pct: stages[k].pct, stage: k, cut: stages[k].pct < 0,
+    nextAt: next ? since + next.fromMin * 60000 : 0, nextPct: next ? next.pct : null,
+    lossAt: since > 0 && loss ? since + loss.fromMin * 60000 : 0
+  };
 }
 const pctLabel = (p) => `${p >= 0 ? '+' : ''}${p.toFixed(2)}%`;
+/** The trade type a bag close gets, from the stage's target. */
+const bagReason = (st) => (st.cut ? `BAG CUT ${pctLabel(st.pct)}` : st.pct === 0 ? 'BAG BREAKEVEN 0.00%' : `BAG RECOVERED ${pctLabel(st.pct)}`);
 
 /**
  * @param signals { bearishPattern: string|null, peakExhausted: bool, upsideDead: bool }
@@ -785,7 +795,7 @@ function manageNoLoss(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES
   return { action: 'HOLD' };
 }
 
-/** A recovery bag closes at entry +0.30% or better in its first hour, then (v6.17) at -2.00% or better. */
+/** A recovery bag closes at its stage's target or better (v6.18: +0.10%, then 0.00% from 1 hour, -1.50% from 16 hours). */
 function manageBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const entry = num(bag.entryPriceUSDT);
   if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
@@ -795,9 +805,9 @@ function manageBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const st = bagStage(bag, now, R);
   bag.targetExitPriceUSDT = entry * (1 + (st.pct + fundingCostPct) / 100);
   bag.targetStep = `CLOSES AT ${pctLabel(st.pct)}`;
-  bag.cutAt = st.cutAt;
+  Object.assign(bag, { nextStepAt: st.nextAt, nextStepPct: st.nextPct, lossAt: st.lossAt });
   bag.troughPrice = Math.min(num(bag.troughPrice) || price, price);
-  return price >= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: st.cut ? `BAG CUT ${pctLabel(st.pct)}` : 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
+  return price >= bag.targetExitPriceUSDT * (1 - 1e-9) ? { action: 'EXIT', reason: bagReason(st) } : { action: 'HOLD' };   // 1e-9: float dust
 }
 
 /* =========================================================================
@@ -1216,7 +1226,8 @@ function manageShort(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES)
   return r;
 }
 
-/** A short bag closes at 0.30% below entry. Funding it has paid moves the target further, so the close is still not a loss. */
+/** A short bag mirrors manageBag: its stage's target below entry (v6.18: 0.10% below, then entry, then 1.50% above).
+ *  Funding it has paid moves the target further. */
 function manageShortBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const entry = num(bag.entryPriceUSDT);
   if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
@@ -1225,9 +1236,9 @@ function manageShortBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const st = bagStage(bag, now, R);
   bag.targetExitPriceUSDT = entry * (1 - (st.pct + fundingCostPct) / 100);
   bag.targetStep = `CLOSES AT ${pctLabel(st.pct)}`;
-  bag.cutAt = st.cutAt;
+  Object.assign(bag, { nextStepAt: st.nextAt, nextStepPct: st.nextPct, lossAt: st.lossAt });
   bag.troughPrice = Math.max(num(bag.troughPrice) || price, price);
-  return price <= bag.targetExitPriceUSDT ? { action: 'EXIT', reason: st.cut ? `BAG CUT ${pctLabel(st.pct)}` : 'BAG RECOVERED +0.30%' } : { action: 'HOLD' };
+  return price <= bag.targetExitPriceUSDT * (1 + 1e-9) ? { action: 'EXIT', reason: bagReason(st) } : { action: 'HOLD' };   // 1e-9: float dust
 }
 
 /* =========================================================================
