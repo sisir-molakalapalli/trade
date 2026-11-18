@@ -6,8 +6,8 @@
  * No orders are sent to Binance from this file.
  *
  * Exits: the engine never closes below +0.30% (long) or +0.20% (short). A failing position moves to a Recovery Bag,
- * which closes at +0.10% in its first hour, at entry (0.00%) until 16 hours, then at -1.50% (v6.18). See CHANGES.md v5.8
- * and v6.18.
+ * which closes at +0.10% in its first hour, at entry (0.00%) until 16 hours, then at -1.50% (v6.18). A bag still above 1x
+ * gets free cash every second, before new trades, until it is 1x (v6.19). See CHANGES.md v5.8, v6.18 and v6.19.
  * Strategy logic lives in strategy.js (shared with backtest.js).
  * =========================================================================
  */
@@ -1543,17 +1543,32 @@ function topUpBag(k, bag) {
   if (!(margin > 0) || margin >= notional - 0.005) return;
   const add = Strategy.bagTopUp(margin, notional, Number(State.portfolio.cashUSDT));
   if (!(add > 0)) {
-    logOperation('RECOVERY', `${bag.pair}: no free cash to add to the bag's margin. It stays ${Number(bag.leverage).toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)}.`, 'warning');
+    logOperation('RECOVERY', `${bag.pair}: no free cash to add to the bag's margin yet. It stays ${Number(bag.leverage).toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)}, until cash frees up.`, 'warning');
     return;
   }
+  applyBagTopUp(bag, add);
+}
+
+// Moves `add` of free cash into a bag's margin and works out its new leverage and liquidation price.
+function applyBagTopUp(bag, add, later = false) {
+  const notional = Number(bag.qty) * Number(bag.entryPriceUSDT), margin = Number(bag.marginUSDT);
   State.portfolio.cashUSDT = Number((Number(State.portfolio.cashUSDT) - add).toFixed(6));
   bag.marginUSDT = Number((margin + add).toFixed(6));
   const L = notional / bag.marginUSDT;
   bag.leverage = Number(L.toFixed(2));
   bag.liquidationPrice = Strategy.liquidationPrice(Number(bag.entryPriceUSDT), isShort(bag) ? 'SHORT' : 'LONG', L);
-  logOperation('RECOVERY', `${bag.pair}: $${add.toFixed(2)} of free cash added to the bag's margin, now ${L <= 1.0001
+  logOperation('RECOVERY', `${bag.pair}: $${add.toFixed(2)} of free cash added to the bag's margin${later ? ' (cash freed up)' : ''}, now ${L <= 1.0001
     ? `1x (${isShort(bag) ? `liquidation only at $${formatPrecisePrice(bag.liquidationPrice)}, about +99%` : 'no liquidation'})`
-    : `${L.toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)} (not enough free cash for 1x)`}.`, L <= 1.0001 ? 'success' : 'warning');
+    : `${L.toFixed(2)}x, liquidation $${formatPrecisePrice(bag.liquidationPrice)} (more is added as cash frees up)`}.`, L <= 1.0001 ? 'success' : 'warning');
+}
+
+// v6.19: a bag that is still leveraged (no free cash when it moved to the bag) gets cash as soon as it frees up, until it
+// is back to 1x. Runs every second before the entry checks, so freed cash goes to bags before new trades.
+function topUpBags() {
+  if (tradingPaused()) return;
+  const plan = Strategy.planBagTopUps(State.recoveryBags, Number(State.portfolio.cashUSDT));
+  for (const { key, add } of plan) { const bag = State.recoveryBags[key]; if (bag) applyBagTopUp(bag, add, true); }
+  if (plan.length) { saveDiskState(); broadcastStateUpdate(); }
 }
 
 function demoteToBag(k, pos, price, reason) {
@@ -2971,6 +2986,7 @@ setInterval(async () => {
   if (tradingPaused()) return;
   try {
     await runPredictiveSentry();
+    topUpBags();   // v6.19: leveraged bags get freed cash before new trades
     await evaluateAutopilotEntries();
     syncActiveSymbolSubscriptions(); // add ticks for new buys, drop them for sold coins
   } catch (e) {
