@@ -718,13 +718,13 @@ const EXIT_RULES = {
   demotePct: -3.50,
   minPartialUSDT: 10,
   // What a recovery bag closes at, by minutes since the trade moved to the bag (price move from entry, the trade's way).
-  // v6.20: 0.00% (entry, about -0.10% after fees) from the moment it forms, then -1.50% (a loss) from 16 hours.
-  // (v6.18 had +0.10% for the first hour, then entry.)
-  bagStages: [{ fromMin: 0, pct: 0.00 }, { fromMin: 960, pct: -1.50 }]
+  // v6.22: 0.00% (entry, about -0.10% after fees) from the moment it forms, however long it takes: no time-based cut.
+  // (v6.18 had +0.10% for the first hour, then entry, then -1.50% from 16 hours; v6.20 dropped the +0.10% hour.)
+  bagStages: [{ fromMin: 0, pct: 0.00 }]
 };
 
 /**
- * v6.18: what a recovery bag closes at now, from `bagStages` (v6.20: entry at once, -1.50% from 16 hours). Paper trading of v6.17 (+0.30% for an hour, then -2.00%)
+ * v6.18: what a recovery bag closes at now, from `bagStages` (v6.22: entry only, no time limit). Paper trading of v6.17 (+0.30% for an hour, then -2.00%)
  * lost: in its first 14 hours 4 bag cuts (-2.74 USDT, two of them at 2x) took more than 31 winning trades made
  * (+2.40 USDT), and two of the four coins came back past entry within a few hours of their cut. Your schedule gives a bag
  * 16 hours to get back to entry before it takes a loss, and a smaller one (-1.50%). The 180-day replay scores it below
@@ -796,7 +796,7 @@ function manageNoLoss(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES
   return { action: 'HOLD' };
 }
 
-/** A recovery bag closes at its stage's target or better (v6.20: entry from the start, -1.50% from 16 hours). */
+/** A recovery bag closes at its stage's target or better (v6.22: entry, however long it takes). */
 function manageBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const entry = num(bag.entryPriceUSDT);
   if (!(entry > 0) || !(price > 0)) return { action: 'HOLD' };
@@ -1261,7 +1261,7 @@ function manageShort(pos, price, signals = {}, now = Date.now(), R = EXIT_RULES)
   return r;
 }
 
-/** A short bag mirrors manageBag: its stage's target (v6.20: entry, then 1.50% above entry from 16 hours).
+/** A short bag mirrors manageBag: its stage's target (v6.22: entry, however long it takes).
  *  Funding it has paid moves the target further. */
 function manageShortBag(bag, price, R = EXIT_RULES, now = Date.now()) {
   const entry = num(bag.entryPriceUSDT);
