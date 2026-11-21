@@ -12,6 +12,8 @@
  *  - Python round(): ties to even, and round(x, n) on the exact binary value;
  *  - dict order (insertion) and list.sort (stable) for ranking.
  * The class keeps the spec's names (snake_case fields) so the two can be read side by side.
+ * v6.24: FibConfluenceEngine (below) is the version the app runs: the document's v2 (1h) plus the confluence gate.
+ * The spec's engine stays here as it was (tests and replays).
  * Only addition: autopilotStep(..., { allowEntries }) can skip STEP 3, used by the engine to catch up on bars it
  * missed (no entries at old prices) and to warm up the swing memory. With the default it is the spec's step.
  */
@@ -630,6 +632,277 @@ class CryptoFibAutopilotEngine {
   }
 }
 
+// ------------------------------------------------------------------------------------------------
+// v6.24: FIBONACCI v2 + CONFLUENCE (the best Fibonacci version in the replays, 1h)
+// v2 = the "1h structural" engine from the user's second document (fib_v2_engine.py), ported line by line with the
+// same kernels as above: swings of 10 bars each side and at least 3 ATR, in an EMA50 / EMA200 trend; the entry needs a
+// touch of 0.650 / 0.618 / 0.786, a structural reversal candle (beyond the last bar's high / low, closing in its outer
+// 45%) and RSI turning from below 45 / above 55; stop beyond the swing (at least 1.2%), 35% at TP1 (the swing high /
+// low, then the stop to entry + fees), the rest at the 1.272 extension; 1% risk a trade, 3% in all, 3 trades, 2 a side, 2x.
+// Confluence (from web research, 21 Nov): the 0.618-0.786 zone, widened by the buffer, must hold the swing point before
+// the impulse (old resistance = new support). With { confluence: false } the class is the document's v2 exactly.
+// ------------------------------------------------------------------------------------------------
+const pyMin2 = (a, b) => (b < a ? b : a);   // Python min(a, b): the first argument unless b is smaller (NaN-safe)
+const pyMax2 = (a, b) => (b > a ? b : a);
+const diffN = (a, k) => a.map((v, i) => (i - k >= 0 ? v - a[i - k] : NaN));
+
+class FibConfluenceEngine {
+  constructor({
+    swing_lookback = 10, ema_fast_period = 50, ema_slow_period = 200, rsi_period = 14, atr_period = 14, adx_period = 14,
+    min_adx = 22.0, min_atr_pct = 0.006, min_24h_quote_vol = 15_000_000, min_swing_atr_mult = 3.0, zone_buffer_atr_mult = 0.25,
+    min_stop_pct = 0.012, min_rr = 1.8, max_setup_bars = 36,
+    risk_per_trade = 0.01, max_portfolio_risk = 0.03, max_notional_pct = 0.50, tp1_close_ratio = 0.35,
+    max_open_positions = 3, max_same_direction = 2, leverage = 2.0, cooldown_bars = 6, confluence = true
+  } = {}) {
+    Object.assign(this, { N: swing_lookback, ema_fast_period, ema_slow_period, rsi_period, atr_period, adx_period,
+      min_adx, min_atr_pct, min_24h_quote_vol, min_swing_atr_mult, zone_buffer_atr_mult, min_stop_pct, min_rr, max_setup_bars,
+      risk_per_trade, max_portfolio_risk, max_notional_pct, tp1_close_ratio, max_open_positions, max_same_direction, leverage, cooldown_bars, confluence });
+    this._pivots = {};
+    this._active_setups = {};
+  }
+
+  /** The settings, for the app's status line. */
+  params() {
+    return { swing_lookback: this.N, min_adx: this.min_adx, min_atr_pct: this.min_atr_pct, min_24h_quote_vol: this.min_24h_quote_vol, min_swing_atr_mult: this.min_swing_atr_mult,
+      zone_buffer_atr_mult: this.zone_buffer_atr_mult, min_stop_pct: this.min_stop_pct, min_rr: this.min_rr, max_setup_bars: this.max_setup_bars,
+      risk_per_trade: this.risk_per_trade, max_portfolio_risk: this.max_portfolio_risk, max_notional_pct: this.max_notional_pct, tp1_close_ratio: this.tp1_close_ratio,
+      max_open_positions: this.max_open_positions, max_same_direction: this.max_same_direction, leverage: this.leverage, cooldown_bars: this.cooldown_bars, confluence: this.confluence };
+  }
+
+  /** The swing memory, to save and restore. */
+  memory() { return { pivots: this._pivots, setups: this._active_setups }; }
+  restore(mem) {
+    this._pivots = (mem && mem.pivots) || {};
+    this._active_setups = (mem && mem.setups) || {};
+  }
+
+  compute_indicators(bars) {
+    const open = bars.map((b) => b.open), high = bars.map((b) => b.high), low = bars.map((b) => b.low);
+    const close = bars.map((b) => b.close), volume = bars.map((b) => b.volume), n = bars.length;
+    const ema_fast = ewmMean(close, { span: this.ema_fast_period });
+    const ema_slow = ewmMean(close, { span: this.ema_slow_period });
+    const ema_slow_slope = diffN(ema_slow, 3);
+    const prevClose = shift(close, 1), tr = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const xs = [high[i] - low[i], Math.abs(high[i] - prevClose[i]), Math.abs(low[i] - prevClose[i])].filter((v) => !isNaNum(v));
+      tr[i] = xs.length ? Math.max(...xs) : NaN;
+    }
+    const atr = ewmMean(tr, { alpha: 1 / this.atr_period });
+    const delta = diffN(close, 1);
+    const gainE = ewmMean(delta.map((d) => (isNaNum(d) ? NaN : d < 0 ? 0 : d)), { alpha: 1 / this.rsi_period });
+    const lossE = ewmMean(delta.map((d) => (isNaNum(d) ? NaN : d > 0 ? 0 : d)).map((v) => -v), { alpha: 1 / this.rsi_period });
+    const lossR = replaceZero(lossE);
+    const rsi = gainE.map((g, i) => 100 - (100 / (1 + (g / lossR[i]))));
+    const up = diffN(high, 1), down = diffN(low, 1).map((v) => -v);
+    const pdm = up.map((u, i) => (u > down[i] && u > 0 ? u : 0.0)), mdm = down.map((d, i) => (d > up[i] && d > 0 ? d : 0.0));
+    const atrSafe = replaceZero(atr);
+    const pE = ewmMean(pdm, { alpha: 1 / this.adx_period }), mE = ewmMean(mdm, { alpha: 1 / this.adx_period });
+    const pdi = pE.map((v, i) => 100 * (v / atrSafe[i])), mdi = mE.map((v, i) => 100 * (v / atrSafe[i]));
+    const sum = replaceZero(pdi.map((v, i) => v + mdi[i]));
+    const adx = ewmMean(pdi.map((v, i) => 100 * (Math.abs(v - mdi[i]) / sum[i])), { alpha: 1 / this.adx_period });
+    const vol_sma = rollingMean(volume, 20);
+    const win = 2 * this.N + 1, hiN = shift(high, this.N), loN = shift(low, this.N);
+    const rmax = rollingExtreme(high, win, true), rmin = rollingExtreme(low, win, false);
+    return { open, high, low, close, volume, ema_fast, ema_slow, ema_slow_slope, atr, rsi, adx, vol_sma,
+      conf_high: hiN.map((v, i) => (v === rmax[i] ? v : NaN)), conf_low: loN.map((v, i) => (v === rmin[i] ? v : NaN)), n };
+  }
+
+  _update_symbol_pivots(symbol, row, bar_idx) {
+    if (!this._pivots[symbol]) this._pivots[symbol] = [];
+    const pivots = this._pivots[symbol];
+    let updated = false;
+    const c = [];
+    if (!isNaNum(row.conf_high)) c.push({ kind: 'HIGH', bar_idx: bar_idx - this.N, price: Number(row.conf_high) });
+    if (!isNaNum(row.conf_low)) c.push({ kind: 'LOW', bar_idx: bar_idx - this.N, price: Number(row.conf_low) });
+    if (c.length === 2 && row.close >= row.open) c.reverse();
+    for (const cand of c) {
+      if (!pivots.length) { pivots.push(cand); updated = true; continue; }
+      const last = pivots[pivots.length - 1];
+      if (last.kind === cand.kind) {
+        if ((cand.kind === 'HIGH' && cand.price > last.price) || (cand.kind === 'LOW' && cand.price < last.price)) { pivots[pivots.length - 1] = cand; updated = true; }
+      } else { pivots.push(cand); updated = true; }
+    }
+    if (pivots.length > 20) this._pivots[symbol] = pivots.slice(-20);
+    return updated;
+  }
+
+  _setup(symbol, swing_low, swing_high, direction, bar_idx, prior) {
+    const s = CryptoFibAutopilotEngine._build_fib_setup(symbol, swing_low, swing_high, direction, bar_idx);   // the same levels as v1
+    if (this.confluence) s.prior = prior;   // the swing point before the impulse
+    return s;
+  }
+
+  screen_coin(spec, bars, state, quote_volume_24h, btc_regime = null) {
+    if (bars.length <= Math.max(this.ema_slow_period, 2 * this.N + 2)) return null;
+    if (quote_volume_24h < this.min_24h_quote_vol) return null;
+    const d = this.compute_indicators(bars), i = d.n - 1;
+    const row = {}, prev = {};
+    for (const k of Object.keys(d)) if (Array.isArray(d[k])) { row[k] = d[k][i]; prev[k] = d[k][i - 1]; }
+    const ts = tsString(bars[bars.length - 1].t);
+    const bar_idx = (state.bar_counters[spec.symbol] || 0) + 1;
+    state.bar_counters[spec.symbol] = bar_idx;
+    const atr = Number(row.atr), adx = Number(row.adx);
+    const close_p = Number(row.close), open_p = Number(row.open), high_p = Number(row.high), low_p = Number(row.low);
+    const prev_high = Number(prev.high), prev_low = Number(prev.low), candle_range = high_p - low_p;
+    if (isNaNum(atr) || isNaNum(adx) || close_p <= 0 || candle_range <= 0) return null;
+
+    const pivot_updated = this._update_symbol_pivots(spec.symbol, row, bar_idx);
+    const pivots = this._pivots[spec.symbol] || [];
+    if (pivot_updated && pivots.length >= 2) {
+      const p_prev = pivots[pivots.length - 2], p_last = pivots[pivots.length - 1];
+      const prior = pivots.length >= 3 ? pivots[pivots.length - 3].price : null;
+      if (Math.abs(p_last.price - p_prev.price) >= this.min_swing_atr_mult * atr) {
+        const bullish_stack = close_p > row.ema_fast && row.ema_fast > row.ema_slow && row.ema_slow_slope > 0;
+        const bearish_stack = close_p < row.ema_fast && row.ema_fast < row.ema_slow && row.ema_slow_slope < 0;
+        if (p_prev.kind === 'LOW' && p_last.kind === 'HIGH' && bullish_stack) this._active_setups[spec.symbol] = this._setup(spec.symbol, p_prev.price, p_last.price, 'BULLISH', bar_idx, prior);
+        else if (p_prev.kind === 'HIGH' && p_last.kind === 'LOW' && bearish_stack) this._active_setups[spec.symbol] = this._setup(spec.symbol, p_last.price, p_prev.price, 'BEARISH', bar_idx, prior);
+      }
+    }
+    const setup = this._active_setups[spec.symbol];
+    if (!setup || !setup.active || setup.traded) return null;
+    if ((bar_idx - setup.created_bar) > this.max_setup_bars) { setup.active = false; return null; }
+    if (bar_idx < (state.cooldown_until_bar[spec.symbol] || 0)) return null;
+    if ((atr / close_p) < this.min_atr_pct || adx < this.min_adx) return null;
+    const buffer = this.zone_buffer_atr_mult * atr;
+    const vol_ratio = row.vol_sma > 0 ? Number(row.volume / row.vol_sma) : 1.0;
+    const W = { '0.650': 35.0, '0.618': 35.0, '0.786': 28.0 }, r = this.tp1_close_ratio, R = setup.retracements;
+    if (this.confluence) {
+      const lo = Math.min(R['0.618'], R['0.786']) - buffer, hi = Math.max(R['0.618'], R['0.786']) + buffer;
+      if (!(setup.prior !== null && setup.prior !== undefined && setup.prior >= lo && setup.prior <= hi)) return null;
+    }
+
+    if (setup.direction === 'BULLISH') {
+      if (btc_regime === 'BEARISH') return null;
+      if (close_p < setup.swing_low - buffer || close_p > setup.swing_high + buffer) { setup.active = false; return null; }
+      for (const lvl_key of ['0.650', '0.618', '0.786']) {
+        const lvl = R[lvl_key];
+        const touched = (low_p <= (lvl + buffer) || prev_low <= (lvl + buffer)) && close_p >= (lvl - buffer);
+        const structural_reversal = close_p > open_p && close_p > prev_high && ((close_p - low_p) / candle_range) >= 0.55;
+        const rsi_recovery = pyMin2(Number(row.rsi), Number(prev.rsi)) < 45.0 && row.rsi > prev.rsi;
+        if (touched && structural_reversal && rsi_recovery) {
+          const entry = round_tick(close_p, spec.tick_size);
+          const sl = round_tick(pyMin2(setup.swing_low - 0.5 * atr, entry * (1.0 - this.min_stop_pct)), spec.tick_size);
+          const tp1 = round_tick(setup.swing_high, spec.tick_size), tp2 = round_tick(setup.extensions['1.272'], spec.tick_size);
+          const fee_cost = entry * spec.taker_fee * 2;
+          const risk = (entry - sl) + fee_cost;
+          const reward = (((r * tp1) + ((1.0 - r) * tp2)) - entry) - fee_cost;
+          if (risk <= 0 || (reward / risk) < this.min_rr) continue;
+          const rr = reward / risk;
+          return { symbol: spec.symbol, timestamp: ts, side: 'LONG', entry_price: entry, stop_loss: sl, take_profit_1: tp1, take_profit_2: tp2,
+            fib_level: lvl_key, rr_ratio: pyRound(rr, 2), confluence_score: FibConfluenceEngine._compute_confluence_score(W[lvl_key], rr, vol_ratio, adx), setup_id: setup.setup_id };
+        }
+      }
+    } else if (setup.direction === 'BEARISH') {
+      if (btc_regime === 'BULLISH') return null;
+      if (close_p > setup.swing_high + buffer || close_p < setup.swing_low - buffer) { setup.active = false; return null; }
+      for (const lvl_key of ['0.650', '0.618', '0.786']) {
+        const lvl = R[lvl_key];
+        const touched = (high_p >= (lvl - buffer) || prev_high >= (lvl - buffer)) && close_p <= (lvl + buffer);
+        const structural_reversal = close_p < open_p && close_p < prev_low && ((high_p - close_p) / candle_range) >= 0.55;
+        const rsi_recovery = pyMax2(Number(row.rsi), Number(prev.rsi)) > 55.0 && row.rsi < prev.rsi;
+        if (touched && structural_reversal && rsi_recovery) {
+          const entry = round_tick(close_p, spec.tick_size);
+          const sl = round_tick(pyMax2(setup.swing_high + 0.5 * atr, entry * (1.0 + this.min_stop_pct)), spec.tick_size);
+          const tp1 = round_tick(setup.swing_low, spec.tick_size), tp2 = round_tick(setup.extensions['1.272'], spec.tick_size);
+          const fee_cost = entry * spec.taker_fee * 2;
+          const risk = (sl - entry) + fee_cost;
+          const reward = (entry - ((r * tp1) + ((1.0 - r) * tp2))) - fee_cost;
+          if (risk <= 0 || (reward / risk) < this.min_rr) continue;
+          const rr = reward / risk;
+          return { symbol: spec.symbol, timestamp: ts, side: 'SHORT', entry_price: entry, stop_loss: sl, take_profit_1: tp1, take_profit_2: tp2,
+            fib_level: lvl_key, rr_ratio: pyRound(rr, 2), confluence_score: FibConfluenceEngine._compute_confluence_score(W[lvl_key], rr, vol_ratio, adx), setup_id: setup.setup_id };
+        }
+      }
+    }
+    return null;
+  }
+
+  static _compute_confluence_score(level_pts, rr, vol_ratio, adx) {
+    const rr_pts = pyMin2(25.0, pyMax2(0.0, (rr - 1.2) * 12.5));
+    const vol_pts = pyMin2(20.0, pyMax2(0.0, (vol_ratio - 0.8) * 15.0));
+    const adx_pts = pyMin2(20.0, pyMax2(0.0, (adx - 18.0) * 0.8));
+    return pyRound(level_pts + rr_pts + vol_pts + adx_pts, 2);
+  }
+
+  autopilot_step(universe, state, btc_regime = null, { allowEntries = true } = {}) {
+    const orders = [];
+    const mk = (o) => ({ stop_loss: null, take_profit_1: null, take_profit_2: null, reason: '', realized_pnl: 0.0, ...o });
+    for (const symbol of Object.keys(state.positions)) {
+      if (!universe.has(symbol)) continue;
+      const pos = state.positions[symbol], { spec, bars } = universe.get(symbol), last = bars[bars.length - 1];
+      const high_p = Number(last.high), low_p = Number(last.low), bar_idx = state.bar_counters[symbol] || 0, fee = spec.taker_fee, L = this.leverage;
+      const long = pos.side === 'LONG';
+      if (pos.side !== 'LONG' && pos.side !== 'SHORT') continue;
+      if (long ? low_p <= pos.stop_loss : high_p >= pos.stop_loss) {
+        const exit_fee = pos.stop_loss * pos.remaining_size * fee;
+        const pnl = (long ? (pos.stop_loss - pos.entry_price) : (pos.entry_price - pos.stop_loss)) * pos.remaining_size - exit_fee;
+        state.equity += pnl;
+        state.free_balance += (pos.entry_price * pos.remaining_size) / L + pnl;
+        state.cooldown_until_bar[symbol] = bar_idx + this.cooldown_bars;
+        delete state.positions[symbol];
+        orders.push(mk({ client_order_id: `${pos.position_id}_SL`, symbol, action: 'CLOSE_ALL', order_type: 'MARKET', quantity: pos.remaining_size, price: pos.stop_loss, reason: 'STOP_LOSS_HIT', realized_pnl: pyRound(pnl, 4) }));
+        continue;
+      }
+      if (!pos.tp1_hit && (long ? high_p >= pos.take_profit_1 : low_p <= pos.take_profit_1)) {
+        const close_qty = floor_step(pos.initial_size * this.tp1_close_ratio, spec.step_size);
+        if (close_qty > 0 && (pos.remaining_size - close_qty) >= spec.step_size) {
+          const exit_fee = pos.take_profit_1 * close_qty * fee;
+          const pnl = (long ? (pos.take_profit_1 - pos.entry_price) : (pos.entry_price - pos.take_profit_1)) * close_qty - exit_fee;
+          state.equity += pnl;
+          state.free_balance += (pos.entry_price * close_qty) / L + pnl;
+          pos.remaining_size = floor_step(pos.remaining_size - close_qty, spec.step_size);
+          pos.tp1_hit = true;
+          pos.stop_loss = round_tick(pos.entry_price * (long ? (1.0 + 2.2 * fee) : (1.0 - 2.2 * fee)), spec.tick_size);
+          pos.risk_amount = 0.0;
+          orders.push(mk({ client_order_id: `${pos.position_id}_TP1`, symbol, action: 'CLOSE_PARTIAL', order_type: 'MARKET', quantity: close_qty, price: pos.take_profit_1, stop_loss: pos.stop_loss, reason: 'TP1_PARTIAL_AND_BREAKEVEN', realized_pnl: pyRound(pnl, 4) }));
+        }
+      }
+      if (pos.tp1_hit && (long ? high_p >= pos.take_profit_2 : low_p <= pos.take_profit_2)) {
+        const exit_fee = pos.take_profit_2 * pos.remaining_size * fee;
+        const pnl = (long ? (pos.take_profit_2 - pos.entry_price) : (pos.entry_price - pos.take_profit_2)) * pos.remaining_size - exit_fee;
+        state.equity += pnl;
+        state.free_balance += (pos.entry_price * pos.remaining_size) / L + pnl;
+        delete state.positions[symbol];
+        orders.push(mk({ client_order_id: `${pos.position_id}_TP2`, symbol, action: 'CLOSE_ALL', order_type: 'MARKET', quantity: pos.remaining_size, price: pos.take_profit_2, reason: 'TP2_FINAL_TARGET', realized_pnl: pyRound(pnl, 4) }));
+      }
+    }
+    const candidates = [];
+    for (const [symbol, u] of universe) {
+      if (symbol in state.positions) continue;
+      const sig = this.screen_coin(u.spec, u.bars, state, u.quote_volume_24h, btc_regime);
+      if (sig !== null) candidates.push(sig);
+    }
+    candidates.sort((a, b) => b.confluence_score - a.confluence_score);
+    if (!allowEntries) return { orders, candidates };
+    for (const sig of candidates) {
+      if (Object.keys(state.positions).length >= this.max_open_positions) break;
+      if (Object.values(state.positions).filter((p) => p.side === sig.side).length >= this.max_same_direction) continue;
+      const current_open_risk = Object.values(state.positions).reduce((a, p) => a + p.risk_amount, 0);
+      const trade_risk_budget = Math.min(state.equity * this.risk_per_trade, state.equity * this.max_portfolio_risk - current_open_risk);
+      if (trade_risk_budget <= 0) break;
+      const spec = universe.get(sig.symbol).spec, price_risk = Math.abs(sig.entry_price - sig.stop_loss);
+      if (price_risk <= 0) continue;
+      const raw_qty = trade_risk_budget / price_risk;
+      const max_notional = Math.min(state.free_balance * this.leverage * 0.98, state.equity * this.leverage * this.max_notional_pct);
+      const qty = floor_step(Math.min(raw_qty, max_notional / sig.entry_price), spec.step_size);
+      const notional = qty * sig.entry_price, entry_fee = notional * spec.taker_fee;
+      const required_margin = (notional / this.leverage) + entry_fee;
+      if (qty <= 0 || notional < spec.min_notional || required_margin > state.free_balance) continue;
+      const pos_id = `POS_${sig.setup_id}`;
+      state.free_balance -= required_margin;
+      state.equity -= entry_fee;
+      state.positions[sig.symbol] = { position_id: pos_id, symbol: sig.symbol, side: sig.side, entry_time: String(sig.timestamp), entry_price: sig.entry_price,
+        stop_loss: sig.stop_loss, take_profit_1: sig.take_profit_1, take_profit_2: sig.take_profit_2, initial_size: qty, remaining_size: qty,
+        fib_level: sig.fib_level, risk_amount: (qty * price_risk) + (notional * spec.taker_fee * 2), tp1_hit: false };
+      if (sig.symbol in this._active_setups) this._active_setups[sig.symbol].traded = true;
+      orders.push(mk({ client_order_id: `${pos_id}_ENTRY`, symbol: sig.symbol, action: `OPEN_${sig.side}`, order_type: 'MARKET', quantity: qty, price: sig.entry_price,
+        stop_loss: sig.stop_loss, take_profit_1: sig.take_profit_1, take_profit_2: sig.take_profit_2,
+        reason: `FIB_${sig.fib_level}_SCORE_${pyRepr(sig.confluence_score)}_RR_${pyRepr(sig.rr_ratio)}` }));
+    }
+    return { orders, candidates };
+  }
+}
+
 /** Engine parameters for a timeframe: the class defaults, the spec's preset for that timeframe, and the leverage. */
 function engineParams(timeframe = '15m', leverage = 3.0) {
   const preset = PRESETS[TIMEFRAMES[timeframe] || 'intraday'];
@@ -649,7 +922,7 @@ function quoteVolume24h(bars, tfMs) {
 }
 
 module.exports = {
-  CryptoFibAutopilotEngine, SymbolSpec, PortfolioState, PRESETS, TIMEFRAMES, TF_MS, LEVEL_ORDER, LEVEL_WEIGHTS,
+  CryptoFibAutopilotEngine, FibConfluenceEngine, SymbolSpec, PortfolioState, PRESETS, TIMEFRAMES, TF_MS, LEVEL_ORDER, LEVEL_WEIGHTS,
   engineParams, toBars, quoteVolume24h,
   // kernels and helpers (exported for tests and the cross-check)
   pyRound, pyRoundInt, pyRepr, ewmMean, rollingMean, rollingExtreme, round_tick, floor_step, tsString
