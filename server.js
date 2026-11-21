@@ -9,7 +9,8 @@
  * which closes at entry (0.00%), however long it takes (v6.22; no time-based cut). A bag still above 1x
  * gets free cash every second until it is 1x (v6.19), but only cash above one new trade's margin (v6.21).
  * v6.23: Settings > Entry strategy picks the candlestick model above or the Fibonacci retracement autopilot (fib.js),
- * which has its own stop-loss and targets. See CHANGES.md v5.8, v6.18 to v6.23.
+ * which has its own stop-loss and targets. v6.24: the Fibonacci engine is v2 + confluence on 1h.
+ * See CHANGES.md v5.8, v6.18 to v6.24.
  * Strategy logic lives in strategy.js (shared with backtest.js).
  * =========================================================================
  */
@@ -124,9 +125,9 @@ const State = {
   lastTrendMode: null,   // v6.17: the last BULL / BEAR market mode (for "neutral after bullish: shorts only")
   // v6.23: Settings > Entry strategy: 'CANDLE' (the candlestick model) or 'FIB' (the Fibonacci retracement autopilot)
   entryStrategy: String(process.env.ENTRY_STRATEGY || '').toUpperCase() === 'FIB' ? 'FIB' : 'CANDLE',
-  fibTimeframe: Fib.TIMEFRAMES[process.env.FIB_TIMEFRAME] ? process.env.FIB_TIMEFRAME : '15m',
+  fibTimeframe: '1h',   // v6.24: the Fibonacci strategy (v2 + confluence) runs on 1h candles only
   // the Fibonacci engine's own state: swing memory, its positions / cooldowns / bar counters, the last bar it ran on
-  fib: { memory: { pivots: {}, setups: {} }, portfolio: { positions: {}, cooldown_until_bar: {}, bar_counters: {} }, lastBarT: 0, warm: false, timeframe: null },
+  fib: { memory: { pivots: {}, setups: {} }, portfolio: { positions: {}, cooldown_until_bar: {}, bar_counters: {} }, lastBarT: 0, warm: false, timeframe: null, engine: null },
   fibUniverse: [],   // the radar's coins, in its order (biggest futures volume first)
   tradeLogs: [],
   universe: {},
@@ -1685,7 +1686,7 @@ async function runPredictiveSentry() {
         realizeExit('activePositions', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
         continue;
       }
-      // v6.23: a Fibonacci trade is managed only at each closed bar (fibTick): stop-loss, TP1 50% + stop to entry, TP2.
+      // v6.23: a Fibonacci trade is managed only at each closed bar (fibTick): stop-loss, TP1 35% + stop to entry (v6.24), TP2.
       // No minimum exit, trail, harvest, scratch or move to a recovery bag.
       if (pos.fib) continue;
       // v6.12: your take profit replaces the autopilot's exits for this trade; the -3.50% move to a bag stays.
@@ -2072,15 +2073,18 @@ async function recordTradeToCloudLedger(trade, { announce = true } = {}) {
 }
 
 // =============================================================
-// v6.23: FIBONACCI RETRACEMENT AUTOPILOT (Settings > Entry strategy). The engine is fib.js, a line-by-line port of the
-// specification's Python, checked against it on real candles. It runs once per closed bar of its timeframe (default 15m)
-// over the radar's coins, as the spec's autopilot_step:
-//   STEP 1 manages its open trades on the closed bar: stop-loss, TP1 (50% at the swing extreme, stop to entry), TP2 (1.272),
-//   STEP 2 screens every coin (swings, Fibonacci zones, EMA200 / ADX / RSI / wick / R:R), ranks by confluence score,
-//   STEP 3 opens the best within its caps: 1% of account value at risk a trade, 4% in all, 4 trades, 2 a side, 3x.
-// Fills are the spec's prices (entry at the signal bar's close, exits at the stop / target), with the usual 0.05% fees.
+// v6.23: FIBONACCI RETRACEMENT AUTOPILOT (Settings > Entry strategy).
+// v6.24: the engine is fib.js FibConfluenceEngine, the best version in the replays: the document's v2 (1h structural),
+// checked against its Python on real candles, plus the confluence gate (the 0.618-0.786 zone must hold the swing point
+// before the impulse). It runs once per closed 1h bar over the radar's coins, as autopilot_step:
+//   STEP 1 manages its open trades on the closed bar: stop-loss, TP1 (35% at the swing extreme, stop to entry + fees),
+//          TP2 (the rest at the 1.272 extension),
+//   STEP 2 screens every coin (10-bar swings of 3+ ATR in an EMA50 / EMA200 trend, a touch of 0.650 / 0.618 / 0.786,
+//          a structural reversal candle, RSI turning, R:R 1.8+, confluence), ranks by confluence score,
+//   STEP 3 opens the best within its caps: 1% of account value at risk a trade, 3% in all, 3 trades, 2 a side, 2x.
+// Fills are the engine's prices (entry at the signal bar's close, exits at the stop / target), with the usual 0.05% fees.
 // =============================================================
-const FIB = { leverage: 3.0, window: 1000, warmBars: 500, maxCatchUp: 200 };
+const FIB = { engine: 'v2c', timeframe: '1h', leverage: 2.0, window: 1000, warmBars: 500, maxCatchUp: 200 };
 const fibSeries = new Map();   // symbol -> { tf, bars } closed bars, oldest first (at most window + warmBars)
 let fibEngine = null, fibEngineTf = null, fibBusy = false;
 const fibSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -2089,13 +2093,13 @@ const fibBarTime = (t, tfMs) => new Date(t + tfMs).toLocaleTimeString('en-IN', {
 function resetFibMemory(tf) {
   State.fib.memory = { pivots: {}, setups: {} };
   Object.assign(State.fib.portfolio, { cooldown_until_bar: {}, bar_counters: {} });
-  Object.assign(State.fib, { lastBarT: 0, warm: false, timeframe: tf });
+  Object.assign(State.fib, { lastBarT: 0, warm: false, timeframe: tf, engine: FIB.engine });
   fibEngine = null;
 }
 
 function fibEngineFor(tf) {
   if (!fibEngine || fibEngineTf !== tf) {
-    fibEngine = new Fib.CryptoFibAutopilotEngine(Fib.engineParams(tf, FIB.leverage));
+    fibEngine = new Fib.FibConfluenceEngine({ leverage: FIB.leverage });   // v6.24
     fibEngineTf = tf;
   }
   // the engine works on State.fib.memory itself, so saving the state (and a handover) carries its swing memory
@@ -2122,13 +2126,12 @@ function fibRegime() {
 }
 
 function syncFibStatus(extra = {}) {
-  const tf = State.fibTimeframe, prm = Fib.engineParams(tf, FIB.leverage), port = State.fib.portfolio;
+  const tf = State.fibTimeframe, prm = new Fib.FibConfluenceEngine({ leverage: FIB.leverage }).params(), port = State.fib.portfolio;
   const waiting = Object.values(State.fib.memory.setups || {}).filter((st) => st.active && !st.traded
     && ((port.bar_counters[st.symbol] || 0) - st.created_bar) <= prm.max_setup_bars).length;
-  State.subsystems.fib = { ...(State.subsystems.fib || {}), strategy: State.entryStrategy, timeframe: tf, timeframes: Object.keys(Fib.TIMEFRAMES),
+  State.subsystems.fib = { ...(State.subsystems.fib || {}), strategy: State.entryStrategy, timeframe: tf, timeframes: [FIB.timeframe], engine: FIB.engine,
     warm: State.fib.warm, lastBarT: State.fib.lastBarT, setupsWaiting: waiting, positions: Object.keys(port.positions || {}).length,
-    params: { ...prm, risk_per_trade: 0.01, max_portfolio_risk: 0.04, max_open_positions: 4, max_same_direction: 2, min_atr_pct: 0.004, min_24h_quote_vol: 10000000 },
-    ...extra };
+    params: prm, ...extra };
 }
 
 function openFib(o, sig, tf, T) {
@@ -2152,7 +2155,7 @@ function openFib(o, sig, tf, T) {
       score: sig ? sig.confluence_score : null, rr: sig ? sig.rr_ratio : null, riskUSDT: Number(sp.risk_amount) || 0,
       timeframe: tf, barT: T, positionId: sp.position_id || null, setupId: sig ? sig.setup_id : null }
   };
-  logOperation('EXECUTION', `${side === 'LONG' ? 'LONGED' : 'SHORTED'} ${sym}/USDT @ $${formatPrecisePrice(entry)} (Fibonacci ${sp.fib_level} ${side.toLowerCase()}, ${tf}; $${notional.toFixed(2)} on $${margin.toFixed(2)} margin, ${lev}x, paper) • stop $${formatPrecisePrice(o.stop_loss)} (risk $${(Number(sp.risk_amount) || 0).toFixed(2)}) • TP1 $${formatPrecisePrice(o.take_profit_1)} (half, then stop to entry) • TP2 $${formatPrecisePrice(o.take_profit_2)}${sig ? ` • score ${sig.confluence_score}, R:R ${sig.rr_ratio}` : ''}`, 'success');
+  logOperation('EXECUTION', `${side === 'LONG' ? 'LONGED' : 'SHORTED'} ${sym}/USDT @ $${formatPrecisePrice(entry)} (Fibonacci ${sp.fib_level} ${side.toLowerCase()}, ${tf}; $${notional.toFixed(2)} on $${margin.toFixed(2)} margin, ${lev}x, paper) • stop $${formatPrecisePrice(o.stop_loss)} (risk $${(Number(sp.risk_amount) || 0).toFixed(2)}) • TP1 $${formatPrecisePrice(o.take_profit_1)} (35%, then the stop to entry + fees) • TP2 $${formatPrecisePrice(o.take_profit_2)}${sig ? ` • score ${sig.confluence_score}, R:R ${sig.rr_ratio}` : ''}`, 'success');
   return true;
 }
 
@@ -2165,15 +2168,15 @@ function executeFibOrders(orders, candidates, tf, T) {
     const short = isShort(pos);
     if (o.action === 'CLOSE_PARTIAL') {
       const fraction = Math.min(1, Number(o.quantity) / Number(pos.qty));
-      realizeExit('activePositions', k, fraction, o.price, 'FIB TP1 50%', `Fibonacci TP1: half closed at the swing ${short ? 'low' : 'high'} $${formatPrecisePrice(o.price)}; stop moved to entry $${formatPrecisePrice(o.stop_loss)}`);
+      realizeExit('activePositions', k, fraction, o.price, 'FIB TP1 35%', `Fibonacci TP1: ${Math.round(fraction * 100)}% closed at the swing ${short ? 'low' : 'high'} $${formatPrecisePrice(o.price)}; stop moved to entry + fees $${formatPrecisePrice(o.stop_loss)}`);
       const still = State.activePositions[k];
       if (still && still.fib) { Object.assign(still.fib, { sl: o.stop_loss, tp1Hit: true }); still.sl = o.stop_loss; }
     } else if (o.reason === 'STOP_LOSS_HIT') {
       const be = Boolean(pos.fib.tp1Hit);
       realizeExit('activePositions', k, 1, o.price, be ? 'FIB BREAKEVEN STOP' : 'FIB STOP LOSS',
-        be ? `Fibonacci: the second half closed at its entry stop $${formatPrecisePrice(o.price)}` : `Fibonacci stop-loss hit at $${formatPrecisePrice(o.price)} (${pos.fib.level} ${short ? 'short' : 'long'})`);
+        be ? `Fibonacci: the rest closed at its entry stop $${formatPrecisePrice(o.price)}` : `Fibonacci stop-loss hit at $${formatPrecisePrice(o.price)} (${pos.fib.level} ${short ? 'short' : 'long'})`);
     } else {
-      realizeExit('activePositions', k, 1, o.price, 'FIB TP2 1.272', `Fibonacci TP2: the second half closed at the 1.272 extension $${formatPrecisePrice(o.price)}`);
+      realizeExit('activePositions', k, 1, o.price, 'FIB TP2 1.272', `Fibonacci TP2: the rest closed at the 1.272 extension $${formatPrecisePrice(o.price)}`);
     }
   }
 }
@@ -2247,7 +2250,7 @@ async function fibTick() {
   const tf = State.fibTimeframe, tfMs = Fib.TF_MS[tf];
   const active = State.entryStrategy === 'FIB';
   if (!active && !Object.keys(State.fib.portfolio.positions || {}).length) return;
-  if (State.fib.timeframe && State.fib.timeframe !== tf) resetFibMemory(tf);
+  if ((State.fib.timeframe && State.fib.timeframe !== tf) || State.fib.engine !== FIB.engine) resetFibMemory(tf);   // v6.24: a new engine re-reads the swings
   const now = Date.now(), targetT = Math.floor(now / tfMs) * tfMs - tfMs;   // open time of the last closed bar
   if (now - (targetT + tfMs) < 4000) return;                               // a few seconds for Binance to close the bar
   if (State.fib.lastBarT >= targetT || fapiBusy() || !perpetuals.size || !(State.fibUniverse || []).length) return;
@@ -2319,11 +2322,11 @@ function applyPersistedState(parsed, live = false) {
   State.capitalResetId = parsed.capitalResetId;
   if (parsed.lastTrendMode === 'BULL' || parsed.lastTrendMode === 'BEAR') State.lastTrendMode = parsed.lastTrendMode;
   if (parsed.entryStrategy === 'CANDLE' || parsed.entryStrategy === 'FIB') State.entryStrategy = parsed.entryStrategy;   // v6.23
-  if (Fib.TIMEFRAMES[parsed.fibTimeframe]) State.fibTimeframe = parsed.fibTimeframe;
+  // v6.24: the Fibonacci timeframe is fixed at 1h (a saved 15m / 30m / 4h is ignored; its swing memory is re-read)
   if (parsed.fib && typeof parsed.fib === 'object' && parsed.fib.portfolio && parsed.fib.memory) {
     State.fib = { memory: { pivots: parsed.fib.memory.pivots || {}, setups: parsed.fib.memory.setups || {} },
       portfolio: { positions: parsed.fib.portfolio.positions || {}, cooldown_until_bar: parsed.fib.portfolio.cooldown_until_bar || {}, bar_counters: parsed.fib.portfolio.bar_counters || {} },
-      lastBarT: Number(parsed.fib.lastBarT) || 0, warm: Boolean(parsed.fib.warm), timeframe: parsed.fib.timeframe || null };
+      lastBarT: Number(parsed.fib.lastBarT) || 0, warm: Boolean(parsed.fib.warm), timeframe: parsed.fib.timeframe || null, engine: parsed.fib.engine || null };
   }
   if (live) {
     if (typeof parsed.autopilotEnabled === 'boolean') State.autopilotEnabled = parsed.autopilotEnabled;
@@ -2808,7 +2811,7 @@ app.post('/api/strategy', (req, res) => {
   const strategy = b.strategy === undefined ? State.entryStrategy : String(b.strategy).toUpperCase();
   const tf = b.timeframe === undefined ? State.fibTimeframe : String(b.timeframe);
   if (!['CANDLE', 'FIB'].includes(strategy)) return res.status(400).json({ success: false, error: 'strategy must be CANDLE or FIB' });
-  if (!Fib.TIMEFRAMES[tf]) return res.status(400).json({ success: false, error: `timeframe must be one of: ${Object.keys(Fib.TIMEFRAMES).join(', ')}` });
+  if (tf !== FIB.timeframe) return res.status(400).json({ success: false, error: 'the Fibonacci strategy runs on 1h only (v6.24)' });
   const was = State.entryStrategy, tfChanged = tf !== State.fibTimeframe;
   State.entryStrategy = strategy;
   State.fibTimeframe = tf;
