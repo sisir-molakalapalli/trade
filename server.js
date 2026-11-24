@@ -1,6 +1,6 @@
 /**
  * =========================================================================
- * SISIR QUANT TERMINAL - BACKEND ENGINE v5.8 (v4 ENTRIES, NO-LOSS EXITS, RECOVERY BAGS) --
+ * SISIR QUANT TERMINAL - BACKEND ENGINE v5.8 (v4 ENTRIES, NO-LOSS EXITS, RECOVERY BAGS)
  * =========================================================================
  * PAPER TRADING ENGINE: positions are simulated against live Binance prices.
  * No orders are sent to Binance from this file.
@@ -106,6 +106,8 @@ const State = {
   leverageAuto: ['on', '1', 'true'].includes(String(process.env.LEVERAGE_AUTO || '').toLowerCase()),
   // Settings > Both sides (v6.9): on = longs and shorts in every market mode; off = BULL longs only, BEAR shorts only.
   bothSides: !['off', '0', 'false'].includes(String(process.env.BOTH_SIDES || '').toLowerCase()),
+  // Settings > Trade direction (v6.30): SHORT = shorts only (default), BOTH = shorts and longs as above. SIDE_MODE=both starts it on BOTH.
+  sideMode: Strategy.validSideMode(process.env.SIDE_MODE) || 'SHORT',
   breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
   // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
@@ -334,16 +336,16 @@ async function getKlinesStrict(symbol, interval, limit) {
 // -------------------------------------------------------------
 // MARKET MODE (replaces the BTC gate): see strategy.evaluateMarketMode
 // -------------------------------------------------------------
-// Which side(s) new trades may take: the market mode's side, or both when Settings > Both sides is on (v6.9).
+// Which side(s) new trades may take: shorts only when Settings > Trade direction is Shorts only (v6.30, the default);
+// otherwise the market mode's side, or both when Settings > Both sides is on (v6.9).
 // A trade against the market mode's side needs the coin's own 1h trend to agree, as every trade in NEUTRAL does.
 function tradeSide(mode = State.subsystems.marketMode) {
-  if (!mode || !mode.side || mode.side === 'NONE') return 'NONE';
-  if (mode.shortsOnly) return 'SHORT';   // v6.17: neutral after bullish with BTC below its 1h EMA50 (also with Both sides on)
-  return State.bothSides ? 'BOTH' : mode.side;
+  return Strategy.tradeSideFor(mode, { sideMode: State.sideMode, bothSides: State.bothSides });
 }
 function sideText(mode) {
   const ts = tradeSide(mode);
   if (ts === 'NONE') return 'No new trades.';
+  if (State.sideMode === 'SHORT') return 'Shorts only (Settings): autopilot opens only futures shorts; outside a Bearish market each needs the coin\'s own 1h downtrend. No new longs.';
   if (mode.shortsOnly) return 'Autopilot opens only futures shorts, where a coin\'s own 1h trend is down. No new longs.';
   if (ts === 'LONG') return 'Autopilot opens futures longs.';
   if (ts === 'SHORT') return 'Autopilot opens futures shorts.';
@@ -1275,7 +1277,7 @@ async function evaluateShortEntries(maxBagsLimit) {
 
       // Settings > High vol breakdown > Long (paper test): the same breakdown signal, after the same checks, is bought
       // at the ask and closes only at +0.30%. Candle-pattern shorts are never flipped.
-      if (!candle.isShortEntry && State.breakdownSide === 'LONG') {
+      if (!candle.isShortEntry && State.breakdownSide === 'LONG' && State.sideMode !== 'SHORT') {   // v6.30: shorts only shorts every breakdown
         const ask = book.bestAsk, tPct = Strategy.BREAKDOWN_LONG.targetPct;
         const lsig = await buildEntrySignal(pairKey, ask, 'HIGH_VOL_BREAKDOWN LONG', mom);
         const lplan = Strategy.planCompoundEntry(lsig, ask, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey)));
@@ -2139,6 +2141,7 @@ function openFib(o, sig, tf, T) {
   const sp = port.positions[k] || {};
   const undo = (why) => { delete port.positions[k]; logOperation('FIB', `${k}: Fibonacci ${side.toLowerCase()} not opened: ${why}.`, 'warning'); return false; };
   if (tradingPaused()) return undo('trading is paused');
+  if (side === 'LONG' && State.sideMode === 'SHORT') return undo('Settings > Trade direction is Shorts only');   // v6.30
   if ((State.activePositions[k] && !State.activePositions[k].fib) || State.recoveryBags[k]) return undo('this coin already has an open trade or bag');
   const entry = Number(o.price), qty = Number(o.quantity), notional = qty * entry, margin = notional / lev, cost = margin + notional * FUT_FEE_RATE;
   if (!(qty > 0) || Number(State.portfolio.cashUSDT) < cost) return undo(`needs $${cost.toFixed(2)}, free cash $${Number(State.portfolio.cashUSDT).toFixed(2)}`);
@@ -2276,6 +2279,7 @@ function persistableState(keepTrades = 150, live = false) {
     positionPct: State.positionPct,
     leverageAuto: State.leverageAuto,
     bothSides: State.bothSides,
+    sideMode: State.sideMode,
     breakdownSide: State.breakdownSide,
     breakdownLongs: State.breakdownLongs,
     masterLedgerUrl: State.masterLedgerUrl,
@@ -2307,6 +2311,7 @@ function applyPersistedState(parsed, live = false) {
   if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
   if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
   if (typeof parsed.bothSides === 'boolean') State.bothSides = parsed.bothSides;
+  if (Strategy.validSideMode(parsed.sideMode)) State.sideMode = Strategy.validSideMode(parsed.sideMode);   // v6.30
   if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
   if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
   if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
@@ -2451,7 +2456,7 @@ function legacyHandover(st) {
   return {
     portfolio: st.portfolio, activePositions: st.activePositions, recoveryBags: st.recoveryBags, tradeLogs: st.tradeLogs,
     manual: m && m.positions ? { startUSDT: m.startUSDT, cashUSDT: m.cashUSDT, realizedPnL: m.realizedPnL, positions: m.positions, history: m.history || [] } : undefined,
-    positionPct: sub.sizing && sub.sizing.positionPct, leverageAuto: sub.leverage && sub.leverage.on, bothSides: sub.sides && sub.sides.on,
+    positionPct: sub.sizing && sub.sizing.positionPct, leverageAuto: sub.leverage && sub.leverage.on, bothSides: sub.sides && sub.sides.on, sideMode: sub.sides && sub.sides.mode,
     breakdownSide: sub.breakdown && sub.breakdown.side, breakdownLongs: sub.breakdown && sub.breakdown.longs,
     masterLedgerUrl: st.masterLedgerUrl, learningSheetUrl: st.learningSheetUrl, capitalResetId: CAPITAL_RESET_ID,
     usdtToInrRate: st.usdtToInrRate, marketMode: sub.marketMode
@@ -2742,10 +2747,24 @@ function syncLeverageStatus() {
 }
 
 function syncSidesStatus() {
-  State.subsystems.sides = { on: State.bothSides };
+  State.subsystems.sides = { on: State.bothSides, mode: State.sideMode, label: Strategy.SIDE_MODES[State.sideMode] };
   const mm = State.subsystems.marketMode;
   if (mm) mm.tradeSide = tradeSide(mm);
 }
+
+// v6.30: Settings > Trade direction. SHORT = shorts only; BOTH = shorts and longs (the market mode, Both sides and v6.17 decide).
+app.post('/api/trade-direction', (req, res) => {
+  const m = Strategy.validSideMode(req.body.mode);
+  if (!m) return res.status(400).json({ success: false, error: 'mode must be SHORT or BOTH' });
+  State.sideMode = m;
+  syncSidesStatus();
+  logOperation('ENTRIES', m === 'SHORT'
+    ? 'Trade direction: SHORTS ONLY. The autopilot opens only futures shorts, in every market mode; outside a Bearish market each needs the coin\'s own 1h downtrend. High vol breakdowns are shorted. No new longs. Open positions and bags keep their exits.'
+    : `Trade direction: SHORTS AND LONGS. New trades follow the market mode${State.bothSides ? ' with Both sides on' : ''}, as before. Open positions and bags keep their exits.`, 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, mode: m, label: Strategy.SIDE_MODES[m], tradeSide: tradeSide() });
+});
 
 app.post('/api/both-sides', (req, res) => {
   const v = req.body.on, on = v === true || v === 'true' || v === 'on', off = v === false || v === 'false' || v === 'off';
@@ -2891,6 +2910,23 @@ app.post('/api/manual/tp', (req, res) => {
   broadcastStateUpdate();
   if (tp.pct && p.livePriceUSDT) checkManualTakeProfit(p.symbol, Number(p.livePriceUSDT)).catch(() => {});
   res.json({ success: true, position: p, manual: manualView() });
+});
+
+// v6.30: Settings > Reset paper account. Every open autopilot position and bag is removed without being recorded as a trade
+// (none was closed, so nothing goes to the sheet), and cash goes back to the starting amount with no realized P&L.
+// Closed trades, the sheet, the manual account and every setting stay as they are.
+app.post('/api/account/reset', (req, res) => {
+  if (req.body.confirm !== 'RESET') return res.status(400).json({ success: false, error: 'confirm must be RESET' });
+  const pos = Object.keys(State.activePositions || {}), bags = Object.keys(State.recoveryBags || {}), before = computeEquity();
+  State.activePositions = {};
+  State.recoveryBags = {};
+  if (State.fib && State.fib.portfolio) State.fib.portfolio.positions = {};
+  State.portfolio = { ...State.portfolio, cashUSDT: STARTING_EQUITY_USDT, holdings: {}, realizedPnL: 0, bagSubsidyPoolUSDT: 0 };
+  const names = [...pos, ...bags.map((k) => `${k} (bag)`)].map((k) => k.replace('USDT', '')).join(', ');
+  logOperation('ACCOUNT', `Paper account reset: ${pos.length} open position${pos.length === 1 ? '' : 's'} and ${bags.length} bag${bags.length === 1 ? '' : 's'} removed without being recorded${names ? ` (${names})` : ''}. Value was $${before.toFixed(2)}; cash is now $${STARTING_EQUITY_USDT.toFixed(2)}. Closed trades and settings are unchanged.`, 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, removedPositions: pos, removedBags: bags, valueBefore: Number(before.toFixed(2)), cashUSDT: STARTING_EQUITY_USDT });
 });
 
 app.post('/api/manual/reset', (req, res) => {
