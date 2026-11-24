@@ -914,6 +914,27 @@ function neutralShortsOnly(mode, lastTrend) {
 }
 
 /**
+ * v6.30: Settings > Trade direction. SHORT = shorts only (the default from 24 Nov 2026): the autopilot opens only shorts, in
+ * every market mode, and outside a BEAR market each short still needs the coin's own 1h downtrend (as every NEUTRAL or
+ * against-the-mode trade does). BOTH = shorts and longs, exactly as before: the market mode's side, Settings > Both sides,
+ * and the v6.17 neutral-after-bullish rule.
+ * Replay (180 days, 47 and 113 coins, both bar orders, v6.22 bags): shorts only beat shorts and longs from May to August
+ * in 3 of 4 runs and lost from August to November in 3 of 4 (a September rally bagged every short at once).
+ */
+const SIDE_MODES = { SHORT: 'Shorts only', BOTH: 'Shorts and longs' };
+function validSideMode(v) {
+  const s = String(v || '').trim().toUpperCase();
+  return Object.prototype.hasOwnProperty.call(SIDE_MODES, s) ? s : null;
+}
+/** What new trades may do: 'NONE', 'LONG', 'SHORT' or 'BOTH'. */
+function tradeSideFor(mode, { sideMode = 'SHORT', bothSides = false } = {}) {
+  if (!mode || !mode.side || mode.side === 'NONE') return 'NONE';
+  if (sideMode === 'SHORT') return 'SHORT';
+  if (mode.shortsOnly) return 'SHORT';   // v6.17: neutral after bullish with BTC below its 1h EMA50 (also with Both sides on)
+  return bothSides ? 'BOTH' : mode.side;
+}
+
+/**
  * Coins that must not be shorted. Backtested over 180 days: the volume floor improved results in
  * both halves of the sample and the funding limit cost almost nothing. Unknown funding blocks the short.
  */
@@ -1336,6 +1357,9 @@ module.exports = {
   evaluateMarketMode,
   lastTrendMode,
   neutralShortsOnly,
+  SIDE_MODES,
+  validSideMode,
+  tradeSideFor,
   SHORT_RULES,
   MANUAL,
   manualOpenPlan,
