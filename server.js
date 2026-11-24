@@ -68,6 +68,13 @@ try {
 // Strategy core (pure functions, shared with backtest.js)
 const Strategy = require('./strategy');
 const Fib = require('./fib');   // v6.23: Fibonacci retracement autopilot (Settings > Entry strategy)
+// v6.31: the characters' comments, written by Google Gemini on the server. The key is GEMINI_API_KEY in Render's
+// environment and never leaves this server; without it the app uses the characters' built-in lines.
+const Commentary = require('./commentary').create({
+  apiKey: process.env.GEMINI_API_KEY,
+  models: process.env.GEMINI_MODELS ? process.env.GEMINI_MODELS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+  log: (msg, level) => logOperation('AI', msg, level)
+});
 
 const PORT = process.env.PORT || 3000;
 const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
@@ -2280,6 +2287,7 @@ function persistableState(keepTrades = 150, live = false) {
     leverageAuto: State.leverageAuto,
     bothSides: State.bothSides,
     sideMode: State.sideMode,
+    commentary: Commentary.toJSON(),   // v6.31
     breakdownSide: State.breakdownSide,
     breakdownLongs: State.breakdownLongs,
     masterLedgerUrl: State.masterLedgerUrl,
@@ -2312,6 +2320,7 @@ function applyPersistedState(parsed, live = false) {
   if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
   if (typeof parsed.bothSides === 'boolean') State.bothSides = parsed.bothSides;
   if (Strategy.validSideMode(parsed.sideMode)) State.sideMode = Strategy.validSideMode(parsed.sideMode);   // v6.30
+  if (parsed.commentary) Commentary.load(parsed.commentary);   // v6.31
   if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
   if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
   if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
@@ -2491,6 +2500,9 @@ async function takeOverFromPreviousBuild() {
     } else Handover.note = st && st.handover ? 'the previous build did not hand over its account' : 'no previous build answered';
   } catch (e) { Handover.note = `previous build not read (${e && e.message})`; }
 }
+
+// v6.31: the characters' Gemini comments (the app fetches them when subsystems.ai.rev changes). No key, only text.
+app.get('/api/commentary', (req, res) => { res.json({ ...Commentary.view(), status: Commentary.status() }); });
 
 app.get('/api/state', (req, res) => {
   res.json({
@@ -2979,6 +2991,54 @@ const omitTickStamps = (key, value) => (key === 'lastTickAt' ? undefined : value
 
 // v6.11: the P&L statement the app shows (Realized P&L, Take-home after tax, the statement sheet), over every trade the
 // engine holds, with when the Google Sheet ledger was last read.
+// v6.31: what the characters may comment on, as plain numbers (no URLs, sheet ids or personal details).
+function aiSnapshot(now = Date.now()) {
+  const r2 = (x) => (Number.isFinite(Number(x)) ? Math.round(Number(x) * 100) / 100 : null);
+  const coin = (pair, k) => String(pair || k || '').replace('/USDT', '').replace(/USDT$/, '').slice(0, 20);
+  const move = (side, e, l) => { e = Number(e) || 0; l = Number(l) || e; return e ? ((side === 'SHORT' ? e - l : l - e) / e) * 100 : 0; };
+  const mins = (t) => (Number(t) > 0 ? Math.max(0, Math.round((now - Number(t)) / 60000)) : null);
+  const words = (m) => (m == null ? null : m < 90 ? `${m} min` : m < 2880 ? `${Math.round(m / 60)} hours` : `${Math.round(m / 1440)} days`);
+  const open = (k, p, kind) => ({
+    key: k, kind, coin: coin(p.pair, k), side: isShort(p) ? 'SHORT' : 'LONG', gainPct: r2(move(p.side, p.entryPriceUSDT, p.livePriceUSDT)),
+    openedAt: Number(p.openedAt) || 0, openFor: words(mins(p.openedAt)), leverage: r2(Number(p.leverage) || 1),
+    ...(kind === 'bag' ? { inBagFor: words(mins(p.movedAt)) } : { exitStage: p.ratchetStage || null }),
+    ...(Number(p.userTpPct) > 0 || Number(p.takeProfitPct) > 0 ? { ownTakeProfitPct: Number(p.userTpPct || p.takeProfitPct) } : {})
+  });
+  const positions = Object.entries(State.activePositions || {}).map(([k, p]) => open(k, p, 'position'));
+  const bags = Object.entries(State.recoveryBags || {}).map(([k, p]) => open(k, p, 'bag'));
+  const manual = Object.values((State.manual && State.manual.positions) || {}).map((p) => open(String(p.id), p, 'manual position'));
+  const closed = [
+    // the key is the app's own: its numeric id and its type in capitals (the app renumbers any other id)
+    ...(State.tradeLogs || []).filter((t) => t && Number(t.id) > 0).slice(0, 20).map((t) => {
+      const type = String(t.type || 'EXIT').trim().toUpperCase(), side = t.side === 'SHORT' || /^SHORT/.test(type) ? 'SHORT' : 'LONG';
+      return { key: `${Number(t.id)}_${type}`, coin: coin(t.pair), side, how: type.replace(/^(LONG|SHORT)\s+/, '').slice(0, 60), pnlUSDT: r2(t.pnlUSDT),
+        gainPct: r2(move(side, t.entryPriceUSDT, t.exitPriceUSDT)), heldFor: words(Number(t.holdMinutes) || null) };
+    }),
+    ...(((State.manual && State.manual.history) || []).slice(0, 5)).map((t) => ({ key: `m${t.id}`, coin: coin(t.pair), side: t.side === 'SHORT' ? 'SHORT' : 'LONG',
+      how: `manual: ${String(t.type || 'closed').slice(0, 40)}`, pnlUSDT: r2(t.pnlUSDT), gainPct: r2(t.gainPct), heldFor: words(Number(t.holdMinutes) || null) }))
+  ];
+  const minScore = (State.activeThresholds && State.activeThresholds.scoreThreshold) || 65;
+  const radar = Object.values(State.universe || {}).filter((c) => c && c.symbol && c.symbol !== 'BTC')
+    .sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0)).slice(0, 8)
+    .map((c) => ({ coin: c.symbol, price: Number(c.priceUSDT) || null, change24hPct: r2(c.change24h), score: Math.round(Number(c.score) || 0), side: c.side,
+      qualifies: (Number(c.score) || 0) >= minScore && !c.isPumpAndDump, trap: Boolean(c.isPumpAndDump), dayRangePct: r2(c.intradayRangePct) }));
+  const mm = State.subsystems.marketMode || {}, btc = (State.universe || {}).BTCUSDT;
+  const market = mm.mode ? {
+    mode: mm.mode, newTrades: mm.tradeSide, direction: State.sideMode === 'SHORT' ? 'shorts only (the user\'s setting)' : 'shorts and longs',
+    reason: String(mm.reason || '').slice(0, 160), coinsAboveEma50Pct: mm.breadth == null ? null : Math.round(mm.breadth * 100),
+    btc: r2(mm.btcClose), btcVsEma50Pct: Number(mm.ema50) > 0 ? r2((mm.btcClose / mm.ema50 - 1) * 100) : null,
+    btcEma20AboveEma50: Number(mm.ema20) > 0 && Number(mm.ema50) > 0 ? mm.ema20 > mm.ema50 : null,
+    btc24hPct: btc ? r2(btc.change24h) : null, lastTrend: mm.lastTrend || null
+  } : null;
+  const last = (State.tradeLogs || []).slice(0, 20);
+  const account = {
+    valueUSDT: r2(computeEquity()), cashUSDT: r2(State.portfolio.cashUSDT), openPositions: positions.length, bags: bags.length,
+    last20Trades: { wins: last.filter((t) => Number(t.pnlUSDT) > 0).length, losses: last.filter((t) => Number(t.pnlUSDT) < 0).length, netUSDT: r2(last.reduce((a, t) => a + (Number(t.pnlUSDT) || 0), 0)) }
+  };
+  return { now, positions, bags, manual, closed, radar, market, account };
+}
+function syncAiStatus() { State.subsystems.ai = Commentary.status(); }
+
 function pnlNow() {
   return { ...Strategy.pnlStatement(State.tradeLogs), ledger: { ...State.ledgerSync } };
 }
@@ -3285,6 +3345,16 @@ setInterval(async () => {
 }, 1000);
 
 setInterval(() => { settleFunding().catch((e) => console.error('[Funding]', e.message)); }, 60000);
+// v6.31: Gemini writes what is due for the characters (at most one call a minute); the app reads it when subsystems.ai.rev changes
+syncAiStatus();
+setInterval(() => {
+  if (tradingPaused()) return;
+  Commentary.tick(aiSnapshot()).then((changed) => {
+    const before = State.subsystems.ai && State.subsystems.ai.rev;
+    syncAiStatus();
+    if (changed || before !== State.subsystems.ai.rev) { saveDiskState(); broadcastStateUpdate(); }
+  }).catch((e) => console.error('[AI]', e.message));
+}, 20000);
 setInterval(() => { fibTick().catch(() => {}); }, 5000);   // v6.23: the Fibonacci autopilot, once per closed bar
 setInterval(async () => {
   if (tradingPaused()) return;
