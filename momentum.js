@@ -7,8 +7,9 @@
  * Gemini compact Binance USD-M data for the radar's top coins (1h trend, RSI, volume, taker flow, funding, open
  * interest), Gemini also searches the web for the latest crypto news, and it answers per coin: the direction of its
  * momentum (bear / bull / flat) and a 0-100 score (high = strong momentum likely to carry on, low = weak, choppy or
- * likely to reverse). The autopilot then opens a short only on a coin with bearish momentum at or above the minimum
- * score (a long only on bullish momentum), and with auto leverage on, the score sets the leverage instead of volatility.
+ * likely to reverse). v6.34 (the user's rule): the DIRECTION decides the trade (a short only where the momentum is
+ * bearish, a long only where it is bullish); the SCORE is used only for leverage, with auto leverage on.
+ * Every coin on the radar gets a reading (up to 150 USD-M futures, all the engine can trade), scored in batches of 50.
  *
  * Not replay-tested: a model that searches today's news can't be run honestly on past data. Every trade records the
  * score it was opened with, so paper trading can show whether high-score entries bag less.
@@ -19,12 +20,12 @@
 const ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const DEFAULT_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.6-flash'];
 const RULES = {
-  coins: 40,                  // the radar's top coins by screener score that get a reading
+  coins: 400,                 // v6.34: every coin on the radar (the radar holds up to 150 by default)
+  batch: 50,                  // coins per scoring request (smaller replies parse reliably)
   maxAgeMs: 2 * 3600000,      // a report older than 2 hours no longer opens trades
   retryMs: 5 * 60000,         // a failed report is tried again 5 minutes later
   runAtMinute: 2,             // each hour at hh:02, after the 1h candle has closed
   timeoutMs: 180000,          // web search + thinking can take a while
-  minScore: 60,               // default minimum score to open a trade
   // leverage from the score (auto leverage on): under 70 1x, 70-79 2x, 80+ 3x (capped at the engine's maximum)
   leverageSteps: [[80, 3], [70, 2], [0, 1]]
 };
@@ -93,7 +94,7 @@ const SYSTEM = [
   'rises and funding is very negative is a short squeeze risk, the mirror for longs); falling volume; news that goes against the move. Raise it for',
   'aligned trend (price and EMA20 below EMA50 for bear), rising volume with taker flow on the same side, open interest building with the move, supportive news.',
   'Reply with JSON only, no other text:',
-  '{"market":{"bias":"bear|bull|flat"},"coins":[{"c":"SOL","d":"bear","s":74,"w":"reason, at most 90 characters"}]}',
+  '{"market":{"bias":"bear|bull|flat"},"coins":[{"c":"SOL","d":"bear","s":74,"w":"reason, at most 60 characters"}]}',
   'Include every coin from the rows exactly once, with the coin symbol as given.'
 ].join('\n');
 
@@ -150,7 +151,7 @@ function parseReport(text, asked) {
     if (!want.has(c) || !['bear', 'bull', 'flat'].includes(dir) || !Number.isFinite(s)) continue;
     coins[c] = { d: dir, s: Math.max(0, Math.min(100, s)), w: clean(x.w || x.why || '', 110) };
   }
-  if (Object.keys(coins).length < Math.min(3, want.size)) return null;   // too little to trade on
+  if (Object.keys(coins).length < Math.min(3, want.size) || Object.keys(coins).length < want.size / 2) return null;   // too little to trade on
   const m = d.market && typeof d.market === 'object' ? d.market : {};
   const bias = ['bear', 'bull', 'flat'].includes(String(m.bias).toLowerCase()) ? String(m.bias).toLowerCase() : null;
   return { market: { bias, news: [] }, coins };
@@ -158,17 +159,17 @@ function parseReport(text, asked) {
 
 /**
  * May the autopilot open this side on this coin? report: { at, coins }. side: 'SHORT' | 'LONG'.
+ * v6.34: only the direction counts (bearish for a short, bullish for a long); the score never blocks a trade.
  * Returns { ok, reason, entry } (entry = the coin's reading when there is one).
  */
-function gate(report, coin, side, { minScore = RULES.minScore, maxAgeMs = RULES.maxAgeMs, now = Date.now() } = {}) {
+function gate(report, coin, side, { maxAgeMs = RULES.maxAgeMs, now = Date.now() } = {}) {
   if (!report || !report.at) return { ok: false, reason: 'no momentum report yet' };
   if (now - report.at > maxAgeMs) return { ok: false, reason: `the momentum report is ${Math.round((now - report.at) / 60000)} min old` };
   const c = String(coin || '').toUpperCase().replace(/USDT$/, ''), e = report.coins && report.coins[c];
   if (!e) return { ok: false, reason: 'not in this hour\'s momentum report' };
   const want = side === 'LONG' ? 'bull' : 'bear';
-  if (e.d !== want) return { ok: false, reason: `momentum is ${e.d} ${e.s}, not ${want}`, entry: e };
-  if (e.s < minScore) return { ok: false, reason: `${want} momentum ${e.s} is under ${minScore}`, entry: e };
-  return { ok: true, reason: `${want} momentum ${e.s}`, entry: e };
+  if (e.d !== want) return { ok: false, reason: `momentum is ${e.d}, not ${want}`, entry: e };
+  return { ok: true, reason: `${want} momentum (score ${e.s}, sets the leverage)`, entry: e };
 }
 
 /** Leverage from the momentum score (auto leverage on): under 70 1x, 70-79 2x, 80+ 3x, never above max. */
@@ -187,7 +188,7 @@ function nextRunAt(lastOkAt, lastTryAt, now = Date.now()) {
   return lastTryAt > lastOkAt ? Math.max(lastTryAt + RULES.retryMs, Math.min(due, lastTryAt + RULES.retryMs)) : due;
 }
 
-function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch === 'function' ? fetch : null), log = () => {} } = {}) {
+function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch === 'function' ? fetch : null), log = () => {}, batch = RULES.batch } = {}) {
   const key = String(apiKey || '').trim();
   const st = { report: null, lastOkAt: 0, lastTryAt: 0, lastError: '', model: '', busy: false, runs: 0, usage: null };
 
@@ -229,22 +230,30 @@ function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch 
         news = parseNews(res.text); searches = res.searches;
         if (news.length) break;
       }
-      // step 2: the scores
-      const body = buildRequest(rows, market, news);
-      for (const m of models) {
-        const res = await callModel(m, body);
-        if (!res.ok) { st.lastError = `${m}: ${res.msg}`.slice(0, 200); continue; }
-        const rep = parseReport(res.text, asked);
-        if (!rep) { st.lastError = `${m}: the reply was not a usable report`; continue; }
-        rep.market.news = news.map((x) => (x.src ? `${x.h} (${x.src})` : x.h)).slice(0, 5);
-        st.report = { at: Date.now(), model: m, ...rep, asked: asked.length, searches };
-        st.lastOkAt = st.report.at; st.lastError = ''; st.model = m; st.usage = res.usage;
-        const bears = Object.values(rep.coins).filter((x) => x.d === 'bear').length, bulls = Object.values(rep.coins).filter((x) => x.d === 'bull').length;
-        log(`Momentum report (${m}; ${news.length ? `${news.length} news items${searches ? ` from ${searches} web searches` : ''}` : 'no news found this hour'}): ${Object.keys(rep.coins).length} of ${asked.length} coins read, ${bears} bearish, ${bulls} bullish; market ${rep.market.bias || 'unclear'}.`, 'info');
-        return true;
+      // step 2: the scores, in batches (every coin on the radar; each batch gets the news). A batch that no model answers
+      // leaves its coins out of this report (they can't be traded this hour); at least one batch must succeed.
+      const coins = {}, biases = []; let used = '';
+      for (let i = 0; i < rows.length; i += batch) {
+        const part = rows.slice(i, i + batch), names = part.map((x) => x[0]), body = buildRequest(part, market, news);
+        for (const m of models) {
+          const res = await callModel(m, body);
+          if (!res.ok) { st.lastError = `${m}: ${res.msg}`.slice(0, 200); continue; }
+          const rep = parseReport(res.text, names);
+          if (!rep) { st.lastError = `${m}: the reply was not a usable report`; continue; }
+          Object.assign(coins, rep.coins); if (rep.market.bias) biases.push(rep.market.bias);
+          used = used || m; st.usage = res.usage;
+          break;
+        }
       }
-      log(`Momentum report failed (${st.lastError}). Trying again in 5 minutes.`, 'warning');
-      return false;
+      if (!Object.keys(coins).length) { log(`Momentum report failed (${st.lastError}). Trying again in 5 minutes.`, 'warning'); return false; }
+      const tally = (d) => Object.values(coins).filter((x) => x.d === d).length;
+      const bias = biases.length ? ['bear', 'bull', 'flat'].sort((a, b) => biases.filter((x) => x === b).length - biases.filter((x) => x === a).length)[0] : null;
+      st.report = { at: Date.now(), model: used, market: { bias, news: news.map((x) => (x.src ? `${x.h} (${x.src})` : x.h)).slice(0, 5) }, coins, asked: asked.length, searches };
+      st.lastOkAt = st.report.at; st.model = used;
+      const missing = asked.length - Object.keys(coins).length;
+      st.lastError = missing ? `${missing} coin${missing === 1 ? '' : 's'} got no reading this hour` : '';
+      log(`Momentum report (${used}; ${news.length ? `${news.length} news items${searches ? ` from ${searches} web searches` : ''}` : 'no news found this hour'}): ${Object.keys(coins).length} of ${asked.length} coins read, ${tally('bear')} bearish, ${tally('bull')} bullish, ${tally('flat')} flat; market ${bias || 'unclear'}.`, 'info');
+      return true;
     } catch (e) {
       st.lastError = String((e && e.message) || e).slice(0, 200);
       return false;
