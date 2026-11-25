@@ -35,26 +35,33 @@ const LIMITS = {
 };
 
 const SYSTEM = [
-  'You write short in-character comments for four cartoon characters in a PAPER-TRADING crypto app (no real money).',
+  'You write short in-character comments for four characters in a PAPER-TRADING crypto app (no real money). The user is their sovereign.',
   'Characters and voices:',
-  '- Pip: a cheerful young scooter courier who visits open trades and recovery bags. Casual modern English, delivery and road jokes. Max 120 characters.',
+  '- Sir Edmund, the Loyal Minister (JSON key "minister"): a devoted royal minister who inspects every open position and recovery bag for his sovereign',
+  '  and gives frank, personal counsel. Courtly but plain modern English (not Old English), addresses the user as "Your Majesty" or "Sire" now and then.',
+  '  Each note takes a clear stance (pleased, confident, uneasy, worried, impatient) and gives the reason from the trade\'s own numbers (move %, how long',
+  '  it has been open or in the bag, leverage, exit stage, momentum at entry), sometimes with advice in character (patience, vigilance, courage).',
+  '  Loyal but candid: never flatters when the numbers are bad. Max 130 characters.',
   '- Master Aldric: a medieval accountant who audits closed trades in his ledger. Old English (thee, thou, hath, verily). Max 140 characters.',
-  '- Sergeant Rook: a soldier at a radar desk who watches coins on the screener. Military radio talk (contact, bearing, locked, over). Max 110 characters per line.',
+  '- Sergeant Rook: a veteran radar operator at his desk, dry humour, strong opinions. Each line is HIS PERSONAL OPINION about one coin (or a comparison',
+  '  of two): what he likes, distrusts or doubts and WHY, from that coin\'s numbers (score, 24h move, where it sits in its day range, its momentum',
+  '  reading, whether we already hold it), plus his gut feeling or experience ("I like", "I don\'t trust", "my gut says", "I\'ve seen this before").',
+  '  First person. Never the "Contact: X, score Y" report format, never two lines built the same way; radio words like "over" at most twice in all.',
+  '  Max 120 characters per line.',
   '- Professor Quill: a dry-witted market analyst who reads the market data and gives his opinion. Max 170 characters per line.',
   'Rules: mention the coin and use only the numbers you are given; never invent prices or facts.',
   'Write proper sentences with punctuation. Percentages with a % sign and a sign (+0.84%, -14.9%), amounts in dollars ($0.14), durations in words as given.',
-  'Give an opinion or a feeling about the trade or market, not a list of numbers. Vary the wording; never start two comments the same way.',
-  'Sergeant Rook sounds like a radio call, e.g. "Contact: SOL, score 78, down 3.4% today. Locked on, over." A trap is a pump-and-dump the engine refuses to touch.',
+  'Every line is an opinion or a feeling with a reason, not a list of numbers. Vary the wording; never start two comments the same way.',
+  'A trap is a pump-and-dump the engine refuses to touch. A recovery bag is a trade that fell 3.5% and waits to get back to its entry. Score 65 or more means a coin qualifies.',
   'Professor Quill interprets: what the market mode, BTC against its 1h EMA50 and the share of coins above their EMA50 mean for the autopilot right now; one line may judge the recent record.',
-  'A recovery bag is a trade that fell 3.5% and waits to get back to its entry. Score 65 or more means a coin qualifies for a trade.',
   'Be playful, varied and kind; no profanity, no emojis, no hashtags, no links. Never tell anyone to buy, sell or risk real money.',
   'They are living characters with memory and moods: never repeat or closely paraphrase anything in lastSaid, previously_said or previous_opinions.',
   'Let them react to change (better, worse, still stuck), recall what they said before, change their minds when the numbers change, tease each other now and then, and show a personal touch',
-  '(Pip: traffic, snacks, his scooter; Aldric: candles, the guild, the king; Rook: coffee, the night shift, radio static; Quill: his tea, his old papers, his students). Keep every line about the data.',
+  '(Sir Edmund: the court, the treasury, his duty; Aldric: candles, the guild, the king; Rook: coffee, the night shift, his old sergeant; Quill: his tea, his old papers, his students). Keep every line about the data.',
   'Reply with JSON only, exactly this shape (leave out any part you were not asked for):',
-  '{"pip":[{"id":"p1","texts":["...","...","..."]}],"aldric":[{"id":"a1","text":"...","more":["...","..."]}],"soldier":["...",...],"analyst":["...",...]}',
-  'For each pip id write 3 different notes (each a new angle on that trade). For each aldric id write a verdict in "text" and 2 further remarks in "more".',
-  'Write 8 to 10 soldier lines (mostly coin reports, each coin at most twice, plus one or two bits of radio chatter) and 5 or 6 analyst lines, each from a different angle.'
+  '{"minister":[{"id":"p1","texts":["...","...","..."]}],"aldric":[{"id":"a1","text":"...","more":["...","..."]}],"soldier":["...",...],"analyst":["...",...]}',
+  'For each minister id write 3 different notes (each a new angle on that trade). For each aldric id write a verdict in "text" and 2 further remarks in "more".',
+  'Write 8 to 10 soldier lines (opinions on different coins, each coin at most twice, at most one about his coffee or shift) and 5 or 6 analyst lines, each from a different angle.'
 ].join('\n');
 
 const r2 = (x) => (Number.isFinite(Number(x)) ? Math.round(Number(x) * 100) / 100 : null);
@@ -102,9 +109,9 @@ function plan(snap, store, now = Date.now(), L = LIMITS) {
 
   const strip = ({ key, openedAt, ...rest }) => rest;   // the app's keys and timestamps are not needed by Gemini
   const input = { ask: [] };
-  if (jobs.pip.length) { input.ask.push('pip'); input.pip_positions = jobs.pip.map((j) => ({ id: j.id, mood: j.mood, ...strip(j.it), ...(j.last.length ? { lastSaid: j.last } : {}) })); }
+  if (jobs.pip.length) { input.ask.push('minister'); input.minister_positions_and_bags = jobs.pip.map((j) => ({ id: j.id, mood: j.mood, ...strip(j.it), ...(j.last.length ? { lastSaid: j.last } : {}) })); }
   if (jobs.aldric.length) { input.ask.push('aldric'); input.aldric_closed_trades = jobs.aldric.map((j) => ({ id: j.id, ...strip(j.it) })); }
-  if (jobs.soldier) { input.ask.push('soldier'); input.soldier_radar_top_coins = radar; if (store.soldier.lines.length) input.soldier_previously_said = store.soldier.lines.slice(0, 10); }
+  if (jobs.soldier) { input.ask.push('soldier'); input.soldier_radar_coins = radar; if (store.soldier.lines.length) input.soldier_previously_said = store.soldier.lines.slice(0, 10); }
   if (jobs.analyst) {
     input.ask.push('analyst'); input.analyst_market = mk; input.analyst_account = snap.account || null;
     if (store.analyst.lines.length) input.analyst_previous_opinions = store.analyst.lines.slice(0, 6);
@@ -140,7 +147,7 @@ function parseReply(text, jobs) {
     }
     return keep;
   };
-  const pip = byId(d.pip), ald = byId(d.aldric);
+  const pip = byId(d.minister || d.pip), ald = byId(d.aldric);   // v6.36: the minister (was Pip)
   jobs.pip.forEach((j) => {
     const x = pip[j.id] || {}, texts = lines([...asList(x.texts), ...asList(x.text)], LIMITS.maxChars.pip, 4, j.last || []);
     if (texts.length) out.pip[j.key] = { texts, mood: j.mood };
