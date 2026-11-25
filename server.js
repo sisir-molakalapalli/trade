@@ -3107,7 +3107,8 @@ function aiSnapshot(now = Date.now()) {
     key: k, kind, coin: coin(p.pair, k), side: isShort(p) ? 'SHORT' : 'LONG', gainPct: r2(move(p.side, p.entryPriceUSDT, p.livePriceUSDT)),
     openedAt: Number(p.openedAt) || 0, openFor: words(mins(p.openedAt)), leverage: r2(Number(p.leverage) || 1),
     ...(kind === 'bag' ? { inBagFor: words(mins(p.movedAt)) } : { exitStage: p.ratchetStage || null }),
-    ...(Number(p.userTpPct) > 0 || Number(p.takeProfitPct) > 0 ? { ownTakeProfitPct: Number(p.userTpPct || p.takeProfitPct) } : {})
+    ...(Number(p.userTpPct) > 0 || Number(p.takeProfitPct) > 0 ? { ownTakeProfitPct: Number(p.userTpPct || p.takeProfitPct) } : {}),
+    ...(p.momentum && Number.isFinite(Number(p.momentum.s)) ? { momentumAtEntry: `${p.momentum.d} ${p.momentum.s}` } : {})   // v6.36
   });
   const positions = Object.entries(State.activePositions || {}).map(([k, p]) => open(k, p, 'position'));
   const bags = Object.entries(State.recoveryBags || {}).map(([k, p]) => open(k, p, 'bag'));
@@ -3123,10 +3124,18 @@ function aiSnapshot(now = Date.now()) {
       how: `manual: ${String(t.type || 'closed').slice(0, 40)}`, pnlUSDT: r2(t.pnlUSDT), gainPct: r2(t.gainPct), heldFor: words(Number(t.holdMinutes) || null) }))
   ];
   const minScore = (State.activeThresholds && State.activeThresholds.scoreThreshold) || 65;
-  const radar = Object.values(State.universe || {}).filter((c) => c && c.symbol && c.symbol !== 'BTC')
-    .sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0)).slice(0, 8)
-    .map((c) => ({ coin: c.symbol, price: Number(c.priceUSDT) || null, change24hPct: r2(c.change24h), score: Math.round(Number(c.score) || 0), side: c.side,
-      qualifies: (Number(c.score) || 0) >= minScore && !c.isPumpAndDump, trap: Boolean(c.isPumpAndDump), dayRangePct: r2(c.intradayRangePct) }));
+  // v6.36: more for Sergeant Rook's opinions: where each coin sits in its day range, its momentum reading, whether we hold it
+  const moCoins = (MomentumReport.report() || {}).coins || {};
+  const radar = Object.entries(State.universe || {}).filter(([, c]) => c && c.symbol && c.symbol !== 'BTC')
+    .sort((a, b) => (Number(b[1].score) || 0) - (Number(a[1].score) || 0)).slice(0, 8)
+    .map(([k, c]) => {
+      const mo = moCoins[String(c.symbol).toUpperCase()];
+      return { coin: c.symbol, price: Number(c.priceUSDT) || null, change24hPct: r2(c.change24h), score: Math.round(Number(c.score) || 0), side: c.side,
+        qualifies: (Number(c.score) || 0) >= minScore && !c.isPumpAndDump, trap: Boolean(c.isPumpAndDump), dayRangePct: r2(c.intradayRangePct),
+        whereInDayRangePct: Number.isFinite(Number(c.pricePositionInRange)) ? Math.round(Number(c.pricePositionInRange) * 100) : null,
+        ...(mo ? { momentum: `${mo.d} ${mo.s}`, momentumWhy: mo.w || undefined } : {}),
+        weHold: (State.activePositions || {})[k] ? 'open position' : (State.recoveryBags || {})[k] ? 'recovery bag' : null };
+    });
   const mm = State.subsystems.marketMode || {}, btc = (State.universe || {}).BTCUSDT;
   const market = mm.mode ? {
     mode: mm.mode, newTrades: mm.tradeSide, direction: State.sideMode === 'SHORT' ? 'shorts only (the user\'s setting)' : 'shorts and longs',
