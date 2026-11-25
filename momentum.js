@@ -15,17 +15,26 @@
  * score it was opened with, so paper trading can show whether high-score entries bag less.
  *
  * The key is GEMINI_MOMENTUM_KEY (or GEMINI_API_KEY) in the server's environment; it is sent only to Google, in a header.
+ *
+ * v6.40: far fewer tokens (the user found the report costly). The scoring call no longer "thinks" (thinking tokens are
+ * billed as output and were most of the cost); every coin goes in ONE call (it was 50 + 50 + 1, each repeating the
+ * instructions and the news); rows are short CSV lines (no price, two shape points instead of twelve closes); the reply
+ * is a compact list with a short reason only for bearish and bullish coins; and the news search runs every 4 hours
+ * for the top 12 coins instead of every hour for all of them, its result reused in between. Every report records the
+ * tokens it used, shown in the app.
  */
 
 const ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const DEFAULT_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.6-flash'];
 const RULES = {
   coins: 400,                 // v6.34: every coin on the radar (the radar holds up to 150 by default)
-  batch: 50,                  // coins per scoring request (smaller replies parse reliably)
+  batch: 150,                 // v6.40: coins per scoring request (one call for the whole radar; split evenly above that)
+  newsEveryMs: 4 * 3600000,   // v6.40: the web search for news runs every 4 hours; the hours between reuse it
+  newsCoins: 12,              // v6.40: the news search asks about the top 12 coins (and the market), not every coin
   maxAgeMs: 2 * 3600000,      // a report older than 2 hours no longer opens trades
   retryMs: 5 * 60000,         // a failed report is tried again 5 minutes later
   runAtMinute: 2,             // each hour at hh:02, after the 1h candle has closed
-  timeoutMs: 180000,          // web search + thinking can take a while
+  timeoutMs: 180000,          // the web search can take a while
   // leverage from the score (auto leverage on): under 70 1x, 70-79 2x, 80+ 3x (capped at the engine's maximum)
   leverageSteps: [[80, 3], [70, 2], [0, 1]]
 };
@@ -55,8 +64,10 @@ function rsi(closes, period = 14) {
  * One compact row per coin from Binance data, so Gemini reads numbers instead of raw candles (far fewer tokens).
  * k1h: futures 1h klines, oldest first, the last one may still be open; oi: openInterestHist rows (1h), oldest first;
  * funding: the last funding rate (0.0001 = 0.01%). Returns null when there are too few candles.
+ * v6.40: no price (the reading is all relative), 1 decimal on most numbers, and the shape of the last day as five
+ * changes (1h, 4h, 8h, 12h, 24h) instead of twelve hourly closes.
  */
-const COLS = ['coin', 'price', 'ch1h%', 'ch4h%', 'ch24h%', 'vsEma20%', 'ema20vs50%', 'rsi14', 'atr14%', 'vol3h/avg24', 'takerBuy3h%', 'funding%', 'oi1h%', 'oi24h%', 'closes12h%'];
+const COLS = ['coin', 'ch1h%', 'ch4h%', 'ch8h%', 'ch12h%', 'ch24h%', 'vsEma20%', 'ema20vs50%', 'rsi', 'atr%', 'vol3h/24h', 'takerBuy%', 'fund%', 'oi1h%', 'oi24h%'];
 function features(coin, k1h, oi = [], funding = NaN) {
   const bars = (Array.isArray(k1h) ? k1h : []).map((b) => ({ o: num(b[1]), h: num(b[2]), l: num(b[3]), c: num(b[4]), v: num(b[5]), tb: num(b[9]) }))
     .filter((b) => b.c > 0);
@@ -73,29 +84,26 @@ function features(coin, k1h, oi = [], funding = NaN) {
   const oiv = (Array.isArray(oi) ? oi : []).map((x) => num(x && (x.sumOpenInterestValue ?? x.sumOpenInterest))).filter((x) => x > 0);
   const oiNow = oiv[oiv.length - 1];
   return [
-    coin, r(last, last >= 100 ? 2 : last >= 1 ? 4 : 8), r(pctCh(last, at(1))), r(pctCh(last, at(4))), r(pctCh(last, at(24))),
-    r(pctCh(last, e20)), r(pctCh(e20, e50)), r(rsi(closes), 1), r(atr), r(vr), r(tb, 1),
-    Number.isFinite(num(funding)) ? r(num(funding) * 100, 4) : null,
-    oiv.length >= 2 ? r(pctCh(oiNow, oiv[oiv.length - 2])) : null,
-    oiv.length >= 25 ? r(pctCh(oiNow, oiv[oiv.length - 25])) : null,
-    closes.slice(-13, -1).map((c) => r(pctCh(c, last), 1))
+    coin, r(pctCh(last, at(1))), r(pctCh(last, at(4)), 1), r(pctCh(last, at(8)), 1), r(pctCh(last, at(12)), 1), r(pctCh(last, at(24)), 1),
+    r(pctCh(last, e20), 1), r(pctCh(e20, e50), 1), r(rsi(closes), 0), r(atr), r(vr, 1), r(tb, 0),
+    Number.isFinite(num(funding)) ? r(num(funding) * 100, 3) : null,
+    oiv.length >= 2 ? r(pctCh(oiNow, oiv[oiv.length - 2]), 1) : null,
+    oiv.length >= 25 ? r(pctCh(oiNow, oiv[oiv.length - 25]), 1) : null
   ];
 }
 
 const SYSTEM = [
-  'You are a crypto futures momentum analyst for a PAPER-TRADING autopilot (no real money). It trades Binance USD-M perpetuals intraday.',
-  'You get one compact row per coin (columns in "cols"; closes12h% = each of the last 12 hourly closes as % from the current price, oldest first;',
-  'funding% is the last funding rate, positive = longs pay shorts; oi = open interest value change). You also get "news": the latest crypto',
-  'headlines from a web search made a minute ago (market-wide and per coin, with their tone). Weigh them in.',
-  'For EVERY coin judge its momentum over the next few hours:',
-  '- d: "bear" (falling with force), "bull" (rising with force) or "flat" (no clear push, choppy or stalling).',
-  '- s: 0-100, how strong AND how likely to carry on that momentum is. 80+ strong and clean, 60-79 decent, 40-59 weak or mixed, under 40 none or about to reverse.',
-  'Lower the score for: moves already overextended (far from EMA20, extreme RSI) that tend to snap back; squeeze risk (price falling while open interest',
-  'rises and funding is very negative is a short squeeze risk, the mirror for longs); falling volume; news that goes against the move. Raise it for',
-  'aligned trend (price and EMA20 below EMA50 for bear), rising volume with taker flow on the same side, open interest building with the move, supportive news.',
-  'Reply with JSON only, no other text:',
-  '{"market":{"bias":"bear|bull|flat"},"coins":[{"c":"SOL","d":"bear","s":74,"w":"reason, at most 60 characters"}]}',
-  'Include every coin from the rows exactly once, with the coin symbol as given.'
+  'You are a crypto futures momentum analyst for a paper-trading autopilot (no real money) on Binance USD-M perpetuals, intraday.',
+  'Input: one CSV row per coin. ch*% = price change over that many hours; vsEma20% = price vs its 1h EMA20; ema20vs50% = EMA20 vs EMA50;',
+  'rsi = 1h RSI14; atr% = 1h ATR14; vol3h/24h = last 3h volume vs the 24h average; takerBuy% = taker-buy share of the last 3h;',
+  'fund% = last funding rate (+ = longs pay); oi1h%/oi24h% = open interest change. Also recent news headlines with their tone.',
+  'For EVERY coin judge its momentum over the next few hours: d = bear (falling with force), bull (rising with force) or flat (no clear push);',
+  's = 0-100, how strong and how likely to carry on: 80+ strong and clean, 60-79 decent, 40-59 weak or mixed, under 40 none or about to reverse.',
+  'Lower s for overextended moves (far from EMA20, extreme RSI), squeeze risk (price falling while open interest rises and funding is very',
+  'negative; the mirror for longs), fading volume, news against the move. Raise it for an aligned trend, rising volume with taker flow on the',
+  'same side, open interest building with the move, supportive news.',
+  'Reply with JSON only: {"bias":"bear|bull|flat","c":[["SOL","bear",74,"short reason"],["ADA","flat",35]]}',
+  'One entry per coin, symbol as given. A reason (at most 40 characters) only for bear and bull coins.'
 ].join('\n');
 
 // Step 1: a short web search for the news. (With the whole data table in one request Gemini tended to skip the search and
@@ -103,8 +111,8 @@ const SYSTEM = [
 function buildNewsRequest(coins, now = Date.now()) {
   const text = `Use web search. It is ${new Date(now).toISOString().slice(0, 16)}Z. Find the most important crypto news of the last 24 hours: the overall market `
     + `(macro, ETF flows, liquidations, regulation, hacks) and anything specific to these coins: ${coins.join(', ')}. Reply with JSON only: `
-    + '{"news":[{"h":"headline","src":"source site","coins":["SOL"],"tone":"bear|bull|mixed"}]} with at most 8 items, the most market-moving first.';
-  return { contents: [{ role: 'user', parts: [{ text }] }], tools: [{ google_search: {} }], generationConfig: { temperature: 0.2, maxOutputTokens: 4096 } };
+    + '{"news":[{"h":"headline","src":"source site","coins":["SOL"],"tone":"bear|bull|mixed"}]} with at most 6 items, the most market-moving first, headlines under 100 characters.';
+  return { contents: [{ role: 'user', parts: [{ text }] }], tools: [{ google_search: {} }], generationConfig: { temperature: 0.2, maxOutputTokens: 2048 } };
 }
 function parseNews(text) {
   const raw = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
@@ -115,15 +123,22 @@ function parseNews(text) {
     h: clean(x && x.h, 150), src: clean(x && x.src, 40),
     coins: (Array.isArray(x && x.coins) ? x.coins : []).map((c) => String(c).toUpperCase().replace(/[^A-Z0-9]/g, '')).filter(Boolean).slice(0, 6),
     tone: ['bear', 'bull', 'mixed'].includes(String(x && x.tone).toLowerCase()) ? String(x.tone).toLowerCase() : 'mixed'
-  })).filter((x) => x.h).slice(0, 8);
+  })).filter((x) => x.h).slice(0, 6);
 }
-// Step 2: the scoring, with the data rows and the news (JSON mode, no tools).
-function buildRequest(rows, market, news = []) {
-  const input = { cols: COLS, rows, marketMode: market || null, news, now: new Date().toISOString().slice(0, 16) + 'Z' };
+// Step 2: the scoring, with the data rows and the news (JSON mode, no tools). v6.40: plain text with CSV rows (fewer
+// tokens than JSON), and no thinking: a reading of numbers doesn't need it, and its tokens were most of the bill.
+const NO_THINKING = { thinkingBudget: 0 };
+function buildRequest(rows, market, news = [], now = Date.now()) {
+  const cell = (v) => (v == null || (typeof v === 'number' && !Number.isFinite(v)) ? '' : String(v));
+  const lines = [`time ${new Date(now).toISOString().slice(0, 16)}Z`];
+  if (market) lines.push(`market mode ${JSON.stringify(market)}`);
+  if (news.length) { lines.push('news (tone|coins|headline):'); news.forEach((x) => lines.push(`${x.tone}|${(x.coins || []).join(' ')}|${x.h}`)); }
+  lines.push(COLS.join(','));
+  rows.forEach((row) => lines.push(row.map(cell).join(',')));
   return {
     systemInstruction: { parts: [{ text: SYSTEM }] },
-    contents: [{ role: 'user', parts: [{ text: JSON.stringify(input) }] }],
-    generationConfig: { responseMimeType: 'application/json', temperature: 0.3, maxOutputTokens: 8192 }
+    contents: [{ role: 'user', parts: [{ text: lines.join('\n') }] }],
+    generationConfig: { responseMimeType: 'application/json', temperature: 0.3, maxOutputTokens: 8192, thinkingConfig: NO_THINKING }
   };
 }
 
@@ -141,10 +156,12 @@ function parseReport(text, asked) {
     const a = raw.indexOf('{'), b = raw.lastIndexOf('}');
     if (a >= 0 && b > a) { try { d = JSON.parse(raw.slice(a, b + 1)); } catch (e2) { d = null; } }
   }
-  if (!d || typeof d !== 'object' || !Array.isArray(d.coins)) return null;
+  const list = d && typeof d === 'object' ? (Array.isArray(d.c) ? d.c : Array.isArray(d.coins) ? d.coins : null) : null;
+  if (!list) return null;
   const want = new Set((asked || []).map((x) => String(x).toUpperCase()));
   const coins = {};
-  for (const x of d.coins) {
+  for (let x of list) {
+    if (Array.isArray(x)) x = { c: x[0], d: x[1], s: x[2], w: x[3] };   // v6.40: the compact ["SOL","bear",74,"why"]
     if (!x || typeof x !== 'object') continue;
     const c = String(x.c || x.coin || '').toUpperCase().replace(/USDT$/, '');
     const dir = String(x.d || x.dir || '').toLowerCase(), s = Math.round(Number(x.s ?? x.score));
@@ -152,7 +169,7 @@ function parseReport(text, asked) {
     coins[c] = { d: dir, s: Math.max(0, Math.min(100, s)), w: clean(x.w || x.why || '', 110) };
   }
   if (Object.keys(coins).length < Math.min(3, want.size) || Object.keys(coins).length < want.size / 2) return null;   // too little to trade on
-  const m = d.market && typeof d.market === 'object' ? d.market : {};
+  const m = d.market && typeof d.market === 'object' ? d.market : { bias: d.bias };
   const bias = ['bear', 'bull', 'flat'].includes(String(m.bias).toLowerCase()) ? String(m.bias).toLowerCase() : null;
   return { market: { bias, news: [] }, coins };
 }
@@ -190,9 +207,35 @@ function nextRunAt(lastOkAt, lastTryAt, now = Date.now()) {
 
 function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch === 'function' ? fetch : null), log = () => {}, batch = RULES.batch } = {}) {
   const key = String(apiKey || '').trim();
-  const st = { report: null, lastOkAt: 0, lastTryAt: 0, lastError: '', model: '', busy: false, runs: 0, usage: null };
+  const st = { report: null, lastOkAt: 0, lastTryAt: 0, lastError: '', model: '', busy: false, runs: 0, usage: null,
+    news: null,                              // v6.40: { at, items, searches }: the last news search, reused for 4 hours
+    day: { d: '', tokens: 0, calls: 0, reports: 0 } };   // v6.40: tokens used today (UTC)
+  const dayOf = (t) => new Date(t).toISOString().slice(0, 10);
+  // v6.40: every call's tokens are added up, failed replies included (they are billed too)
+  function count(sum, u, now) {
+    sum.calls++;
+    if (u) {
+      sum.prompt += Number(u.promptTokenCount) || 0; sum.output += Number(u.candidatesTokenCount) || 0;
+      sum.thoughts += Number(u.thoughtsTokenCount) || 0; sum.search += Number(u.toolUsePromptTokenCount) || 0;
+      sum.total += Number(u.totalTokenCount) || ((Number(u.promptTokenCount) || 0) + (Number(u.candidatesTokenCount) || 0) + (Number(u.thoughtsTokenCount) || 0));
+    }
+    if (st.day.d !== dayOf(now)) st.day = { d: dayOf(now), tokens: 0, calls: 0, reports: 0 };
+    st.day.calls++; st.day.tokens += u ? (Number(u.totalTokenCount) || 0) : 0;
+  }
 
   async function callModel(model, body) {
+    const res = await callOnce(model, body);
+    // a model that won't take "no thinking": once with a small budget, then without the setting
+    const tc = body.generationConfig && body.generationConfig.thinkingConfig;
+    if (!res.ok && res.status === 400 && tc && /thinking/i.test(res.msg)) {
+      const small = await callOnce(model, { ...body, generationConfig: { ...body.generationConfig, thinkingConfig: { thinkingBudget: 512 } } });
+      if (small.ok || !(small.status === 400 && /thinking/i.test(small.msg))) return small;
+      const { thinkingConfig, ...gc } = body.generationConfig;
+      return callOnce(model, { ...body, generationConfig: gc });
+    }
+    return res;
+  }
+  async function callOnce(model, body) {
     const ac = new AbortController(), timer = setTimeout(() => ac.abort(), RULES.timeoutMs);
     try {
       const res = await fetchFn(`${ENDPOINT}${encodeURIComponent(model)}:generateContent`, {
@@ -203,7 +246,7 @@ function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch 
       if (!res.ok) return { ok: false, status: res.status, msg: (d && d.error && d.error.message) || `HTTP ${res.status}` };
       const c = ((d && d.candidates) || [])[0] || {};
       const text = ((c.content && c.content.parts) || []).filter((p) => !p.thought && typeof p.text === 'string').map((p) => p.text).join('');
-      if (!text) return { ok: false, status: 200, msg: `empty reply (${c.finishReason || 'no text'})` };
+      if (!text) return { ok: false, status: 200, msg: `empty reply (${c.finishReason || 'no text'})`, usage: (d && d.usageMetadata) || null };
       const gm = c.groundingMetadata || {};
       return { ok: true, text, usage: d.usageMetadata || null, searches: Array.isArray(gm.webSearchQueries) ? gm.webSearchQueries.length : 0 };
     } catch (e) {
@@ -220,23 +263,36 @@ function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch 
       const { rows, market } = await getRows();
       if (!Array.isArray(rows) || rows.length < 3) { st.lastError = 'not enough Binance data for a report'; return false; }
       const asked = rows.map((x) => x[0]);
+      const sum = { calls: 0, prompt: 0, output: 0, thoughts: 0, search: 0, total: 0 };
       // step 1: the news (if no model finds any, the report goes ahead on the numbers alone)
       // (Google returns the search details only some of the time; the prompt tokens it counts show the search results
       // were read in either way: about 110 tokens of question came back as 270-690 prompt tokens in the test.)
-      let news = [], searches = 0;
-      for (const m of models) {
-        const res = await callModel(m, buildNewsRequest(asked, now));
-        if (!res.ok) continue;
-        news = parseNews(res.text); searches = res.searches;
-        if (news.length) break;
+      // v6.40: searched every 4 hours for the top coins; the hours between reuse the last result
+      let fresh = false;
+      if (!st.news || now - st.news.at >= RULES.newsEveryMs) {
+        let items = [], searches = 0;
+        for (const m of models) {
+          const res = await callModel(m, buildNewsRequest(asked.slice(0, RULES.newsCoins), now));
+          count(sum, res.usage, now);
+          if (!res.ok) continue;
+          items = parseNews(res.text); searches = res.searches;
+          if (items.length) break;
+        }
+        // nothing found: try again next hour (not every coin's worth of searching again in 5 minutes)
+        st.news = { at: items.length ? now : now - RULES.newsEveryMs + 3600000, items, searches };
+        fresh = true;
       }
-      // step 2: the scores, in batches (every coin on the radar; each batch gets the news). A batch that no model answers
-      // leaves its coins out of this report (they can't be traded this hour); at least one batch must succeed.
+      const news = st.news.items || [], searches = fresh ? st.news.searches : 0;
+      // step 2: the scores: v6.40 every coin in one call (split evenly above 150). A batch that no model answers leaves its
+      // coins out of this report (they can't be traded this hour); at least one batch must succeed.
       const coins = {}, biases = []; let used = '';
-      for (let i = 0; i < rows.length; i += batch) {
-        const part = rows.slice(i, i + batch), names = part.map((x) => x[0]), body = buildRequest(part, market, news);
+      const parts = Math.max(1, Math.ceil(rows.length / batch));
+      for (let p = 0; p < parts; p++) {
+        const part = rows.slice(Math.round(p * rows.length / parts), Math.round((p + 1) * rows.length / parts));
+        const names = part.map((x) => x[0]), body = buildRequest(part, market, news, now);
         for (const m of models) {
           const res = await callModel(m, body);
+          count(sum, res.usage, now);
           if (!res.ok) { st.lastError = `${m}: ${res.msg}`.slice(0, 200); continue; }
           const rep = parseReport(res.text, names);
           if (!rep) { st.lastError = `${m}: the reply was not a usable report`; continue; }
@@ -248,11 +304,12 @@ function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch 
       if (!Object.keys(coins).length) { log(`Momentum report failed (${st.lastError}). Trying again in 5 minutes.`, 'warning'); return false; }
       const tally = (d) => Object.values(coins).filter((x) => x.d === d).length;
       const bias = biases.length ? ['bear', 'bull', 'flat'].sort((a, b) => biases.filter((x) => x === b).length - biases.filter((x) => x === a).length)[0] : null;
-      st.report = { at: Date.now(), model: used, market: { bias, news: news.map((x) => (x.src ? `${x.h} (${x.src})` : x.h)).slice(0, 5) }, coins, asked: asked.length, searches };
-      st.lastOkAt = st.report.at; st.model = used;
+      st.report = { at: Date.now(), model: used, market: { bias, news: news.map((x) => (x.src ? `${x.h} (${x.src})` : x.h)).slice(0, 5) }, coins, asked: asked.length, searches,
+        newsAt: st.news.at, usage: sum };
+      st.lastOkAt = st.report.at; st.model = used; st.day.reports++;
       const missing = asked.length - Object.keys(coins).length;
       st.lastError = missing ? `${missing} coin${missing === 1 ? '' : 's'} got no reading this hour` : '';
-      log(`Momentum report (${used}; ${news.length ? `${news.length} news items${searches ? ` from ${searches} web searches` : ''}` : 'no news found this hour'}): ${Object.keys(coins).length} of ${asked.length} coins read, ${tally('bear')} bearish, ${tally('bull')} bullish, ${tally('flat')} flat; market ${bias || 'unclear'}.`, 'info');
+      log(`Momentum report (${used}; ${news.length ? `${news.length} news items${fresh ? (searches ? ` from ${searches} web searches` : ' (new search)') : ' (from the last search)'}` : 'no news found'}): ${Object.keys(coins).length} of ${asked.length} coins read, ${tally('bear')} bearish, ${tally('bull')} bullish, ${tally('flat')} flat; market ${bias || 'unclear'}; ${sum.total} tokens in ${sum.calls} call${sum.calls === 1 ? '' : 's'}.`, 'info');
       return true;
     } catch (e) {
       st.lastError = String((e && e.message) || e).slice(0, 200);
@@ -263,12 +320,17 @@ function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch 
   function load(saved) {
     if (!saved || typeof saved !== 'object' || !saved.report || !saved.report.coins) return;
     st.report = saved.report; st.lastOkAt = Number(saved.report.at) || 0; st.model = saved.report.model || '';
+    if (saved.news && Array.isArray(saved.news.items)) st.news = { at: Number(saved.news.at) || 0, items: saved.news.items, searches: Number(saved.news.searches) || 0 };
+    if (saved.day && typeof saved.day === 'object') st.day = { d: String(saved.day.d || ''), tokens: Number(saved.day.tokens) || 0, calls: Number(saved.day.calls) || 0, reports: Number(saved.day.reports) || 0 };
   }
-  const toJSON = () => ({ report: st.report });
+  const toJSON = () => ({ report: st.report, news: st.news, day: st.day });
   const status = (now = Date.now()) => ({
     on: Boolean(key && fetchFn), at: st.lastOkAt || null, model: st.model || null, coins: st.report ? Object.keys(st.report.coins).length : 0,
     bias: st.report ? st.report.market.bias : null, fresh: Boolean(st.report && now - st.report.at <= RULES.maxAgeMs),
-    nextAt: key ? nextRunAt(st.lastOkAt, st.lastTryAt, now) : null, lastError: st.lastError || null, busy: st.busy
+    nextAt: key ? nextRunAt(st.lastOkAt, st.lastTryAt, now) : null, lastError: st.lastError || null, busy: st.busy,
+    usage: st.report && st.report.usage ? st.report.usage : null,                         // v6.40: tokens of the last report
+    today: st.day.d === dayOf(now) ? { tokens: st.day.tokens, calls: st.day.calls, reports: st.day.reports } : { tokens: 0, calls: 0, reports: 0 },
+    newsAt: st.news ? st.news.at : null
   });
   return { tick, load, toJSON, status, report: () => st.report, _st: st };
 }
