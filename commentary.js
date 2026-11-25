@@ -27,15 +27,16 @@ const LIMITS = {
   pipMoodGapMs: 75000,      // ...or when its mood changes, at most once every 75 s per trade
   soldierMs: 4 * 60000,     // new radar reports every 4 minutes
   analystMs: 5 * 60000,     // new market opinions every 5 minutes, or when the market mode changes
+  oracleMs: 30 * 60000,     // v6.37: Lady Seraphina speaks anew with every hourly report, and every 30 minutes
   nearDue: 0.6,             // a call that goes anyway also refreshes whoever is 60% of the way to due (fewer calls)
   maxPip: 6, maxAldric: 5, maxRadar: 8, keepAldric: 300, keepPip: 80,
   // v6.32: several different lines per call, so a character never has to repeat itself
-  counts: { pip: 3, aldricMore: 2, soldier: 10, analyst: 6 },
-  maxChars: { pip: 150, aldric: 170, soldier: 130, analyst: 190 }
+  counts: { pip: 3, aldricMore: 2, soldier: 10, analyst: 6, oracle: 6 },
+  maxChars: { pip: 150, aldric: 170, soldier: 130, analyst: 190, oracle: 170 }
 };
 
 const SYSTEM = [
-  'You write short in-character comments for four characters in a PAPER-TRADING crypto app (no real money). The user is their sovereign.',
+  'You write short in-character comments for five characters in a PAPER-TRADING crypto app (no real money). The user is their sovereign.',
   'Characters and voices:',
   '- Sir Edmund, the Loyal Minister (JSON key "minister"): a devoted royal minister who inspects every open position and recovery bag for his sovereign',
   '  and gives frank, personal counsel. Courtly but plain modern English (not Old English), addresses the user as "Your Majesty" or "Sire" now and then.',
@@ -49,6 +50,10 @@ const SYSTEM = [
   '  First person. Never the "Contact: X, score Y" report format, never two lines built the same way; radio words like "over" at most twice in all.',
   '  Max 120 characters per line.',
   '- Professor Quill: a dry-witted market analyst who reads the market data and gives his opinion. Max 170 characters per line.',
+  '- Lady Seraphina, the Royal Oracle (JSON key "oracle"): the court seer who presents the hourly momentum report (made by Gemini from Binance data',
+  '  and the news) as visions in her crystal orb. Calm, regal, a little mystical ("The orb shows...", "I foresee..."), but every line is grounded in the',
+  '  report: how many coins lean bearish, bullish or flat, the strongest coins with their scores and reasons, the market bias, the news, how old the',
+  '  report is. She may compare this hour with the last. Seers who promise certainty are liars: she speaks of likelihoods. Max 160 characters per line.',
   'Rules: mention the coin and use only the numbers you are given; never invent prices or facts.',
   'Write proper sentences with punctuation. Percentages with a % sign and a sign (+0.84%, -14.9%), amounts in dollars ($0.14), durations in words as given.',
   'Every line is an opinion or a feeling with a reason, not a list of numbers. Vary the wording; never start two comments the same way.',
@@ -57,11 +62,11 @@ const SYSTEM = [
   'Be playful, varied and kind; no profanity, no emojis, no hashtags, no links. Never tell anyone to buy, sell or risk real money.',
   'They are living characters with memory and moods: never repeat or closely paraphrase anything in lastSaid, previously_said or previous_opinions.',
   'Let them react to change (better, worse, still stuck), recall what they said before, change their minds when the numbers change, tease each other now and then, and show a personal touch',
-  '(Sir Edmund: the court, the treasury, his duty; Aldric: candles, the guild, the king; Rook: coffee, the night shift, his old sergeant; Quill: his tea, his old papers, his students). Keep every line about the data.',
+  '(Sir Edmund: the court, the treasury, his duty; Aldric: candles, the guild, the king; Rook: coffee, the night shift, his old sergeant; Quill: his tea, his old papers, his students; Seraphina: her orb, the stars, the tower). Keep every line about the data.',
   'Reply with JSON only, exactly this shape (leave out any part you were not asked for):',
-  '{"minister":[{"id":"p1","texts":["...","...","..."]}],"aldric":[{"id":"a1","text":"...","more":["...","..."]}],"soldier":["...",...],"analyst":["...",...]}',
+  '{"minister":[{"id":"p1","texts":["...","...","..."]}],"aldric":[{"id":"a1","text":"...","more":["...","..."]}],"soldier":["...",...],"analyst":["...",...],"oracle":["...",...]}',
   'For each minister id write 3 different notes (each a new angle on that trade). For each aldric id write a verdict in "text" and 2 further remarks in "more".',
-  'Write 8 to 10 soldier lines (opinions on different coins, each coin at most twice, at most one about his coffee or shift) and 5 or 6 analyst lines, each from a different angle.'
+  'Write 8 to 10 soldier lines (opinions on different coins, each coin at most twice, at most one about his coffee or shift), 5 or 6 analyst lines and 5 or 6 oracle lines, each from a different angle.'
 ].join('\n');
 
 const r2 = (x) => (Number.isFinite(Number(x)) ? Math.round(Number(x) * 100) / 100 : null);
@@ -100,9 +105,12 @@ function plan(snap, store, now = Date.now(), L = LIMITS) {
     .forEach((t, i) => jobs.aldric.push({ id: `a${i + 1}`, key: t.key, it: t }));
   const radar = (snap.radar || []).slice(0, L.maxRadar), mk = snap.market || null;
   const age = (x) => now - (Number(x.at) || 0);
+  const orc = snap.oracle || null, orStore = store.oracle || { lines: [], at: 0, reportAt: null };
+  const oracleDue = Boolean(orc && orc.reportAt) && (!orStore.lines.length || orStore.reportAt !== orc.reportAt || age(orStore) > L.oracleMs);
   const soldierDue = radar.length > 0 && (!store.soldier.lines.length || age(store.soldier) > L.soldierMs);
   const analystDue = Boolean(mk && mk.mode) && (!store.analyst.lines.length || age(store.analyst) > L.analystMs || store.analyst.mode !== mk.mode);
-  if (!jobs.pip.length && !jobs.aldric.length && !soldierDue && !analystDue) return null;
+  if (!jobs.pip.length && !jobs.aldric.length && !soldierDue && !analystDue && !oracleDue) return null;
+  jobs.oracle = oracleDue || (Boolean(orc && orc.reportAt) && age(orStore) > L.oracleMs * L.nearDue);
   // a call is going anyway: whoever is most of the way to due comes along (one call instead of two)
   jobs.soldier = soldierDue || (radar.length > 0 && age(store.soldier) > L.soldierMs * L.nearDue);
   jobs.analyst = analystDue || (Boolean(mk && mk.mode) && age(store.analyst) > L.analystMs * L.nearDue);
@@ -115,6 +123,11 @@ function plan(snap, store, now = Date.now(), L = LIMITS) {
   if (jobs.analyst) {
     input.ask.push('analyst'); input.analyst_market = mk; input.analyst_account = snap.account || null;
     if (store.analyst.lines.length) input.analyst_previous_opinions = store.analyst.lines.slice(0, 6);
+  }
+  if (jobs.oracle) {
+    const { reportAt, ...shown } = orc;   // the report's own time stays on the server; she gets "minutesAgo"
+    input.ask.push('oracle'); input.oracle_momentum_report = shown;
+    if (orStore.lines.length) input.oracle_previously_said = orStore.lines.slice(0, 6);
   }
   const body = {
     systemInstruction: { parts: [{ text: SYSTEM }] },
@@ -134,7 +147,7 @@ function parseReply(text, jobs) {
     if (a >= 0 && b > a) { try { d = JSON.parse(raw.slice(a, b + 1)); } catch (e2) { d = null; } }
   }
   if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
-  const out = { pip: {}, aldric: {}, soldier: [], analyst: [] };
+  const out = { pip: {}, aldric: {}, soldier: [], analyst: [], oracle: [] };
   const byId = (arr) => { const m = {}; (Array.isArray(arr) ? arr : []).forEach((x) => { if (x && typeof x === 'object' && typeof x.id === 'string') m[x.id] = x; }); return m; };
   const asList = (v) => (Array.isArray(v) ? v : v == null ? [] : [v]);
   // cleaned, no duplicates, nothing that was said last time
@@ -158,13 +171,14 @@ function parseReply(text, jobs) {
   });
   if (jobs.soldier) out.soldier = lines(d.soldier, LIMITS.maxChars.soldier, 12, jobs.soldierOld || []);
   if (jobs.analyst) out.analyst = lines(d.analyst, LIMITS.maxChars.analyst, 8, jobs.analystOld || []);
+  if (jobs.oracle) out.oracle = lines(d.oracle, LIMITS.maxChars.oracle, 8, jobs.oracleOld || []);
   return out;
 }
 
 function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch === 'function' ? fetch : null), log = () => {}, limits = {} } = {}) {
   const L = { ...LIMITS, ...limits };
   const key = String(apiKey || '').trim();
-  const store = { pip: {}, aldric: {}, soldier: { lines: [], at: 0 }, analyst: { lines: [], at: 0, mode: null } };
+  const store = { pip: {}, aldric: {}, soldier: { lines: [], at: 0 }, analyst: { lines: [], at: 0, mode: null }, oracle: { lines: [], at: 0, reportAt: null } };
   const st = { rev: 0, day: '', calls: 0, okToday: 0, okCalls: 0, lastCallAt: 0, lastOkAt: 0, lastError: '', backoffUntil: 0, backoffMs: 0, model: '', busy: false, coolUntil: {} };
 
   function load(saved) {
@@ -177,6 +191,7 @@ function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch 
     for (const [k, v] of Object.entries(saved.aldric || {})) if (v && typeof v.text === 'string') store.aldric[k] = { text: clean(v.text, L.maxChars.aldric), more: many(v.more, L.maxChars.aldric, 3), at: Number(v.at) || 0 };
     if (saved.soldier && Array.isArray(saved.soldier.lines)) store.soldier = { lines: many(saved.soldier.lines, L.maxChars.soldier, 12), at: Number(saved.soldier.at) || 0 };
     if (saved.analyst && Array.isArray(saved.analyst.lines)) store.analyst = { lines: many(saved.analyst.lines, L.maxChars.analyst, 8), at: Number(saved.analyst.at) || 0, mode: saved.analyst.mode || null };
+    if (saved.oracle && Array.isArray(saved.oracle.lines)) store.oracle = { lines: many(saved.oracle.lines, L.maxChars.oracle, 8), at: Number(saved.oracle.at) || 0, reportAt: saved.oracle.reportAt || null };
     if (saved.day) { st.day = String(saved.day); st.calls = Number(saved.calls) || 0; st.okToday = Number(saved.okToday) || 0; }
     st.rev = 1;
   }
@@ -235,7 +250,7 @@ function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch 
     if (now < st.backoffUntil || now - st.lastCallAt < L.minGapMs || st.okToday >= L.dailyCap || st.calls >= L.maxAttempts) return st.rev !== before;
     const p = plan(snap, store, now, L);
     if (!p) return st.rev !== before;
-    p.jobs.soldierOld = store.soldier.lines; p.jobs.analystOld = store.analyst.lines;   // a new batch must not repeat the last one
+    p.jobs.soldierOld = store.soldier.lines; p.jobs.analystOld = store.analyst.lines; p.jobs.oracleOld = store.oracle.lines;   // a new batch must not repeat the last one
     st.busy = true; st.lastCallAt = now;
     try {
       let res = null, used = '';
@@ -263,7 +278,8 @@ function create({ apiKey = '', models = DEFAULT_MODELS, fetchFn = (typeof fetch 
       for (const [k, v] of Object.entries(out.aldric)) store.aldric[k] = { ...v, at: t };
       if (out.soldier.length) store.soldier = { lines: out.soldier, at: t };
       if (out.analyst.length) store.analyst = { lines: out.analyst, at: t, mode: (snap.market && snap.market.mode) || null };
-      const n = Object.keys(out.pip).length + Object.keys(out.aldric).length + out.soldier.length + out.analyst.length;
+      if (out.oracle.length) store.oracle = { lines: out.oracle, at: t, reportAt: (snap.oracle && snap.oracle.reportAt) || null };
+      const n = Object.keys(out.pip).length + Object.keys(out.aldric).length + out.soldier.length + out.analyst.length + out.oracle.length;
       if (n) st.rev++;
       if (st.okCalls === 1) log(`Gemini (${used}) is writing the characters' comments.`, 'success');
       return st.rev !== before;
