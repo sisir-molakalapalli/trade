@@ -76,14 +76,14 @@ const Commentary = require('./commentary').create({
   log: (msg, level) => logOperation('AI', msg, level)
 });
 // v6.33: the hourly momentum report (momentum.js), written by Gemini with the paid key GEMINI_MOMENTUM_KEY
-// (GEMINI_API_KEY if that is not set). It decides which coins the autopilot may trade and, with auto leverage, the leverage.
+// (GEMINI_API_KEY if that is not set). v6.34: its direction decides which coins may be traded (bearish for a short);
+// its score is used only for the leverage, with auto leverage on.
 const Momentum = require('./momentum');
 const MomentumReport = Momentum.create({
   apiKey: process.env.GEMINI_MOMENTUM_KEY || process.env.GEMINI_API_KEY,
   models: process.env.GEMINI_MOMENTUM_MODELS ? process.env.GEMINI_MOMENTUM_MODELS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
   log: (msg, level) => logOperation('MOMENTUM', msg, level)
 });
-const MOMENTUM_MIN_CHOICES = [50, 60, 70, 80];   // Settings > Momentum report > minimum score
 
 const PORT = process.env.PORT || 3000;
 const DISK_STATE_FILE = path.join(__dirname, 'cloud_portfolio_state.json');
@@ -124,10 +124,9 @@ const State = {
   bothSides: !['off', '0', 'false'].includes(String(process.env.BOTH_SIDES || '').toLowerCase()),
   // Settings > Trade direction (v6.30): SHORT = shorts only (default), BOTH = shorts and longs as above. SIDE_MODE=both starts it on BOTH.
   sideMode: Strategy.validSideMode(process.env.SIDE_MODE) || 'SHORT',
-  // Settings > Momentum report (v6.33): on = new trades need the hourly Gemini report to show momentum their way.
+  // Settings > Momentum report (v6.33): on = a new short needs the hourly Gemini report to call the coin bearish (v6.34).
   // Starts on only when the server has a Gemini key, so an upload without the key doesn't stop new trades. MOMENTUM=off starts it off.
   momentumOn: !['off', '0', 'false'].includes(String(process.env.MOMENTUM || '').toLowerCase()) && Boolean(process.env.GEMINI_MOMENTUM_KEY || process.env.GEMINI_API_KEY),
-  momentumMin: Momentum.RULES.minScore,
   breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
   // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
@@ -1247,10 +1246,10 @@ function momentumEntry(pairKey) {
   const r = MomentumReport.report();
   return (r.coins || {})[String(pairKey).replace(/USDT$/, '')] || null;
 }
-// may the autopilot open this side here? Logs a skipped coin once per report.
+// may the autopilot open this side here? Only the direction counts (v6.34). Logs a skipped coin once per report.
 function momentumCheck(pairKey, side) {
   if (!State.momentumOn) return { ok: true };
-  const r = MomentumReport.report(), g = Momentum.gate(r, pairKey, side, { minScore: State.momentumMin });
+  const r = MomentumReport.report(), g = Momentum.gate(r, pairKey, side);
   if (!g.ok && r && r.at) {
     const k = `${r.at}|${pairKey}|${side}`;
     if (!momentumLogged.has(k)) {
@@ -1260,20 +1259,13 @@ function momentumCheck(pairKey, side) {
   }
   return g;
 }
-// with the report on, the strongest momentum the right way is tried first
-function momentumOrder(keys, side) {
-  if (!State.momentumOn || !momentumFresh()) return keys;
-  const want = side === 'LONG' ? 'bull' : 'bear', r = MomentumReport.report();
-  const m = (k) => { const e = (r.coins || {})[String((State.universe[k] || {}).symbol || '').toUpperCase()]; return e && e.d === want && e.s >= State.momentumMin ? e.s : -1; };
-  return [...keys].sort((a, b) => m(b) - m(a) || (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
-}
 // the reading goes with the trade: onto the position, into its bag and into the closed trade
 function tagMomentum(pairKey, g) {
   const pos = State.activePositions[pairKey], r = MomentumReport.report();
   if (!pos || !g || !g.entry) return;
   pos.momentum = { d: g.entry.d, s: g.entry.s, w: g.entry.w, at: r ? r.at : null };
 }
-// the Binance numbers Gemini reads: the radar's top coins (and BTC for context)
+// the Binance numbers Gemini reads: every coin on the radar the engine could trade (v6.34), and BTC for context
 async function momentumRows() {
   const keys = Object.keys(State.universe || {}).filter((k) => { const c = State.universe[k]; return c && c.canTrade && !c.isPumpAndDump && c.symbol !== 'BTC'; })
     .sort((a, b) => (State.universe[b].score || 0) - (State.universe[a].score || 0)).slice(0, Momentum.RULES.coins);
@@ -1295,7 +1287,7 @@ async function momentumRows() {
     btcVsEma50Pct: Number(mm.ema50) > 0 ? Number(((mm.btcClose / mm.ema50 - 1) * 100).toFixed(2)) : null } : null;
   return { rows, market };
 }
-function syncMomentumStatus() { State.subsystems.momentum = { ...MomentumReport.status(), enabled: State.momentumOn, minScore: State.momentumMin }; }
+function syncMomentumStatus() { State.subsystems.momentum = { ...MomentumReport.status(), enabled: State.momentumOn }; }
 
 async function evaluateShortEntries(maxBagsLimit) {
   if (!perpetuals.size) {
@@ -1303,7 +1295,7 @@ async function evaluateShortEntries(maxBagsLimit) {
     return;
   }
   const minScore = State.activeThresholds?.scoreThreshold || 65;
-  const sorted = momentumOrder(Object.keys(State.universe || {}).sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0)), 'SHORT');
+  const sorted = Object.keys(State.universe || {}).sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
   isEvaluatingEntries = true;
   try {
     let evaluated = 0;
@@ -1313,7 +1305,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
       const coin = State.universe[k];
       if (!coin || !coin.symbol || coin.isPumpAndDump || coin.side !== 'SHORT' || !coin.canTrade) continue;
-      if ((coin.score || 0) < minScore) continue;   // v6.33: the list may be in momentum order, so no early stop
+      if ((coin.score || 0) < minScore) break;
       const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
       const pairKey = `${baseSym}USDT`;
       if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
@@ -1324,7 +1316,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       const change24h = Number(coin.change24h || 0), rangePct = Number(coin.intradayRangePct || 0);
       if (change24h > -0.20 && rangePct < 3.0) continue;
       if (Number(coin.pricePositionInRange ?? 0.3) > 0.50) continue;
-      const mg = momentumCheck(pairKey, 'SHORT');   // v6.33: the hourly momentum report must show bearish momentum
+      const mg = momentumCheck(pairKey, 'SHORT');   // v6.33/v6.34: the hourly momentum report must call it bearish (any score)
       if (!mg.ok) { candidateCooldownMemo.set(pairKey, now + 300000); continue; }
       if (State.subsystems.marketMode.side !== 'SHORT' && !(await coinTrendAgrees(pairKey, 'SHORT'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
 
@@ -1470,7 +1462,7 @@ async function evaluateAutopilotEntries() {
   const minScore = State.activeThresholds?.scoreThreshold || 65;
   const keys = Object.keys(State.universe || {});
   if (keys.length === 0) return;
-  const sorted = momentumOrder([...keys].sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0)), 'LONG');   // v6.33
+  const sorted = [...keys].sort((a, b) => (State.universe[b]?.score || 0) - (State.universe[a]?.score || 0));
 
   isEvaluatingEntries = true;
   try {
@@ -1483,7 +1475,7 @@ async function evaluateAutopilotEntries() {
       if (!coin || !coin.symbol || coin.side !== 'LONG' || !coin.canTrade) continue;
 
       if (coin.isPumpAndDump) continue;
-      if ((coin.score || 0) < minScore) continue;   // v6.33: the list may be in momentum order, so no early stop
+      if ((coin.score || 0) < minScore) break;
 
       const baseSym = String(coin.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
       const pairKey = `${baseSym}USDT`;
@@ -1504,7 +1496,7 @@ async function evaluateAutopilotEntries() {
 
       const posInRange = Number(coin.pricePositionInRange !== undefined ? coin.pricePositionInRange : 0.70);
       if (posInRange < 0.50) continue;
-      const mgL = momentumCheck(pairKey, 'LONG');   // v6.33: the hourly momentum report must show bullish momentum
+      const mgL = momentumCheck(pairKey, 'LONG');   // v6.33/v6.34: the hourly momentum report must call it bullish (any score)
       if (!mgL.ok) { candidateCooldownMemo.set(pairKey, now + 300000); continue; }
       if (State.subsystems.marketMode.side !== 'LONG' && !(await coinTrendAgrees(pairKey, 'LONG'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
 
@@ -2374,7 +2366,7 @@ function persistableState(keepTrades = 150, live = false) {
     bothSides: State.bothSides,
     sideMode: State.sideMode,
     commentary: Commentary.toJSON(),   // v6.31
-    momentumOn: State.momentumOn, momentumMin: State.momentumMin, momentum: MomentumReport.toJSON(),   // v6.33
+    momentumOn: State.momentumOn, momentum: MomentumReport.toJSON(),   // v6.33
     breakdownSide: State.breakdownSide,
     breakdownLongs: State.breakdownLongs,
     masterLedgerUrl: State.masterLedgerUrl,
@@ -2409,7 +2401,6 @@ function applyPersistedState(parsed, live = false) {
   if (Strategy.validSideMode(parsed.sideMode)) State.sideMode = Strategy.validSideMode(parsed.sideMode);   // v6.30
   if (parsed.commentary) Commentary.load(parsed.commentary);   // v6.31
   if (typeof parsed.momentumOn === 'boolean') State.momentumOn = parsed.momentumOn;   // v6.33
-  if (MOMENTUM_MIN_CHOICES.includes(Number(parsed.momentumMin))) State.momentumMin = Number(parsed.momentumMin);
   if (parsed.momentum) MomentumReport.load(parsed.momentum);
   if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
   if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
@@ -2854,22 +2845,20 @@ function syncSidesStatus() {
   if (mm) mm.tradeSide = tradeSide(mm);
 }
 
-// v6.33: Settings > Momentum report. on: new trades need the hourly Gemini report to show momentum their way (score >= minScore).
+// v6.33: Settings > Momentum report. v6.34: on = a new short needs the hourly Gemini report to call the coin bearish (a long:
+// bullish); the score is used only for leverage.
 app.get('/api/momentum', (req, res) => { res.json({ report: MomentumReport.report(), status: State.subsystems.momentum || null }); });
 app.post('/api/momentum', (req, res) => {
   const v = req.body.on, on = v === true || v === 'true' || v === 'on', off = v === false || v === 'false' || v === 'off';
-  const min = req.body.minScore === undefined ? null : Number(req.body.minScore);
-  if (!on && !off && min === null) return res.status(400).json({ success: false, error: 'send on (true/false) and/or minScore (50, 60, 70 or 80)' });
-  if (min !== null && !MOMENTUM_MIN_CHOICES.includes(min)) return res.status(400).json({ success: false, error: 'minScore must be 50, 60, 70 or 80' });
-  if (on || off) State.momentumOn = on;
-  if (min !== null) State.momentumMin = min;
+  if (!on && !off) return res.status(400).json({ success: false, error: 'on must be true or false' });
+  State.momentumOn = on;
   syncMomentumStatus();
   logOperation('ENTRIES', State.momentumOn
-    ? `Momentum report ON: a new trade needs the hourly Gemini report to show momentum its way, score ${State.momentumMin} or more${State.leverageAuto ? '; auto leverage follows the score (under 70 1x, 70-79 2x, 80+ 3x)' : ''}. Open positions and bags keep their exits.`
+    ? `Momentum report ON: a new short needs the hourly Gemini report to call the coin bearish (a long: bullish), whatever its score${State.leverageAuto ? '; the score sets the leverage (under 70 1x, 70-79 2x, 80+ 3x)' : ''}. Open positions and bags keep their exits.`
     : 'Momentum report OFF: new trades no longer need it; auto leverage follows volatility again. Open positions and bags keep their exits.', 'warning');
   saveDiskState();
   broadcastStateUpdate();
-  res.json({ success: true, on: State.momentumOn, minScore: State.momentumMin });
+  res.json({ success: true, on: State.momentumOn });
 });
 app.post('/api/momentum/refresh', (req, res) => {
   const st = MomentumReport.status();
