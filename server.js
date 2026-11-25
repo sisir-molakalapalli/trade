@@ -3151,7 +3151,18 @@ function aiSnapshot(now = Date.now()) {
     valueUSDT: r2(computeEquity()), cashUSDT: r2(State.portfolio.cashUSDT), openPositions: positions.length, bags: bags.length,
     last20Trades: { wins: last.filter((t) => Number(t.pnlUSDT) > 0).length, losses: last.filter((t) => Number(t.pnlUSDT) < 0).length, netUSDT: r2(last.reduce((a, t) => a + (Number(t.pnlUSDT) || 0), 0)) }
   };
-  return { now, positions, bags, manual, closed, radar, market, account };
+  // v6.37: what Lady Seraphina, the Royal Oracle, presents: the hourly momentum report in short
+  const rep = MomentumReport.report();
+  let oracle = null;
+  if (rep && rep.coins) {
+    const all = Object.entries(rep.coins).map(([coin, e]) => ({ coin, s: e.s, d: e.d, why: e.w || undefined }));
+    const by = (d) => all.filter((x) => x.d === d).sort((a, b) => b.s - a.s);
+    oracle = { reportAt: rep.at, minutesAgo: Math.max(0, Math.round((now - rep.at) / 60000)), bias: rep.market ? rep.market.bias : null,
+      counts: { bearish: by('bear').length, bullish: by('bull').length, flat: by('flat').length },
+      strongestBearish: by('bear').slice(0, 6).map(({ d, ...x }) => x), strongestBullish: by('bull').slice(0, 3).map(({ d, ...x }) => x),
+      news: ((rep.market && rep.market.news) || []).slice(0, 5) };
+  }
+  return { now, positions, bags, manual, closed, radar, market, account, oracle };
 }
 function syncAiStatus() { State.subsystems.ai = Commentary.status(); }
 
