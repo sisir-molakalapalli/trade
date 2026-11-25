@@ -79,6 +79,11 @@ const Commentary = require('./commentary').create({
 // (GEMINI_API_KEY if that is not set). v6.34: its direction decides which coins may be traded (bearish for a short);
 // its score is used only for the leverage, with auto leverage on.
 const Momentum = require('./momentum');
+// v6.42: the BTC 2-hour prediction (btcpredict.js), worked out in the app every 5 minutes (no AI, no key, no cost): the chance
+// BTC closes above its 1h EMA50 two hours from now. It steers only the candlestick pattern path (its market mode, or a pause)
+// and never closes a trade; the Fibonacci path keeps the app's own mode.
+const BtcPredict = require('./btcpredict');
+const BtcPred = BtcPredict.create({ log: (msg, level) => logOperation('BTC_PREDICT', msg, level) });
 const MomentumReport = Momentum.create({
   apiKey: process.env.GEMINI_MOMENTUM_KEY || process.env.GEMINI_API_KEY,
   models: process.env.GEMINI_MOMENTUM_MODELS ? process.env.GEMINI_MOMENTUM_MODELS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
@@ -127,7 +132,8 @@ const State = {
   // Settings > Momentum report (v6.33): on = a new short needs the hourly Gemini report to call the coin bearish (v6.34).
   // Starts on only when the server has a Gemini key, so an upload without the key doesn't stop new trades. MOMENTUM=off starts it off.
   momentumOn: !['off', '0', 'false'].includes(String(process.env.MOMENTUM || '').toLowerCase()) && Boolean(process.env.GEMINI_MOMENTUM_KEY || process.env.GEMINI_API_KEY),
-  breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
+  // Settings > BTC 2h prediction (v6.42): on = the in-app prediction steers candlestick trades. BTC_PREDICT=off starts it off.
+  predictOn: !['off', '0', 'false'].includes(String(process.env.BTC_PREDICT || '').toLowerCase()),  breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
   // Manual paper futures: its own cash, positions and history. Never touched by the autopilot or the sentry.
   manual: { startUSDT: MANUAL_START_USDT, cashUSDT: MANUAL_START_USDT, realizedPnL: 0, positions: {}, history: [] },
@@ -391,6 +397,7 @@ async function refreshMarketMode(tickers) {
   if (before !== r.mode || beforeShorts !== shortsOnly) {
     logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${sideText(r)} Open positions keep their exits.`, 'warning');
   }
+  syncPredictStatus();   // v6.42: the candlestick mode follows the app's mode unless a fresh BTC 2h prediction changes it
   return r;
 }
 
@@ -1289,6 +1296,39 @@ async function momentumRows() {
 }
 function syncMomentumStatus() { State.subsystems.momentum = { ...MomentumReport.status(), enabled: State.momentumOn }; }
 
+// ---------- v6.42: the BTC 2-hour prediction (btcpredict.js). Candlestick path only: the Fibonacci path, open positions, bags,
+// the characters' market view and everything else keep the app's own market mode (State.subsystems.marketMode).
+function candleMode() { return BtcPredict.applyToMode(State.subsystems.marketMode, State.predictOn ? BtcPred.prediction() : null); }
+async function btcPredictData() {
+  if (fapiBusy()) return null;
+  const get = (p) => safeFetch(`${FAPI_BASE}${p}`, 8000).catch(() => null);
+  const [k1h, k15m, prem, oi, taker, depth] = await Promise.all([
+    get('/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=200'),
+    get('/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=70'),
+    get('/fapi/v1/premiumIndex?symbol=BTCUSDT'),
+    get('/futures/data/openInterestHist?symbol=BTCUSDT&period=15m&limit=6'),
+    get('/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=15m&limit=4'),
+    get('/fapi/v1/depth?symbol=BTCUSDT&limit=50')
+  ]);
+  if (!Array.isArray(k1h) || !Array.isArray(k15m)) return null;
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  return { k1h, k15m, prem: prem && typeof prem === 'object' ? prem : {}, oi: arr(oi), taker: arr(taker), depth: depth && Array.isArray(depth.bids) ? depth : { bids: [], asks: [] } };
+}
+let predictEffectKey = '';
+function syncPredictStatus() {
+  const cm = candleMode();
+  State.subsystems.btcPredict = { ...BtcPred.status(), enabled: State.predictOn,
+    candle: { mode: cm.mode, side: cm.side, tradeSide: tradeSide(cm), reason: cm.reason, source: cm.source, pause: Boolean(cm.pause) } };
+  const k = `${State.predictOn}|${cm.source}|${cm.mode}|${cm.side}|${Boolean(cm.pause)}`, changed = k !== predictEffectKey;
+  if (changed && predictEffectKey && State.entryStrategy === 'CANDLE') {
+    logOperation('BTC_PREDICT', cm.source === 'predict'
+      ? `Candlestick trades now follow the BTC 2h prediction: ${cm.pause ? 'no new candlestick trades' : `a ${cm.mode === 'BULL' ? 'bullish' : 'bearish'} market`} (${cm.reason.replace(/^BTC 2h prediction: /, '')}). ${cm.pause ? '' : `${sideText(cm)} `}Open positions, bags and the Fibonacci path are not affected.`
+      : `Candlestick trades follow the app's own market mode again (${State.subsystems.marketMode.mode}): ${State.predictOn ? 'no prediction under 15 minutes old' : 'the BTC 2h prediction is off'}.`, 'warning');
+  }
+  predictEffectKey = k;
+  return changed;
+}
+
 async function evaluateShortEntries(maxBagsLimit) {
   if (!perpetuals.size) {
     throttledNotice('noperps', 'FUTURES', 'Binance Futures data is unavailable. No shorts opened.', 'danger', 60000);
@@ -1318,7 +1358,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       if (Number(coin.pricePositionInRange ?? 0.3) > 0.50) continue;
       const mg = momentumCheck(pairKey, 'SHORT');   // v6.33/v6.34: the hourly momentum report must call it bearish (any score)
       if (!mg.ok) { candidateCooldownMemo.set(pairKey, now + 300000); continue; }
-      if (State.subsystems.marketMode.side !== 'SHORT' && !(await coinTrendAgrees(pairKey, 'SHORT'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
+      if (candleMode().side !== 'SHORT' && !(await coinTrendAgrees(pairKey, 'SHORT'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }   // v6.42: candlestick mode
 
       let flow = await checkShortOrderFlow(pairKey);
       if (!flow.passed) { veto(pairKey, 30000, 'FLOW_VETO', flow.reason); continue; }
@@ -1439,7 +1479,8 @@ async function evaluateAutopilotEntries() {
   };
 
   // Market mode decides which side may trade. Open positions are managed either way.
-  const mode = State.subsystems.marketMode;
+  // v6.42: for these candlestick trades, a fresh BTC 2h prediction sets the mode (62%+ bullish, 38% or less bearish) or pauses them
+  const mode = candleMode();
   const side = tradeSide(mode);
   if (side === 'NONE') {
     throttledNotice('mode', 'MARKET_MODE', `No new trades: ${mode.reason}.`, 'info', 120000);
@@ -1498,7 +1539,7 @@ async function evaluateAutopilotEntries() {
       if (posInRange < 0.50) continue;
       const mgL = momentumCheck(pairKey, 'LONG');   // v6.33/v6.34: the hourly momentum report must call it bullish (any score)
       if (!mgL.ok) { candidateCooldownMemo.set(pairKey, now + 300000); continue; }
-      if (State.subsystems.marketMode.side !== 'LONG' && !(await coinTrendAgrees(pairKey, 'LONG'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }
+      if (candleMode().side !== 'LONG' && !(await coinTrendAgrees(pairKey, 'LONG'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }   // v6.42: candlestick mode
 
       const volQuote = (coin.volumeM || 0) * 1000000;
       if (volQuote < 70000000 && (change24h >= 7.0 || rangePct >= 8.5)) {
@@ -2367,6 +2408,7 @@ function persistableState(keepTrades = 150, live = false) {
     sideMode: State.sideMode,
     commentary: Commentary.toJSON(),   // v6.31
     momentumOn: State.momentumOn, momentum: MomentumReport.toJSON(),   // v6.33
+    predictOn: State.predictOn, btcPredict: BtcPred.toJSON(),           // v6.42
     breakdownSide: State.breakdownSide,
     breakdownLongs: State.breakdownLongs,
     masterLedgerUrl: State.masterLedgerUrl,
@@ -2402,6 +2444,8 @@ function applyPersistedState(parsed, live = false) {
   if (parsed.commentary) Commentary.load(parsed.commentary);   // v6.31
   if (typeof parsed.momentumOn === 'boolean') State.momentumOn = parsed.momentumOn;   // v6.33
   if (parsed.momentum) MomentumReport.load(parsed.momentum);
+  if (typeof parsed.predictOn === 'boolean') State.predictOn = parsed.predictOn;   // v6.42
+  if (parsed.btcPredict) BtcPred.load(parsed.btcPredict);
   if (BREAKDOWN_SIDES[parsed.breakdownSide]) State.breakdownSide = parsed.breakdownSide;
   if (parsed.breakdownLongs && typeof parsed.breakdownLongs === 'object') State.breakdownLongs = { ...State.breakdownLongs, ...parsed.breakdownLongs };
   if (parsed.masterLedgerUrl && !parsed.masterLedgerUrl.includes('AKfycbw3cTF2Q3X') && !parsed.masterLedgerUrl.includes('AKfycbxzrx')) {
@@ -2869,6 +2913,22 @@ app.post('/api/momentum/refresh', (req, res) => {
   res.json({ success: true, started: true });
 });
 
+// v6.42: Settings > BTC 2h prediction. On = every 5 minutes the app predicts BTC against its 1h EMA50 two hours ahead, and
+// candlestick trades follow it (62%+ bullish, 38% or less bearish, in between none). It never closes a trade.
+app.get('/api/btc-predict', (req, res) => { syncPredictStatus(); res.json({ status: State.subsystems.btcPredict || null }); });
+app.post('/api/btc-predict', (req, res) => {
+  const v = req.body.on, on = v === true || v === 'true' || v === 'on', off = v === false || v === 'false' || v === 'off';
+  if (!on && !off) return res.status(400).json({ success: false, error: 'on must be true or false' });
+  State.predictOn = on;
+  syncPredictStatus();
+  logOperation('ENTRIES', State.predictOn
+    ? 'BTC 2h prediction ON: every 5 minutes the app predicts whether BTC will be above its 1h EMA50 in 2 hours. Candlestick trades: 62% or more a bullish market, 38% or less a bearish one, in between no new candlestick trades. Open positions, bags and the Fibonacci path are not affected.'
+    : 'BTC 2h prediction OFF: candlestick trades follow the app\'s own market mode.', 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, on: State.predictOn });
+});
+
 // v6.30: Settings > Trade direction. SHORT = shorts only; BOTH = shorts and longs (the market mode, Both sides and v6.17 decide).
 app.post('/api/trade-direction', (req, res) => {
   const m = Strategy.validSideMode(req.body.mode);
@@ -3144,7 +3204,10 @@ function aiSnapshot(now = Date.now()) {
     btcEma20AboveEma50: Number(mm.ema20) > 0 && Number(mm.ema50) > 0 ? mm.ema20 > mm.ema50 : null,
     btc24hPct: btc ? r2(btc.change24h) : null, lastTrend: mm.lastTrend || null,
     // v6.33: Professor Quill also reads the hourly momentum report's market view and news
-    ...(MomentumReport.report() ? { momentumBias: MomentumReport.report().market.bias, news: (MomentumReport.report().market.news || []).slice(0, 3) } : {})
+    ...(MomentumReport.report() ? { momentumBias: MomentumReport.report().market.bias, news: (MomentumReport.report().market.news || []).slice(0, 3) } : {}),
+    // v6.42: the in-app BTC 2h prediction, when on and fresh (it steers candlestick trades only)
+    ...(State.predictOn && BtcPredict.fresh(BtcPred.prediction()) ? { btcPrediction2h: `${BtcPred.prediction().prob}% chance BTC is above its 1h EMA50 in 2 hours (${BtcPred.prediction().regime})`,
+      candlestickTrades: candleMode().pause ? 'paused by the prediction' : `follow the prediction (${candleMode().mode})` } : {})
   } : null;
   const last = (State.tradeLogs || []).slice(0, 20);
   const account = {
@@ -3488,6 +3551,22 @@ setInterval(() => {
   if (tradingPaused() || !State.momentumOn) return;
   MomentumReport.tick(momentumRows).then((ok) => { syncMomentumStatus(); if (ok) { saveDiskState(); broadcastStateUpdate(); } }).catch((e) => console.error('[Momentum]', e.message));
 }, 30000);
+// v6.42: the BTC 2h prediction, 10 s after each 5m close (a failed one is tried again a minute later), or early when BTC moves
+// 0.35%+ from the last prediction's price (BTC's price is read once a minute). Saved every 15 minutes; the screen updates each time.
+let btcPriceNow = { p: NaN, at: 0 }, predictSavedAt = 0;
+setInterval(async () => {
+  if (tradingPaused() || !State.predictOn) { if (syncPredictStatus()) broadcastStateUpdate(); return; }
+  if (Date.now() - btcPriceNow.at >= 60000 && !fapiBusy()) {
+    const t = await safeFetch(`${FAPI_BASE}/fapi/v1/ticker/price?symbol=BTCUSDT`, 5000).catch(() => null);
+    btcPriceNow = { p: Number(t && t.price), at: Date.now() };
+  }
+  BtcPred.tick(btcPredictData, Date.now(), { price: btcPriceNow.p }).then((ok) => {
+    const changed = syncPredictStatus();
+    if (changed || (ok && Date.now() - predictSavedAt >= 15 * 60000)) { saveDiskState(); predictSavedAt = Date.now(); }
+    if (ok || changed) broadcastStateUpdate();
+  }).catch((e) => console.error('[BTC predict]', e.message));
+}, 15000);
+syncPredictStatus();
 setInterval(() => { fibTick().catch(() => {}); }, 5000);   // v6.23: the Fibonacci autopilot, once per closed bar
 setInterval(async () => {
   if (tradingPaused()) return;
