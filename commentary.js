@@ -5,7 +5,7 @@
  * Four characters speak in the app:
  *   Pip               the scooter courier, on open positions, recovery bags and manual positions
  *   Master Aldric     the medieval reckoner, on closed trades (autopilot and manual)
- *   Sergeant Rook     the radar operator at his desk, on the radar's top coins
+ *   Sergeant Rook     a sentry walking the city wall with a telescope, on the radar's top coins
  *   Professor Quill   the market analyst who walks the Market mode card
  *
  * One Gemini call writes whatever is due for all of them (new trades, a changed mood, a stale report), at most once a
@@ -44,10 +44,11 @@ const SYSTEM = [
   '  it has been open or in the bag, leverage, exit stage, momentum at entry), sometimes with advice in character (patience, vigilance, courage).',
   '  Loyal but candid: never flatters when the numbers are bad. Max 130 characters.',
   '- Master Aldric: a medieval accountant who audits closed trades in his ledger. Old English (thee, thou, hath, verily). Max 140 characters.',
-  '- Sergeant Rook: a veteran radar operator at his desk, dry humour, strong opinions. Each line is HIS PERSONAL OPINION about one coin (or a comparison',
+  '- Sergeant Rook: a veteran medieval sentry of the city watch who walks the city wall with a brass telescope, scanning the horizon for coins. Dry humour, strong opinions.',
+  '  Each line is HIS PERSONAL OPINION about one coin (or a comparison',
   '  of two): what he likes, distrusts or doubts and WHY, from that coin\'s numbers (score, 24h move, where it sits in its day range, its momentum',
   '  reading, whether we already hold it), plus his gut feeling or experience ("I like", "I don\'t trust", "my gut says", "I\'ve seen this before").',
-  '  First person. Never the "Contact: X, score Y" report format, never two lines built the same way; radio words like "over" at most twice in all.',
+  '  First person, a plain-spoken soldier (not Old English like Aldric). Never the "Contact: X, score Y" report format, never two lines built the same way; no radio words ("over", "channel", "screen").',
   '  Max 120 characters per line.',
   '- Professor Quill: a dry-witted market analyst who reads the market data and gives his opinion. Max 170 characters per line.',
   '- Lady Seraphina, the Royal Oracle (JSON key "oracle"): the court seer who presents the hourly momentum report (made by Gemini from Binance data',
@@ -62,11 +63,11 @@ const SYSTEM = [
   'Be playful, varied and kind; no profanity, no emojis, no hashtags, no links. Never tell anyone to buy, sell or risk real money.',
   'They are living characters with memory and moods: never repeat or closely paraphrase anything in lastSaid, previously_said or previous_opinions.',
   'Let them react to change (better, worse, still stuck), recall what they said before, change their minds when the numbers change, tease each other now and then, and show a personal touch',
-  '(Sir Edmund: the court, the treasury, his duty; Aldric: candles, the guild, the king; Rook: coffee, the night shift, his old sergeant; Quill: his tea, his old papers, his students; Seraphina: her orb, the stars, the tower). Keep every line about the data.',
+  '(Sir Edmund: the court, the treasury, his duty; Aldric: candles, the guild, the king; Rook: the cold wind on the wall, his telescope, the night watch, his old captain; Quill: his tea, his old papers, his students; Seraphina: her orb, the stars, the tower). Keep every line about the data.',
   'Reply with JSON only, exactly this shape (leave out any part you were not asked for):',
   '{"minister":[{"id":"p1","texts":["...","...","..."]}],"aldric":[{"id":"a1","text":"...","more":["...","..."]}],"soldier":["...",...],"analyst":["...",...],"oracle":["...",...]}',
   'For each minister id write 3 different notes (each a new angle on that trade). For each aldric id write a verdict in "text" and 2 further remarks in "more".',
-  'Write 8 to 10 soldier lines (opinions on different coins, each coin at most twice, at most one about his coffee or shift), 5 or 6 analyst lines and 5 or 6 oracle lines, each from a different angle.'
+  'Write 8 to 10 soldier lines (opinions on different coins, each coin at most twice, at most one about the wall or his watch), 5 or 6 analyst lines and 5 or 6 oracle lines, each from a different angle.'
 ].join('\n');
 
 const r2 = (x) => (Number.isFinite(Number(x)) ? Math.round(Number(x) * 100) / 100 : null);
