@@ -1117,6 +1117,31 @@ function liquidationPrice(entryPrice, side, leverage = 1, R = LEVERAGE) {
 }
 
 /**
+ * v6.43 (the user's paper test, 26 Nov 2026): back-to-back trades at 20x. In the trade ledger, rows of the same coin in a
+ * line are back to back (on 26 Nov: BABY four times running, WIF, ARIA, ZRO and BTW twice). When the candlestick autopilot
+ * opens a coin whose trade is the latest row of the ledger (the most recent close), that trade uses 20x, and so on down the
+ * run; the first trade of a run keeps its usual leverage. Same margin as any trade (positionPct of the account), so the
+ * position is 20 times the margin. Isolated: liquidated about 4% against (1% maintenance), just past the -3.50% bag point.
+ */
+const REPEAT_LEVERAGE = { leverage: 20 };
+const ledgerCoin = (p) => String(p || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
+/** The coin of the latest row in the trade ledger (the most recent close), or null. */
+function lastLedgerCoin(tradeLogs) {
+  let best = null, bestT = -Infinity;
+  for (const t of tradeLogs || []) {
+    if (!t || isTestTrade(t)) continue;
+    const id = Number(t.id);
+    if (Number.isFinite(id) && id > bestT) { bestT = id; best = t; }
+  }
+  return best ? ledgerCoin(best.pair) || null : null;
+}
+/** Is a new trade on this coin back to back (its trade is the latest row of the ledger)? */
+function backToBack(tradeLogs, pairKey) {
+  const last = lastLedgerCoin(tradeLogs);
+  return Boolean(last) && last === ledgerCoin(pairKey);
+}
+
+/**
  * v6.14: which of the engine's own trade records a row read back from the Google Sheet is. By its id first (same coin);
  * a row whose id the engine does not hold falls back to the same coin, day and minute at the same entry price (to
  * 0.001% of the price). The old rule took the first record of the coin on that day with an entry within a fixed $0.0001,
@@ -1385,6 +1410,9 @@ module.exports = {
   LEVERAGE,
   autoLeverage,
   liquidationPrice,
+  REPEAT_LEVERAGE,
+  lastLedgerCoin,
+  backToBack,
   bagTopUp,
   planBagTopUps,
   bagTopUpReserve,
