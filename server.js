@@ -883,7 +883,7 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   const short = isShort(pos);
   const bagCut = bookName === 'recoveryBags' && /^BAG (CUT|BREAKEVEN) /.test(typeLabel);
   const fibExit = bookName === 'activePositions' && Boolean(pos.fib) && /^FIB /.test(typeLabel);   // v6.23: its own stop-loss
-  // v6.44: your BULL-fading rule closes longs at -1.20% from entry or better, only while it is on
+  // v6.44: your BULL-fading rule closes longs at -1.20% from entry or better, only while it is on (never a 20x trade: bullFadeExit)
   const fadeExit = typeLabel === 'BULL FADE' && !short && Boolean(State.bullFade && State.bullFade.on) && Strategy.bullFadeExit(pos, price);
   if (!/MANUAL|LIQUIDATED/.test(typeLabel) && !bagCut && !fibExit && !fadeExit && (short ? price > entry : price < entry)) {
     logOperation('SENTRY', `${pos.pair}: blocked ${typeLabel} below entry. Position stays open.`, 'warning');
@@ -1339,7 +1339,7 @@ function syncBullFade(live) {
   };
   const pct = (x) => `${Math.round(Number(x) * 100)}%`;
   if (event === 'fired') {
-    logOperation('MARKET_MODE', `Bull fading: only ${pct(bf.breadth)} of coins are above their 1h EMA50 on the live price (under ${pct(R.breadth)}). No new longs until the market leaves BULL. Long trades and bags close at ${R.closePct.toFixed(2)}% from entry or better; shorts keep their exits.`, 'warning');
+    logOperation('MARKET_MODE', `Bull fading: only ${pct(bf.breadth)} of coins are above their 1h EMA50 on the live price (under ${pct(R.breadth)}). No new longs until the market leaves BULL. Long trades and bags close at ${R.closePct.toFixed(2)}% from entry or better; shorts and 20x trades keep their exits.`, 'warning');
     saveDiskState(); broadcastStateUpdate(); setImmediate(kickSentry);
   } else if (event === 'released') {
     const n = bf.closed || 0, net = bf.netUSDT || 0;
@@ -1881,8 +1881,8 @@ async function runPredictiveSentry() {
       // No minimum exit, trail, harvest, scratch or move to a recovery bag.
       if (pos.fib) continue;
       // v6.44: while BULL fades a long closes at -1.20% from entry or better, before any other exit. Below that it keeps its
-      // usual rules (it still moves to a recovery bag at -3.50%).
-      if (State.bullFade.on && !short) {
+      // usual rules (it still moves to a recovery bag at -3.50%). A trade opened at 20x keeps its usual exits (your exception).
+      if (State.bullFade.on && Strategy.bullFadePrice(pos)) {
         pos.fadeClosePrice = Strategy.bullFadePrice(pos);
         if (Strategy.bullFadeExit(pos, price)) {
           const fill = (await executableExitPrice(k, pos)) || price;
@@ -1969,8 +1969,8 @@ async function runPredictiveSentry() {
         realizeExit('recoveryBags', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
         continue;
       }
-      // v6.44: while BULL fades a long bag closes at -1.20% from entry or better, instead of its usual close
-      if (State.bullFade.on && !isShort(bag)) {
+      // v6.44: while BULL fades a long bag closes at -1.20% from entry or better, instead of its usual close (not a 20x one)
+      if (State.bullFade.on && Strategy.bullFadePrice(bag)) {
         const lvl = Strategy.bullFadePrice(bag);
         Object.assign(bag, { fadeClosePrice: lvl, targetExitPriceUSDT: lvl, targetStep: `CLOSES AT ${Strategy.BULL_FADE.closePct.toFixed(2)}% (BULL FADING)` });
         if (Strategy.bullFadeExit(bag, price)) {
