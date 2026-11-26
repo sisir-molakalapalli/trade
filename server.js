@@ -132,6 +132,9 @@ const State = {
   // Settings > Momentum report (v6.33): on = a new short needs the hourly Gemini report to call the coin bearish (v6.34).
   // Starts on only when the server has a Gemini key, so an upload without the key doesn't stop new trades. MOMENTUM=off starts it off.
   momentumOn: !['off', '0', 'false'].includes(String(process.env.MOMENTUM || '').toLowerCase()) && Boolean(process.env.GEMINI_MOMENTUM_KEY || process.env.GEMINI_API_KEY),
+  // Settings > Back-to-back trades at 20x (v6.43, paper test): on = the candlestick autopilot opens a coin whose trade is the
+  // latest row of the ledger at 20x. REPEAT_LEV=off starts it off.
+  repeatLev: !['off', '0', 'false'].includes(String(process.env.REPEAT_LEV || '').toLowerCase()),
   // Settings > BTC 2h prediction (v6.42): on = the in-app prediction steers candlestick trades. BTC_PREDICT=off starts it off.
   predictOn: !['off', '0', 'false'].includes(String(process.env.BTC_PREDICT || '').toLowerCase()),  breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
@@ -817,12 +820,13 @@ function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
     initialStopPrice: bagAt, sl: bagAt, stopPct: Number(plan.stopPct.toFixed(3)), riskUSDT: plan.riskUSDT, atrPct: Number(signal.atrPct.toFixed(3)),
     breakevenPrice: entry * (1 + R.shortFloorPct / 100), tp1Price: entry * (1 + R.tp1Pct / 100), targetPrice: entry * 1.03,
     liquidationPrice: Strategy.liquidationPrice(entry, 'LONG', lev), fundingUSDT: 0, nextFundingAt: 0,
-    peakGainPct: 0, peakHighPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern
+    peakGainPct: 0, peakHighPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern,
+    ...(repeatTrade(pairKey, lev) ? { repeat20: true } : {})   // v6.43: back to back, 20x
   };
   // Breakdown long (test): closes only at its fixed target, never by harvest, trail, scratch or partial.
   const target = opts.targetOnlyPct ? entry * (1 + opts.targetOnlyPct / 100) : 0;
   if (target) Object.assign(State.activePositions[pairKey], { targetOnlyPct: opts.targetOnlyPct, entrySource: opts.entrySource, ratchetStage: 'TARGET_ONLY', breakevenPrice: target, tp1Price: target, targetPrice: target });
-  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''}) via [${signal.pattern}] • ${target ? `Closes only at +${opts.targetOnlyPct.toFixed(2)}% ($${formatPrecisePrice(target)})` : 'Min exit +0.20%'} • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
+  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''})${State.activePositions[pairKey].repeat20 ? ' • back to back on this coin: 20x' : ''} via [${signal.pattern}] • ${target ? `Closes only at +${opts.targetOnlyPct.toFixed(2)}% ($${formatPrecisePrice(target)})` : 'Min exit +0.20%'} • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -849,9 +853,10 @@ function openShort(pairKey, signal, plan, takerBuyRatio) {
     initialStopPrice: bagAt, sl: bagAt, stopPct: Number(plan.stopPct.toFixed(3)), riskUSDT: plan.riskUSDT, atrPct: Number(signal.atrPct.toFixed(3)),
     breakevenPrice: entry * (1 - R.shortFloorPct / 100), tp1Price: entry * (1 - R.tp1Pct / 100), targetPrice: entry * 0.97,
     liquidationPrice: Strategy.liquidationPrice(entry, 'SHORT', lev), fundingUSDT: 0, nextFundingAt: 0,
-    peakGainPct: 0, peakLowPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern
+    peakGainPct: 0, peakLowPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern,
+    ...(repeatTrade(pairKey, lev) ? { repeat20: true } : {})   // v6.43: back to back, 20x
   };
-  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''}) via [${signal.pattern}] • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
+  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''})${State.activePositions[pairKey].repeat20 ? ' • back to back on this coin: 20x' : ''} via [${signal.pattern}] • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -927,7 +932,7 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
     strategyVersion: 6,
     leverage: levAtEntry,
     ...(pos.momentum ? { momentumScore: pos.momentum.s, momentumDir: pos.momentum.d } : {}),   // v6.33: the score it was opened with
-    reason: `${reasonText}${levAtEntry > 1 ? ` • ${levAtEntry}x leverage` : ''}${pos.momentum ? ` • momentum ${pos.momentum.d} ${pos.momentum.s}` : ''}`
+    reason: `${reasonText}${levAtEntry > 1 ? ` • ${levAtEntry}x leverage${pos.repeat20 ? ' (back to back)' : ''}` : ''}${pos.momentum ? ` • momentum ${pos.momentum.d} ${pos.momentum.s}` : ''}`
   };
 
   logOperation(pnl >= 0 ? 'SENTRY_EXIT' : 'RISK_STOP',
@@ -1234,7 +1239,13 @@ async function coinTrendAgrees(pairKey, side) {
 }
 
 // Settings > Leverage (v6.8): 1x when off; when on, from the coin's 15m ATR on closed candles, as back-tested.
+// v6.43: was this trade opened at 20x because it is back to back (its coin's trade is the latest row of the ledger)?
+function repeatTrade(pairKey, lev) {
+  return State.repeatLev && Number(lev) === Strategy.REPEAT_LEVERAGE.leverage && Strategy.backToBack(State.tradeLogs, pairKey);
+}
 async function leverageFor(pairKey) {
+  // v6.43: back to back (this coin's trade is the latest row of the ledger): 20x, with or without auto leverage
+  if (State.repeatLev && Strategy.backToBack(State.tradeLogs, pairKey)) return Strategy.REPEAT_LEVERAGE.leverage;
   if (!State.leverageAuto) return 1;
   const mo = momentumEntry(pairKey);   // v6.33: with the momentum report on, its score sets the leverage, not volatility
   if (mo) return Momentum.leverageFor(mo.s, Strategy.LEVERAGE.maxLeverage);
@@ -2404,6 +2415,7 @@ function persistableState(keepTrades = 150, live = false) {
     manual: State.manual,
     positionPct: State.positionPct,
     leverageAuto: State.leverageAuto,
+    repeatLev: State.repeatLev,   // v6.43
     bothSides: State.bothSides,
     sideMode: State.sideMode,
     commentary: Commentary.toJSON(),   // v6.31
@@ -2439,6 +2451,7 @@ function applyPersistedState(parsed, live = false) {
   if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
   if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
   if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
+  if (typeof parsed.repeatLev === 'boolean') State.repeatLev = parsed.repeatLev;   // v6.43
   if (typeof parsed.bothSides === 'boolean') State.bothSides = parsed.bothSides;
   if (Strategy.validSideMode(parsed.sideMode)) State.sideMode = Strategy.validSideMode(parsed.sideMode);   // v6.30
   if (parsed.commentary) Commentary.load(parsed.commentary);   // v6.31
@@ -2880,7 +2893,8 @@ function checkManualLiquidation(sym, price) {
 }
 
 function syncLeverageStatus() {
-  State.subsystems.leverage = { on: State.leverageAuto, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct };
+  State.subsystems.leverage = { on: State.leverageAuto, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct,
+    repeatOn: State.repeatLev, repeatLeverage: Strategy.REPEAT_LEVERAGE.leverage };   // v6.43
 }
 
 function syncSidesStatus() {
@@ -2964,6 +2978,19 @@ app.post('/api/leverage', (req, res) => {
   logOperation('ENTRIES', on
     ? `Auto leverage ON (test): new trades use 1x to ${Strategy.LEVERAGE.maxLeverage}x from each coin's volatility (${Strategy.LEVERAGE.atrTargetPct} / 15m ATR%). A trade that moves to a recovery bag gets free cash added to its margin, back to 1x. Open positions keep their leverage.`
     : 'Auto leverage OFF: new trades are 1x. Open positions and bags keep their leverage.', 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, on });
+});
+// v6.43: Settings > Back-to-back trades at 20x (paper test)
+app.post('/api/repeat-leverage', (req, res) => {
+  const v = req.body.on, on = v === true || v === 'true' || v === 'on', off = v === false || v === 'false' || v === 'off';
+  if (!on && !off) return res.status(400).json({ success: false, error: 'on must be true or false' });
+  State.repeatLev = on;
+  syncLeverageStatus();
+  logOperation('ENTRIES', on
+    ? `Back-to-back trades at ${Strategy.REPEAT_LEVERAGE.leverage}x ON (test): when the candlestick autopilot opens a coin whose trade is the latest row of the trade ledger, it uses ${Strategy.REPEAT_LEVERAGE.leverage}x (same margin, a position ${Strategy.REPEAT_LEVERAGE.leverage} times bigger; liquidated about 4% against). The first trade of a run keeps its usual leverage.`
+    : `Back-to-back trades at ${Strategy.REPEAT_LEVERAGE.leverage}x OFF: new trades use the usual leverage. Open positions and bags keep theirs.`, 'warning');
   saveDiskState();
   broadcastStateUpdate();
   res.json({ success: true, on });
