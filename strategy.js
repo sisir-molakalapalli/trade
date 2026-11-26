@@ -919,7 +919,7 @@ function neutralShortsOnly(mode, lastTrend) {
  * the live price (the hour still open, as a live chart shows it). The first reading under 60% stops new longs until that
  * mode is no longer BULL (NEUTRAL or BEAR); then new trades follow the usual rules again. Meanwhile every long trade and
  * long bag closes at -1.20% from entry or better: at once if its price is there, otherwise when it climbs back to it.
- * Shorts keep their usual exits. A finished hour under 60% already ends BULL (evaluateMarketMode), so only the live
+ * Shorts and trades opened at 20x (back to back, v6.43) keep their usual exits. A finished hour under 60% already ends BULL (evaluateMarketMode), so only the live
  * reading can see the drop while the market is still BULL.
  */
 const BULL_FADE = { breadth: 0.60, closePct: -1.20, liveMaxAgeMs: 5 * 60000 };
@@ -948,10 +948,14 @@ function bullFadeStep(prev, { mode, breadth, now = Date.now() } = {}, R = BULL_F
   }
   return { state: p, event: null };
 }
-/** The price a long closes at while BULL fades: -1.20% from entry. null for a short or without an entry. */
+/** The user's exception (27 Nov 2026): a trade opened at 20x (back to back, v6.43) is left out of the -1.20% close, as a trade or a bag. */
+function bullFadeSkips(pos) {
+  return Boolean(pos && (pos.repeat20 || num(pos.leverageAtEntry || pos.leverage) >= REPEAT_LEVERAGE.leverage));
+}
+/** The price a long closes at while BULL fades: -1.20% from entry. null for a short, a 20x trade, or without an entry. */
 function bullFadePrice(pos, R = BULL_FADE) {
   const e = num(pos && pos.entryPriceUSDT);
-  return pos && pos.side !== 'SHORT' && e > 0 ? e * (1 + R.closePct / 100) : null;
+  return pos && pos.side !== 'SHORT' && !bullFadeSkips(pos) && e > 0 ? e * (1 + R.closePct / 100) : null;
 }
 /** True when a long's price is at its BULL-fading close level or better (1e-9: float dust). */
 function bullFadeExit(pos, price, R = BULL_FADE) {
@@ -1431,6 +1435,7 @@ module.exports = {
   BULL_FADE,
   liveBreadth,
   bullFadeStep,
+  bullFadeSkips,
   bullFadePrice,
   bullFadeExit,
   SIDE_MODES,
