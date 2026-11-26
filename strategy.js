@@ -914,6 +914,52 @@ function neutralShortsOnly(mode, lastTrend) {
 }
 
 /**
+ * v6.44 (the user's rule, 27 Nov 2026): BULL fading. While the market mode the candlestick autopilot trades by is BULL
+ * (the app's own, or a fresh BTC 2h prediction), the share of the top coins above their 1h EMA50 is read every minute on
+ * the live price (the hour still open, as a live chart shows it). The first reading under 60% stops new longs until that
+ * mode is no longer BULL (NEUTRAL or BEAR); then new trades follow the usual rules again. Meanwhile every long trade and
+ * long bag closes at -1.20% from entry or better: at once if its price is there, otherwise when it climbs back to it.
+ * Shorts keep their usual exits. A finished hour under 60% already ends BULL (evaluateMarketMode), so only the live
+ * reading can see the drop while the market is still BULL.
+ */
+const BULL_FADE = { breadth: 0.60, closePct: -1.20, liveMaxAgeMs: 5 * 60000 };
+/** Share (0-1) of coins whose live 1h price is above their live 1h EMA50; klines include the hour still open. null: under minCoins readable. */
+function liveBreadth(coins1h = [], R = MODE_RULES) {
+  let above = 0, seen = 0;
+  (coins1h || []).filter(Array.isArray).forEach((k) => {
+    const c = toBars(k).map((b) => b.c).filter((x) => x > 0);
+    if (c.length < 55) return;
+    seen++;
+    if (c[c.length - 1] > emaSeries(c, 50)[c.length - 1]) above++;
+  });
+  return seen >= R.minCoins ? above / seen : null;
+}
+/**
+ * One step of the BULL-fading latch. prev: the stored state ({on, at, breadth, ...}); mode: the candlestick mode's
+ * name; breadth: the latest live reading (null if unknown or stale). Returns { state, event: 'fired' | 'released' | null }.
+ */
+function bullFadeStep(prev, { mode, breadth, now = Date.now() } = {}, R = BULL_FADE) {
+  const p = prev && typeof prev === 'object' ? prev : { on: false };
+  if (mode !== 'BULL') {
+    return p.on ? { state: { ...p, on: false, endedAt: now, endMode: mode || 'NEUTRAL' }, event: 'released' } : { state: p, event: null };
+  }
+  if (!p.on && breadth !== null && breadth !== undefined && Number.isFinite(Number(breadth)) && Number(breadth) < R.breadth) {
+    return { state: { ...p, on: true, at: now, breadth: Number(breadth), endedAt: 0, endMode: null, closed: 0, netUSDT: 0 }, event: 'fired' };
+  }
+  return { state: p, event: null };
+}
+/** The price a long closes at while BULL fades: -1.20% from entry. null for a short or without an entry. */
+function bullFadePrice(pos, R = BULL_FADE) {
+  const e = num(pos && pos.entryPriceUSDT);
+  return pos && pos.side !== 'SHORT' && e > 0 ? e * (1 + R.closePct / 100) : null;
+}
+/** True when a long's price is at its BULL-fading close level or better (1e-9: float dust). */
+function bullFadeExit(pos, price, R = BULL_FADE) {
+  const lvl = bullFadePrice(pos, R);
+  return lvl > 0 && num(price) > 0 && num(price) >= lvl * (1 - 1e-9);
+}
+
+/**
  * v6.30: Settings > Trade direction. SHORT = shorts only (the default from 24 Nov 2026): the autopilot opens only shorts, in
  * every market mode, and outside a BEAR market each short still needs the coin's own 1h downtrend (as every NEUTRAL or
  * against-the-mode trade does). BOTH = shorts and longs, exactly as before: the market mode's side, Settings > Both sides,
@@ -1382,6 +1428,11 @@ module.exports = {
   evaluateMarketMode,
   lastTrendMode,
   neutralShortsOnly,
+  BULL_FADE,
+  liveBreadth,
+  bullFadeStep,
+  bullFadePrice,
+  bullFadeExit,
   SIDE_MODES,
   validSideMode,
   tradeSideFor,
