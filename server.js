@@ -135,6 +135,9 @@ const State = {
   // Settings > Back-to-back trades at 20x (v6.43, paper test): on = the candlestick autopilot opens a coin whose trade is the
   // latest row of the ledger at 20x. REPEAT_LEV=off starts it off.
   repeatLev: !['off', '0', 'false'].includes(String(process.env.REPEAT_LEV || '').toLowerCase()),
+  // v6.44: BULL fading (Strategy.BULL_FADE): on = live breadth fell under 60% while the candlestick mode was BULL. No new longs
+  // and long trades / bags close at -1.20% or better until that mode leaves BULL. live / liveAt: the latest live reading.
+  bullFade: { on: false, at: 0, breadth: null, live: null, liveAt: 0, closed: 0, netUSDT: 0, endedAt: 0, endMode: null },
   // Settings > BTC 2h prediction (v6.42): on = the in-app prediction steers candlestick trades. BTC_PREDICT=off starts it off.
   predictOn: !['off', '0', 'false'].includes(String(process.env.BTC_PREDICT || '').toLowerCase()),  breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
@@ -176,6 +179,7 @@ const State = {
     screener: { status: 'ACTIVE', scannedPairsCount: 0, qualifiedCandidatesCount: 0, cadenceSec: 60, liquidityFloorUSD: '$10M+ futures volume', source: 'USD-M futures' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
+    bullFade: { on: false, live: null, liveAt: 0, limitPct: 60, closePct: -1.20 },   // v6.44
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
     leverage: { on: false, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct },
     sizing: { positionPct: Strategy.FUTURES.positionPct, minPct: Strategy.POSITION_SIZE.minPct, maxPct: Strategy.POSITION_SIZE.maxPct },
@@ -401,6 +405,7 @@ async function refreshMarketMode(tickers) {
     logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${sideText(r)} Open positions keep their exits.`, 'warning');
   }
   syncPredictStatus();   // v6.42: the candlestick mode follows the app's mode unless a fresh BTC 2h prediction changes it
+  syncBullFade(Strategy.liveBreadth(coins.filter(Boolean)));   // v6.44: the same coins, with the hour still open
   return r;
 }
 
@@ -878,7 +883,9 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   const short = isShort(pos);
   const bagCut = bookName === 'recoveryBags' && /^BAG (CUT|BREAKEVEN) /.test(typeLabel);
   const fibExit = bookName === 'activePositions' && Boolean(pos.fib) && /^FIB /.test(typeLabel);   // v6.23: its own stop-loss
-  if (!/MANUAL|LIQUIDATED/.test(typeLabel) && !bagCut && !fibExit && (short ? price > entry : price < entry)) {
+  // v6.44: your BULL-fading rule closes longs at -1.20% from entry or better, only while it is on
+  const fadeExit = typeLabel === 'BULL FADE' && !short && Boolean(State.bullFade && State.bullFade.on) && Strategy.bullFadeExit(pos, price);
+  if (!/MANUAL|LIQUIDATED/.test(typeLabel) && !bagCut && !fibExit && !fadeExit && (short ? price > entry : price < entry)) {
     logOperation('SENTRY', `${pos.pair}: blocked ${typeLabel} below entry. Position stays open.`, 'warning');
     return null;
   }
@@ -1310,6 +1317,45 @@ function syncMomentumStatus() { State.subsystems.momentum = { ...MomentumReport.
 // ---------- v6.42: the BTC 2-hour prediction (btcpredict.js). Candlestick path only: the Fibonacci path, open positions, bags,
 // the characters' market view and everything else keep the app's own market mode (State.subsystems.marketMode).
 function candleMode() { return BtcPredict.applyToMode(State.subsystems.marketMode, State.predictOn ? BtcPred.prediction() : null); }
+// v6.44: BULL fading (Strategy.BULL_FADE). live: a new live breadth reading (refreshMarketMode, every minute); without one the
+// last reading counts while it is under 5 minutes old. Until the market mode has been read properly the latch is left as it is
+// (a restart keeps it on), so missing data never ends it.
+function syncBullFade(live) {
+  const now = Date.now(), R = Strategy.BULL_FADE;
+  if (live !== undefined) Object.assign(State.bullFade, { live, liveAt: now });
+  const fresh = State.bullFade.liveAt > 0 && now - State.bullFade.liveAt < R.liveMaxAgeMs;
+  const own = State.subsystems.marketMode || {};
+  const mode = candleMode();
+  let event = null;
+  if (own.updatedAt > 0 && own.seen >= Strategy.MODE_RULES.minCoins) {
+    const step = Strategy.bullFadeStep(State.bullFade, { mode: mode.mode, breadth: fresh ? State.bullFade.live : null, now });
+    State.bullFade = step.state; event = step.event;
+  }
+  const bf = State.bullFade;
+  State.subsystems.bullFade = {
+    on: Boolean(bf.on), at: bf.at || 0, breadth: bf.breadth, live: fresh ? bf.live : null, liveAt: bf.liveAt || 0, mode: mode.mode,
+    limitPct: R.breadth * 100, closePct: R.closePct, closed: bf.closed || 0, netUSDT: Number((bf.netUSDT || 0).toFixed(4)),
+    endedAt: bf.endedAt || 0, endMode: bf.endMode || null
+  };
+  const pct = (x) => `${Math.round(Number(x) * 100)}%`;
+  if (event === 'fired') {
+    logOperation('MARKET_MODE', `Bull fading: only ${pct(bf.breadth)} of coins are above their 1h EMA50 on the live price (under ${pct(R.breadth)}). No new longs until the market leaves BULL. Long trades and bags close at ${R.closePct.toFixed(2)}% from entry or better; shorts keep their exits.`, 'warning');
+    saveDiskState(); broadcastStateUpdate(); setImmediate(kickSentry);
+  } else if (event === 'released') {
+    const n = bf.closed || 0, net = bf.netUSDT || 0;
+    logOperation('MARKET_MODE', `Bull fading is over: the market is ${bf.endMode} now, so new trades follow the usual rules again.${n ? ` ${n} long${n === 1 ? '' : 's'} closed while it lasted, net ${net >= 0 ? '+' : '-'}$${Math.abs(net).toFixed(2)}.` : ''} Long bags left go back to their usual close.`, 'info');
+    saveDiskState(); broadcastStateUpdate();
+  }
+  return bf;
+}
+// v6.44: a long closed by BULL fading counts toward what the app shows for it
+function noteBullFadeClose(trade) {
+  if (!trade) return trade;
+  State.bullFade.closed = (State.bullFade.closed || 0) + 1;
+  State.bullFade.netUSDT = Number(((State.bullFade.netUSDT || 0) + (Number(trade.pnlUSDT) || 0)).toFixed(6));
+  syncBullFade();
+  return trade;
+}
 async function btcPredictData() {
   if (fapiBusy()) return null;
   const get = (p) => safeFetch(`${FAPI_BASE}${p}`, 8000).catch(() => null);
@@ -1405,6 +1451,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       // Settings > High vol breakdown > Long (paper test): the same breakdown signal, after the same checks, is bought
       // at the ask and closes only at +0.30%. Candle-pattern shorts are never flipped.
       if (!candle.isShortEntry && State.breakdownSide === 'LONG' && State.sideMode !== 'SHORT') {   // v6.30: shorts only shorts every breakdown
+        if (State.bullFade.on) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }   // v6.44: no new longs while BULL fades
         const ask = book.bestAsk, tPct = Strategy.BREAKDOWN_LONG.targetPct;
         const lsig = await buildEntrySignal(pairKey, ask, 'HIGH_VOL_BREAKDOWN LONG', mom);
         const lplan = Strategy.planCompoundEntry(lsig, ask, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey)));
@@ -1492,9 +1539,13 @@ async function evaluateAutopilotEntries() {
   // Market mode decides which side may trade. Open positions are managed either way.
   // v6.42: for these candlestick trades, a fresh BTC 2h prediction sets the mode (62%+ bullish, 38% or less bearish) or pauses them
   const mode = candleMode();
-  const side = tradeSide(mode);
+  syncBullFade();
+  let side = tradeSide(mode);
+  const fading = State.bullFade.on && (side === 'LONG' || side === 'BOTH');   // v6.44: no new longs while BULL fades
+  if (fading) side = side === 'LONG' ? 'NONE' : 'SHORT';
   if (side === 'NONE') {
-    throttledNotice('mode', 'MARKET_MODE', `No new trades: ${mode.reason}.`, 'info', 120000);
+    throttledNotice('mode', 'MARKET_MODE', fading ? `No new longs: bull fading (${Math.round(Number(State.bullFade.breadth) * 100)}% of coins above their 1h EMA50), until the market leaves BULL.`
+      : `No new trades: ${mode.reason}.`, 'info', 120000);
     return;
   }
   if (Number(State.portfolio.cashUSDT) < Strategy.CONFIG.minNotional * (1 + FUT_FEE_RATE)) {
@@ -1809,6 +1860,7 @@ async function runPredictiveSentry() {
   if (sentryBusy || tradingPaused()) return;
   sentryBusy = true;
   try {
+    syncBullFade();   // v6.44
     // ---- active positions ----
     for (const k of Object.keys(State.activePositions || {})) {
       const pos = State.activePositions[k];
@@ -1828,6 +1880,19 @@ async function runPredictiveSentry() {
       // v6.23: a Fibonacci trade is managed only at each closed bar (fibTick): stop-loss, TP1 35% + stop to entry (v6.24), TP2.
       // No minimum exit, trail, harvest, scratch or move to a recovery bag.
       if (pos.fib) continue;
+      // v6.44: while BULL fades a long closes at -1.20% from entry or better, before any other exit. Below that it keeps its
+      // usual rules (it still moves to a recovery bag at -3.50%).
+      if (State.bullFade.on && !short) {
+        pos.fadeClosePrice = Strategy.bullFadePrice(pos);
+        if (Strategy.bullFadeExit(pos, price)) {
+          const fill = (await executableExitPrice(k, pos)) || price;
+          if (State.activePositions[k] === pos && Strategy.bullFadeExit(pos, fill)) {
+            const g = (fill - entry) / entry * 100;
+            const t = realizeExit('activePositions', k, 1, fill, 'BULL FADE', `Bull fading (${Math.round(Number(State.bullFade.breadth) * 100)}% of coins above their 1h EMA50): closed at ${Strategy.BULL_FADE.closePct.toFixed(2)}% or better, ${g >= 0 ? '+' : ''}${g.toFixed(2)}% @ $${formatPrecisePrice(fill)}`);
+            if (t) { noteBullFadeClose(t); continue; }
+          }
+        }
+      } else if (pos.fadeClosePrice) delete pos.fadeClosePrice;
       // v6.12: your take profit replaces the autopilot's exits for this trade; the -3.50% move to a bag stays.
       if (Number(pos.userTpPct) > 0) {
         const r = Strategy.manageUserTp(pos, price);
@@ -1904,6 +1969,22 @@ async function runPredictiveSentry() {
         realizeExit('recoveryBags', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
         continue;
       }
+      // v6.44: while BULL fades a long bag closes at -1.20% from entry or better, instead of its usual close
+      if (State.bullFade.on && !isShort(bag)) {
+        const lvl = Strategy.bullFadePrice(bag);
+        Object.assign(bag, { fadeClosePrice: lvl, targetExitPriceUSDT: lvl, targetStep: `CLOSES AT ${Strategy.BULL_FADE.closePct.toFixed(2)}% (BULL FADING)` });
+        if (Strategy.bullFadeExit(bag, price)) {
+          const fill = (await executableExitPrice(k, bag)) || price;
+          if (State.recoveryBags[k] === bag && Strategy.bullFadeExit(bag, fill)) {
+            const e = Number(bag.entryPriceUSDT), g = (fill - e) / e * 100;
+            const inBagMin = Math.round((Date.now() - Number(bag.movedAt || bag.openedAt)) / 60000);
+            const t = realizeExit('recoveryBags', k, 1, fill, 'BULL FADE', `Bull fading (${Math.round(Number(State.bullFade.breadth) * 100)}% of coins above their 1h EMA50): recovery bag closed at ${Strategy.BULL_FADE.closePct.toFixed(2)}% or better, ${g >= 0 ? '+' : ''}${g.toFixed(2)}%, ${inBagMin < 120 ? `${inBagMin} min` : `${(inBagMin / 60).toFixed(1)} h`} after it moved to the bag @ $${formatPrecisePrice(fill)}`);
+            if (t) noteBullFadeClose(t);
+          }
+        }
+        continue;
+      }
+      if (bag.fadeClosePrice) delete bag.fadeClosePrice;
       // v6.12: a bag with your take profit closes there instead of at +0.30%
       const mine = Number(bag.userTpPct) > 0;
       const manage = (px) => (mine ? Strategy.manageUserTp(bag, px, { inBag: true }) : isShort(bag) ? Strategy.manageShortBag(bag, px) : Strategy.manageBag(bag, px));
@@ -2416,6 +2497,7 @@ function persistableState(keepTrades = 150, live = false) {
     positionPct: State.positionPct,
     leverageAuto: State.leverageAuto,
     repeatLev: State.repeatLev,   // v6.43
+    bullFade: State.bullFade,   // v6.44
     bothSides: State.bothSides,
     sideMode: State.sideMode,
     commentary: Commentary.toJSON(),   // v6.31
@@ -2452,6 +2534,7 @@ function applyPersistedState(parsed, live = false) {
   if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
   if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
   if (typeof parsed.repeatLev === 'boolean') State.repeatLev = parsed.repeatLev;   // v6.43
+  if (parsed.bullFade && typeof parsed.bullFade === 'object') State.bullFade = { ...State.bullFade, ...parsed.bullFade, live: null, liveAt: 0 };   // v6.44
   if (typeof parsed.bothSides === 'boolean') State.bothSides = parsed.bothSides;
   if (Strategy.validSideMode(parsed.sideMode)) State.sideMode = Strategy.validSideMode(parsed.sideMode);   // v6.30
   if (parsed.commentary) Commentary.load(parsed.commentary);   // v6.31
