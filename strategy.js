@@ -1236,6 +1236,15 @@ function backToBack(tradeLogs, pairKey, modeChangedAt = 0) {
   if (!last || ledgerCoin(last.pair) !== ledgerCoin(pairKey)) return false;
   return !(num(modeChangedAt) > 0 && num(last.id) <= num(modeChangedAt));
 }
+/**
+ * v6.51 (the user's rule, 27 Nov 2026): after the market mode changes, no new autopilot trades for an hour. Open positions
+ * and bags keep every exit; manual trades are the user's own. Returns when new trades may open again (ms), or 0.
+ */
+const MODE_SETTLE = { ms: 60 * 60000 };
+function modeSettling(modeChangedAt, now = Date.now()) {
+  const t = num(modeChangedAt);
+  return t > 0 && now >= t && now - t < MODE_SETTLE.ms ? t + MODE_SETTLE.ms : 0;
+}
 
 /**
  * v6.14: which of the engine's own trade records a row read back from the Google Sheet is. By its id first (same coin);
@@ -1529,6 +1538,8 @@ module.exports = {
   lastLedgerCoin,
   lastLedgerTrade,
   backToBack,
+  MODE_SETTLE,
+  modeSettling,
   bagTopUp,
   planBagTopUps,
   bagTopUpReserve,
