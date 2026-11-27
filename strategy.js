@@ -957,6 +957,25 @@ function bullFadePrice(pos, R = BULL_FADE) {
   const e = num(pos && pos.entryPriceUSDT);
   return pos && pos.side !== 'SHORT' && !bullFadeSkips(pos) && e > 0 ? e * (1 + R.closePct / 100) : null;
 }
+/**
+ * v6.45 (paper test, 27 Nov 2026): HIGH_VOL_IGNITION on the volume RATE. The old rule compared the live 15m candle's volume
+ * so far with a whole average candle (1.35x), which a surge reaches only late in the candle: in the 180-day replay 57% of
+ * ignitions fired only at minute 15 and 8% by minute 5. Now the volume so far must be 2x what an average candle (of the 9
+ * before) has traded by this point of the candle, counting at least a third of the candle (minute 5) as elapsed, so the
+ * first minutes need a real surge. The move (+0.80% from the 15m open) and taker buys (52%+) are unchanged.
+ * Replay (4 runs): average money up in all 8 halves, the worst start lower in 3 of 8; per trade about the same.
+ */
+const IGNITION = { movePct: 0.80, taker: 52, rvol: 1.35, rateX: 2.0, minShare: 1 / 3, candleMs: 15 * 60000 };
+/** Volume so far / what an average candle has traded by atMs. rvol: volume so far / a whole average candle. */
+function ignitionVolumeRate(rvol, openMs, atMs, R = IGNITION) {
+  const share = Math.min(1, Math.max(R.minShare, (num(atMs) - num(openMs)) / R.candleMs));
+  return Number.isFinite(num(rvol)) ? num(rvol) / share : 0;
+}
+/** The ignition check. useRate: v6.45 (volume rate >= 2x); false: the old rule (volume so far >= 1.35x a whole candle). */
+function isIgnition({ change15mPct, rvol, volRate, takerBuyRatio } = {}, useRate = true, R = IGNITION) {
+  if (!(num(change15mPct) >= R.movePct) || !(num(takerBuyRatio) >= R.taker)) return false;
+  return useRate ? num(volRate) >= R.rateX : num(rvol) >= R.rvol;
+}
 /** True when a long's price is at its BULL-fading close level or better (1e-9: float dust). */
 function bullFadeExit(pos, price, R = BULL_FADE) {
   const lvl = bullFadePrice(pos, R);
@@ -1438,6 +1457,9 @@ module.exports = {
   bullFadeSkips,
   bullFadePrice,
   bullFadeExit,
+  IGNITION,
+  ignitionVolumeRate,
+  isIgnition,
   SIDE_MODES,
   validSideMode,
   tradeSideFor,
