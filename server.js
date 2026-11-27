@@ -153,6 +153,9 @@ const State = {
   ignitionRate: !['off', '0', 'false'].includes(String(process.env.IGNITION_RATE || '').toLowerCase()),
   // v6.52 (paper test): the high vol breakdown (short) reads the volume RATE too (Strategy.BREAKDOWN). BREAKDOWN_RATE=off: the old rule.
   breakdownRate: !['off', '0', 'false'].includes(String(process.env.BREAKDOWN_RATE || '').toLowerCase()),
+  // v6.53 (the user's PDF): the short screener (Strategy.PDF_SHORT); shorts no longer use the Gemini report. PDF_SHORTS=off: no PDF shorts.
+  pdfShortsOn: !['off', '0', 'false'].includes(String(process.env.PDF_SHORTS || '').toLowerCase()),
+  pdfShortlist: [],
   // Settings > BTC 2h prediction (v6.42): on = the in-app prediction steers candlestick trades. BTC_PREDICT=off starts it off.
   predictOn: !['off', '0', 'false'].includes(String(process.env.BTC_PREDICT || '').toLowerCase()),  breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
@@ -202,6 +205,7 @@ const State = {
     leverage: { on: false, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct },
     sizing: { positionPct: Strategy.FUTURES.positionPct, minPct: Strategy.POSITION_SIZE.minPct, maxPct: Strategy.POSITION_SIZE.maxPct },
     breakdown: { side: 'SHORT', label: BREAKDOWN_SIDES.SHORT, longs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' } },
+    pdfShorts: { on: true, list: [], at: 0, gate: '', lastRead: '', opened: 0, last: '' },   // v6.53
     riskGuard: { status: 'ARMED', reason: 'Awaiting first evaluation', equityUSDT: 0, riskPerTradePct: 0.5, dailyLossLimitPct: 2.0 },
     regimeController: { status: 'CALIBRATED', currentRegime: 'BALANCED', marketAvgVolatilityPct: 4.5, liveScoreGate: 65, liveObiGatePct: 45 },
     predictiveSentry: { status: 'WATCHING', activePositionsMonitored: 0, recoveryBagsMonitored: 0, architecture: 'Min exit +0.30% long, +0.20% short • Candlestick harvest • From +0.50%, trail 0.20% behind the peak • Failing trades move to recovery bags' },
@@ -695,6 +699,12 @@ async function runDynamicScreener() {
       return;
     }
     const eligible = Strategy.futuresUniverse(futTickers, perpetuals, { ...Strategy.SCREENER, maxCoins: Infinity });
+    // v6.53: the PDF short screener's stage 1, from the same ticker of every contract and the funding rates (no extra request);
+    // the app's own short exclusions (listed under 3 days, extreme funding) still apply
+    State.pdfShortlist = Strategy.pdfShortlist(futTickers.filter((t) => perpetuals.has(t.symbol)
+      && !Strategy.futuresExclusion({ side: 'SHORT', volumeUSD: parseFloat(t.quoteVolume), fundingRate: currentFundingRate(t.symbol), listedAt: perpetuals.get(t.symbol).listedAt }))
+      .map((t) => ({ symbol: t.symbol, change24h: parseFloat(t.priceChangePercent), volumeUSD: parseFloat(t.quoteVolume), fundingRate: currentFundingRate(t.symbol) })));
+    syncPdfStatus({ at: Date.now() });
     const picked = eligible.slice(0, SCREENER_MAX_COINS);
     State.fibUniverse = picked.map((t) => t.symbol);   // v6.23: the Fibonacci screener's coins (it applies its own $10M gate too)
     const universe = {};
@@ -896,10 +906,11 @@ function openShort(pairKey, signal, plan, takerBuyRatio, opts = {}) {
     liquidationPrice: Strategy.liquidationPrice(entry, 'SHORT', lev), fundingUSDT: 0, nextFundingAt: 0,
     peakGainPct: 0, peakLowPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern,
     ...(repeatTrade(pairKey, lev) ? { repeat20: true } : {}),   // v6.43: back to back, 20x
-    ...(opts.breakdown ? { breakdown: opts.breakdown } : {})   // v6.52: how the breakdown fired
+    ...(opts.breakdown ? { breakdown: opts.breakdown } : {}),   // v6.52: how the breakdown fired
+    ...(opts.pdfShort ? { pdfShort: opts.pdfShort, entrySource: opts.entrySource || 'PDF_SHORT' } : {})   // v6.53: the PDF short screener's setup
   };
-  Journal.open('position', pairKey, State.activePositions[pairKey], { strategy: 'CANDLE', checks: { ...(opts.journal || {}), takerBuyRatio, breakdown: opts.breakdown || null }, signal, plan });   // v6.47
-  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''})${State.activePositions[pairKey].repeat20 ? ' • back to back on this coin: 20x' : ''} via [${signal.pattern}]${opts.breakdown ? ` (${opts.breakdown.rate ? `volume ${opts.breakdown.volRate}x the normal rate at minute ${opts.breakdown.minute}, test` : `volume ${opts.breakdown.rvol}x`})` : ''} • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
+  Journal.open('position', pairKey, State.activePositions[pairKey], { strategy: opts.entrySource || 'CANDLE', checks: { ...(opts.journal || {}), takerBuyRatio, breakdown: opts.breakdown || null }, signal, plan });   // v6.47
+  logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''})${State.activePositions[pairKey].repeat20 ? ' • back to back on this coin: 20x' : ''} via [${signal.pattern}]${opts.breakdown ? ` (${opts.breakdown.rate ? `volume ${opts.breakdown.volRate}x the normal rate at minute ${opts.breakdown.minute}, test` : `volume ${opts.breakdown.rvol}x`})` : ''}${opts.pdfShort ? ` (PDF short screener: ${opts.pdfShort.label})` : ''} • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -977,7 +988,7 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
     strategyVersion: 6,
     leverage: levAtEntry,
     ...(pos.momentum ? { momentumScore: pos.momentum.s, momentumDir: pos.momentum.d } : {}),   // v6.33: the score it was opened with
-    reason: `${reasonText}${levAtEntry > 1 ? ` • ${levAtEntry}x leverage${pos.repeat20 ? ' (back to back)' : ''}` : ''}${pos.momentum ? ` • momentum ${pos.momentum.d} ${pos.momentum.s}` : ''}${pos.ignition ? ` • ignition${pos.ignition.rate ? ` test (volume rate ${pos.ignition.volRate}x at minute ${pos.ignition.minute})` : ''}` : ''}${pos.breakdown ? ` • breakdown${pos.breakdown.rate ? ` test (volume rate ${pos.breakdown.volRate}x at minute ${pos.breakdown.minute})` : ''}` : ''}`
+    reason: `${reasonText}${levAtEntry > 1 ? ` • ${levAtEntry}x leverage${pos.repeat20 ? ' (back to back)' : ''}` : ''}${pos.momentum ? ` • momentum ${pos.momentum.d} ${pos.momentum.s}` : ''}${pos.ignition ? ` • ignition${pos.ignition.rate ? ` test (volume rate ${pos.ignition.volRate}x at minute ${pos.ignition.minute})` : ''}` : ''}${pos.breakdown ? ` • breakdown${pos.breakdown.rate ? ` test (volume rate ${pos.breakdown.volRate}x at minute ${pos.breakdown.minute})` : ''}` : ''}${pos.pdfShort ? ` • PDF short (${pos.pdfShort.label}: ${pos.pdfShort.pattern})` : ''}`
   };
 
   // v6.47: the journal record of this close, with all of the trade's data
@@ -1302,7 +1313,7 @@ async function coinTrendAgrees(pairKey, side) {
 function repeatTrade(pairKey, lev) {
   return State.repeatLev && Number(lev) === Strategy.REPEAT_LEVERAGE.leverage && Strategy.backToBack(State.tradeLogs, pairKey, State.modeChangedAt);
 }
-async function leverageFor(pairKey) {
+async function leverageFor(pairKey, side = 'LONG') {
   // v6.43: back to back (this coin's trade is the latest row of the ledger): 20x, with or without auto leverage
   // v6.50: not when the market mode changed after that trade closed (your rule): the coin opens at its usual leverage
   if (State.repeatLev && Strategy.backToBack(State.tradeLogs, pairKey, State.modeChangedAt)) return Strategy.REPEAT_LEVERAGE.leverage;
@@ -1310,7 +1321,7 @@ async function leverageFor(pairKey) {
     throttledNotice(`repeat-mode-${pairKey}`, 'LEVERAGE', `${pairKey.replace('USDT', '')} is back to back, but the market mode changed (to ${State.modeSeen || 'a new mode'}) after its last trade closed: usual leverage, not ${Strategy.REPEAT_LEVERAGE.leverage}x.`, 'info', 600000);
   }
   if (!State.leverageAuto) return 1;
-  const mo = momentumEntry(pairKey);   // v6.33: with the momentum report on, its score sets the leverage, not volatility
+  const mo = side === 'SHORT' ? null : momentumEntry(pairKey);   // v6.33: the report's score sets the leverage; v6.53: longs only
   if (mo) return Momentum.leverageFor(mo.s, Strategy.LEVERAGE.maxLeverage);
   const k = await getCachedKlines(pairKey, '15m', 16, 2500, 45000, true).catch(() => null);
   const closed = Array.isArray(k) ? Strategy.closedOnly(k) : [];
@@ -1375,6 +1386,12 @@ function syncMomentumStatus() { State.subsystems.momentum = { ...MomentumReport.
 function candleMode() { return BtcPredict.applyToMode(State.subsystems.marketMode, State.predictOn ? BtcPred.prediction() : null); }
 // v6.51 (the user's rule, 27 Nov 2026): after the app's market mode changes, no new autopilot trades (candlestick or
 // Fibonacci) for an hour. The BTC 2h prediction's shifts don't count. Open positions and bags keep every exit.
+// v6.53: the momentum report is for longs only now, so it isn't written while the autopilot can't open a long (saves the tokens)
+function longsPossible() {
+  if (State.sideMode === 'SHORT' || State.entryStrategy === 'FIB') return false;
+  const ts = tradeSide(candleMode());
+  return ts === 'LONG' || ts === 'BOTH';
+}
 function modeSettleNotice() {
   const until = Strategy.modeSettling(State.modeChangedAt);
   if (!until) return false;
@@ -1486,7 +1503,7 @@ function journalContext() {
       longs: all.filter((x) => !isShort(x)).length, shorts: all.filter((x) => isShort(x)).length },
     settings: { autopilot: State.autopilotEnabled, sideMode: State.sideMode, bothSides: State.bothSides, entryStrategy: State.entryStrategy,
       positionPct: State.positionPct, leverageAuto: State.leverageAuto, repeatLev: State.repeatLev, momentumOn: State.momentumOn, predictOn: State.predictOn,
-      ignitionRate: State.ignitionRate, breakdownRate: State.breakdownRate, breakdownSide: State.breakdownSide, minScore: (State.activeThresholds && State.activeThresholds.scoreThreshold) || 65 }
+      ignitionRate: State.ignitionRate, breakdownRate: State.breakdownRate, pdfShortsOn: State.pdfShortsOn, breakdownSide: State.breakdownSide, minScore: (State.activeThresholds && State.activeThresholds.scoreThreshold) || 65 }
   };
 }
 // the coin: its radar row, the momentum report's reading of it and its funding rate
@@ -1538,8 +1555,7 @@ async function evaluateShortEntries(maxBagsLimit) {
       const change24h = Number(coin.change24h || 0), rangePct = Number(coin.intradayRangePct || 0);
       if (change24h > -0.20 && rangePct < 3.0) continue;
       if (Number(coin.pricePositionInRange ?? 0.3) > 0.50) continue;
-      const mg = momentumCheck(pairKey, 'SHORT');   // v6.33/v6.34: the hourly momentum report must call it bearish (any score)
-      if (!mg.ok) { candidateCooldownMemo.set(pairKey, now + 300000); continue; }
+      // v6.53 (the user's rule): shorts no longer need the Gemini momentum report
       if (candleMode().side !== 'SHORT' && !(await coinTrendAgrees(pairKey, 'SHORT'))) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }   // v6.42: candlestick mode
 
       let flow = await checkShortOrderFlow(pairKey);
@@ -1584,12 +1600,12 @@ async function evaluateShortEntries(maxBagsLimit) {
         if (State.bullFade.on) { candidateCooldownMemo.set(pairKey, now + 60000); continue; }   // v6.44: no new longs while BULL fades
         const ask = book.bestAsk, tPct = Strategy.BREAKDOWN_LONG.targetPct;
         const lsig = await buildEntrySignal(pairKey, ask, 'HIGH_VOL_BREAKDOWN LONG', mom);
-        const lplan = Strategy.planCompoundEntry(lsig, ask, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey)));
+        const lplan = Strategy.planCompoundEntry(lsig, ask, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey, 'SHORT')));
         if (!lplan.ok) { candidateCooldownMemo.set(pairKey, now + 30000); logOperation('CASH_GUARD', `${pairKey} breakdown long: ${lplan.reason}`, 'warning'); continue; }
         const minNL = perpetuals.get(pairKey)?.minNotional || 5;
         if (lplan.notional < minNL) { candidateCooldownMemo.set(pairKey, now + 300000); logOperation('CASH_GUARD', `${pairKey} breakdown long: Binance minimum for this contract is $${minNL}, position would be $${lplan.notional.toFixed(2)}.`, 'info'); continue; }
         logOperation('BOOK_CLEAR', `${pairKey} high vol breakdown (${bdText(mom, flow)}) bought instead of shorted (test): long at the ask $${formatPrecisePrice(ask)}, closes only at +${tPct.toFixed(2)}% ($${formatPrecisePrice(ask * (1 + tPct / 100))}). Entering...`, 'success');
-        const jcb = { coin, flow, momentum: mom, trend, candle, book, momentumReport: mg.entry || null, late: late || null, path: 'BREAKDOWN', minScore, change24h, rangePct };   // v6.47
+        const jcb = { coin, flow, momentum: mom, trend, candle, book, momentumReport: null, late: late || null, path: 'BREAKDOWN', minScore, change24h, rangePct };   // v6.47
         if (openLong(pairKey, lsig, lplan, flow.takerBuyRatio, { targetOnlyPct: tPct, entrySource: 'BREAKDOWN_LONG', breakdown: bd, journal: jcb })) {
           State.breakdownLongs.opened++;
           State.breakdownLongs.last = `${pairKey} long @ $${formatPrecisePrice(ask)}, ${new Date().toISOString().slice(11, 16)} UTC`;
@@ -1609,15 +1625,85 @@ async function evaluateShortEntries(maxBagsLimit) {
       }
       const stopPct = Math.min(cfg.maxStopPct, Math.max(structPct, (atr || 0) * cfg.atrStopMult, cfg.minStopPct));
       const signal = { ok: true, pattern: label, refPrice: px, stopPrice: px * (1 - stopPct / 100), stopPct, atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: mom.rvol };
-      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey)));
+      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey, 'SHORT')));
       if (!plan.ok) { veto(pairKey, 30000, 'CASH_GUARD', plan.reason); continue; }
       const minN = perpetuals.get(pairKey)?.minNotional || 5;
       if (plan.notional < minN) { veto(pairKey, 300000, 'CASH_GUARD', `Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
       logOperation('BOOK_CLEAR', `${pairKey} short confirmed [${label}]${bd ? ` (${bdText(mom, flow)})` : ''}: bid share ${Math.round(book.obi * 100)}%, spread ${book.spreadPct.toFixed(2)}%, taker buy ${flow.takerBuyRatio}%. Entering...`, 'success');
-      const jcs = { coin, flow, momentum: mom, trend, candle, book, momentumReport: mg.entry || null, late: late || null,   // v6.47
+      const jcs = { coin, flow, momentum: mom, trend, candle, book, momentumReport: null, late: late || null,   // v6.47
         path: candle.isShortEntry ? 'PATTERN' : 'BREAKDOWN', minScore, change24h, rangePct, atrPct: Number.isFinite(atr) ? atr : null, structStopPct: structPct };
-      if (openShort(pairKey, signal, plan, flow.takerBuyRatio, { ...(bd ? { breakdown: bd } : {}), journal: jcs })) tagMomentum(pairKey, mg);
+      openShort(pairKey, signal, plan, flow.takerBuyRatio, { ...(bd ? { breakdown: bd } : {}), journal: jcs });
     }
+  } finally {
+    isEvaluatingEntries = false;
+  }
+}
+
+// v6.53 (the user's PDF): THE SHORT SCREENER'S ENTRIES. Stage 1 runs with the radar each minute (State.pdfShortlist). Here, within
+// 5 minutes of each 15m close, every shortlisted coin is read once (its 1h and 15m futures candles) for the three setups
+// (Strategy.pdfShortSetup). The BTC gate is the PDF's; the book check, sizing, leverage and exits are the app's.
+const pdfSeen = new Map();   // coin -> the 15m close it was last read at
+function syncPdfStatus(extra = {}) {
+  const prev = State.subsystems.pdfShorts || {};
+  State.subsystems.pdfShorts = { ...prev, ...extra, on: State.pdfShortsOn,
+    list: (State.pdfShortlist || []).map((x) => ({ c: x.symbol.replace(/USDT$/, ''), ch: x.change24h, f: x.fundingRate, why: x.why })),
+    rules: { volM: Strategy.PDF_SHORT.minVolumeUSD / 1e6, pump: Strategy.PDF_SHORT.pumpPct, dump: Strategy.PDF_SHORT.dumpPct, max: Strategy.PDF_SHORT.maxList } };
+}
+async function evaluatePdfShorts(maxBagsLimit) {
+  if (!State.pdfShortsOn || !(State.pdfShortlist || []).length) return;
+  const now = Date.now(), bar = Strategy.PATTERN_ENTRY.barMs, lastClose = Math.floor(now / bar) * bar;
+  if (now - lastClose > Strategy.PATTERN_ENTRY.windowMin * 60000) return;   // the trigger is the 15m candle that just closed
+  if (State.pdfShortlist.every((x) => pdfSeen.get(x.symbol) === lastClose)) return;
+  isEvaluatingEntries = true;
+  try {
+    const btc = await getCachedKlines('BTCUSDT', '1h', 200, 3500, 120000, true).catch(() => null);
+    const btcUp = Array.isArray(btc) ? Strategy.btcAboveEma50(Strategy.closedOnly(btc)) : true;   // no BTC candles: no new PDF shorts
+    if (btcUp) {
+      State.pdfShortlist.forEach((x) => pdfSeen.set(x.symbol, lastClose));
+      syncPdfStatus({ gate: Array.isArray(btc) ? 'BTC is above its 1h EMA50' : 'BTC candles unavailable' });
+      throttledNotice('pdf-btc', 'PDF_SHORT', `PDF short screener: ${State.pdfShortlist.length} on the shortlist, but ${Array.isArray(btc) ? 'BTC is above its 1h EMA50' : 'BTC candles are unavailable'}, so no new PDF shorts.`, 'info', 900000);
+      return;
+    }
+    const reads = [];
+    for (const x of State.pdfShortlist) {
+      if (Object.keys(State.recoveryBags || {}).length >= maxBagsLimit) break;
+      const pairKey = x.symbol, base = pairKey.replace(/USDT$/, '');
+      if (pdfSeen.get(pairKey) === lastClose) continue;
+      pdfSeen.set(pairKey, lastClose);
+      if (pdfSeen.size > 800) pdfSeen.delete(pdfSeen.keys().next().value);
+      if (State.activePositions[pairKey] || State.recoveryBags[pairKey]) continue;
+      if (State.cooldowns[base] && State.cooldowns[base].until > now) continue;
+      if (fapiBusy()) break;
+      const [k1, k15] = await Promise.all([getCachedKlines(pairKey, '1h', 200, 3500, 120000, true).catch(() => null), getCachedKlines(pairKey, '15m', 100, 3500, 0, true).catch(() => null)]);
+      if (!Array.isArray(k1) || !Array.isArray(k15)) { reads.push(`${base} candles unavailable`); continue; }
+      const k15c = Strategy.closedOnly(k15);
+      if (!k15c.length || Number(k15c[k15c.length - 1][0]) + bar !== lastClose) { reads.push(`${base} candle not closed yet`); pdfSeen.delete(pairKey); continue; }
+      const setup = Strategy.pdfShortSetup({ k1h: Strategy.closedOnly(k1), k15: k15c, fundingRate: x.fundingRate });
+      reads.push(`${base} ${x.change24h >= 0 ? '+' : ''}${x.change24h}%: ${setup.reason}`);
+      if (!setup.ok) continue;
+      const book = await fetchRealOrderBookDepth(pairKey, true);
+      if (!book) { logOperation('PDF_SHORT', `${pairKey} PDF short (${setup.reason}): futures order book unavailable.`, 'warning'); continue; }
+      if (book.obi > 0.55 || book.spreadPct > 0.20) { logOperation('PDF_SHORT', `${pairKey} PDF short (${setup.reason}) skipped: bid share ${Math.round(book.obi * 100)}% (req <= 55%) or spread ${book.spreadPct.toFixed(2)}%.`, 'info'); continue; }
+      const px = book.bestBid, cfg = Strategy.CONFIG;
+      const atr = Strategy.atrPct(Strategy.toBars(k15c.slice(-16)), 14);
+      const structPct = Number(setup.patternHigh) > px ? ((Number(setup.patternHigh) - px) / px) * 100 + cfg.stopBufferPct : cfg.minStopPct;
+      const stopPct = Math.min(cfg.maxStopPct, Math.max(structPct, (atr || 0) * cfg.atrStopMult, cfg.minStopPct));
+      const signal = { ok: true, pattern: `PDF ${setup.type}: ${setup.pattern}`, refPrice: px, stopPrice: px * (1 - stopPct / 100), stopPct,
+        atrPct: Number.isFinite(atr) ? atr : stopPct / cfg.atrStopMult, rvol: 1 };
+      const plan = Strategy.planCompoundEntry(signal, px, computeEquity(), Number(State.portfolio.cashUSDT), sizeConfig(await leverageFor(pairKey, 'SHORT')));
+      if (!plan.ok) { logOperation('CASH_GUARD', `${pairKey} PDF short: ${plan.reason}`, 'warning'); continue; }
+      const minN = perpetuals.get(pairKey)?.minNotional || 5;
+      if (plan.notional < minN) { logOperation('CASH_GUARD', `${pairKey} PDF short: Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
+      const flow = await checkShortOrderFlow(pairKey).catch(() => ({}));
+      const mark = { type: setup.type, label: setup.label, pattern: setup.pattern, change24h: x.change24h, funding: x.fundingRate, gapPct: setup.gapPct, rsi: setup.rsi, why: x.why };
+      const fund = Number.isFinite(Number(x.fundingRate)) ? `${(Number(x.fundingRate) * 100).toFixed(3)}%` : 'unknown';
+      logOperation('BOOK_CLEAR', `${pairKey} PDF short [${setup.label}: ${setup.pattern}]: 24h ${x.change24h >= 0 ? '+' : ''}${x.change24h}%, ${setup.gapPct >= 0 ? '+' : ''}${setup.gapPct}% vs the 1h EMA20, RSI ${setup.rsi}, funding ${fund}. Entering...`, 'success');
+      if (openShort(pairKey, signal, plan, Number.isFinite(Number(flow.takerBuyRatio)) ? flow.takerBuyRatio : '--', { pdfShort: mark, entrySource: 'PDF_SHORT', journal: { path: 'PDF', pdf: mark, setup, book, flow, shortlist: x } })) {
+        syncPdfStatus({ opened: (Number((State.subsystems.pdfShorts || {}).opened) || 0) + 1, last: `${base} ${setup.label} (${setup.pattern}), ${new Date().toISOString().slice(11, 16)} UTC` });
+      }
+    }
+    if (reads.length) syncPdfStatus({ gate: '', lastRead: `${new Date(lastClose).toISOString().slice(11, 16)} UTC: ${reads.join('; ')}` });
+    if (reads.length) logOperation('PDF_SHORT', `PDF short screener, ${new Date(lastClose).toISOString().slice(11, 16)} UTC candle: ${reads.join('; ')}.`, 'info');
   } finally {
     isEvaluatingEntries = false;
   }
@@ -1645,12 +1731,7 @@ async function evaluateAutopilotEntries() {
   if (!State.autopilotEnabled || isEvaluatingEntries || tradingPaused()) return;
   if (State.entryStrategy === 'FIB') return;   // v6.23: the Fibonacci autopilot opens the trades (fibTick)
   if (modeSettleNotice()) return;   // v6.51: an hour after a mode change
-  if (State.momentumOn && !momentumFresh()) {   // v6.33
-    const st = MomentumReport.status();
-    throttledNotice('momentum', 'MOMENTUM', st.on ? `No new trades: waiting for the hourly momentum report${st.lastError ? ` (last try: ${st.lastError})` : ''}. Open positions and bags are still managed.`
-      : 'No new trades: the momentum report is on but the server has no Gemini key (GEMINI_MOMENTUM_KEY). Turn it off in Settings, or add the key on Render.', 'warning', 300000);
-    return;
-  }
+  const momentumStale = State.momentumOn && !momentumFresh();   // v6.33; v6.53: only new longs wait for the report
 
   const activeBagsCount = Object.keys(State.recoveryBags || {}).length;
   const maxBagsLimit = State.tradeFrequencyController?.maxRecoveryBagsLimit || 5;
@@ -1691,8 +1772,14 @@ async function evaluateAutopilotEntries() {
     throttledNotice('weight', 'AUTOPILOT', `New-trade checks paused: ${busy}. Open positions and bags are still managed.`, 'warning', 60000);
     return;
   }
-  if (side !== 'LONG') await evaluateShortEntries(maxBagsLimit);
+  if (side !== 'LONG') { await evaluateShortEntries(maxBagsLimit); await evaluatePdfShorts(maxBagsLimit); }   // v6.53: + the PDF short screener
   if (side === 'SHORT') return;
+  if (momentumStale) {
+    const st = MomentumReport.status();
+    throttledNotice('momentum', 'MOMENTUM', st.on ? `No new longs: waiting for the hourly momentum report${st.lastError ? ` (last try: ${st.lastError})` : ''}. Shorts don't need it. Open positions and bags are still managed.`
+      : 'No new longs: the momentum report is on but the server has no Gemini key (GEMINI_MOMENTUM_KEY). Turn it off in Settings, or add the key on Render.', 'warning', 300000);
+    return;
+  }
 
   if (learningEngine.recalculateDynamicHurdles) learningEngine.recalculateDynamicHurdles(activeBagsCount, State.tradeLogs.length);
 
@@ -1936,7 +2023,8 @@ function demoteToBag(k, pos, price, reason) {
     entrySource: pos.entrySource, leverage: pos.leverage, leverageAtEntry: pos.leverageAtEntry, marginUSDT: pos.marginUSDT,
     ...(pos.momentum ? { momentum: pos.momentum } : {}),   // v6.33
     ...(pos.ignition ? { ignition: pos.ignition } : {}), ...(pos.repeat20 ? { repeat20: true } : {}),   // v6.45 (and v6.43's mark)
-    ...(pos.breakdown ? { breakdown: pos.breakdown } : {})   // v6.52
+    ...(pos.breakdown ? { breakdown: pos.breakdown } : {}),   // v6.52
+    ...(pos.pdfShort ? { pdfShort: pos.pdfShort } : {})   // v6.53
   };
   // v6.12: your take profit stays with the trade when it becomes a bag (in place of the bag's +0.30%)
   const mine = Number(pos.userTpPct) > 0;
@@ -3952,8 +4040,8 @@ setInterval(() => {
 }, 20000);
 // v6.33: the hourly momentum report (hh:02 UTC; a failed one is tried again 5 minutes later)
 syncMomentumStatus();
-setInterval(() => {
-  if (tradingPaused() || !State.momentumOn) return;
+setInterval(() => {   // v6.53: only while a long can open (longsPossible)
+  if (tradingPaused() || !State.momentumOn || !longsPossible()) return;
   MomentumReport.tick(momentumRows).then((ok) => { syncMomentumStatus(); if (ok) { saveDiskState(); broadcastStateUpdate(); } }).catch((e) => console.error('[Momentum]', e.message));
 }, 30000);
 // v6.42: the BTC 2h prediction, 10 s after each 5m close (a failed one is tried again a minute later), or early when BTC moves
