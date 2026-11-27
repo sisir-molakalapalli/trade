@@ -68,6 +68,15 @@ try {
 // Strategy core (pure functions, shared with backtest.js)
 const Strategy = require('./strategy');
 const Fib = require('./fib');   // v6.23: Fibonacci retracement autopilot (Settings > Entry strategy)
+// v6.47: the trade journal (journal.js): every trade with every number the engine had, for analysis later. Records go to
+// the sheet's TradeJournal tab (ledger script v3); the last 1,000 stay here too (/api/journal, /api/journal.csv).
+const JournalMod = require('./journal');
+const Journal = JournalMod.create({
+  file: path.join(__dirname, 'trade_journal.json'),
+  post: journalPost, ledgerUrl: () => State.masterLedgerUrl, canSend: () => Handover.ready && !Handover.frozen,
+  context: () => journalContext(), coin: (k, pos) => journalCoin(k, pos), feeRate: Strategy.FUTURES.feePct / 100,
+  log: (msg, lvl) => logOperation('JOURNAL', msg, lvl)
+});
 // v6.31: the characters' comments, written by Google Gemini on the server. The key is GEMINI_API_KEY in Render's
 // environment and never leaves this server; without it the app uses the characters' built-in lines.
 const Commentary = require('./commentary').create({
@@ -135,9 +144,11 @@ const State = {
   // Settings > Back-to-back trades at 20x (v6.43, paper test): on = the candlestick autopilot opens a coin whose trade is the
   // latest row of the ledger at 20x. REPEAT_LEV=off starts it off.
   repeatLev: !['off', '0', 'false'].includes(String(process.env.REPEAT_LEV || '').toLowerCase()),
-  // v6.44: BULL fading (Strategy.BULL_FADE): on = live breadth fell under 60% while the candlestick mode was BULL. No new longs
-  // and long trades / bags close at -1.20% or better until that mode leaves BULL. live / liveAt: the latest live reading.
-  bullFade: { on: false, at: 0, breadth: null, live: null, liveAt: 0, closed: 0, netUSDT: 0, endedAt: 0, endMode: null },
+  // v6.44 / v6.48: BULL fading (Strategy.BULL_FADE): on = a reading under 60% of coins above their 1h EMA50, or BTC going below
+  // its own, while the candlestick mode was BULL. Every long trade and bag open then closes at market (sweepAt), and no new longs
+  // until that mode leaves BULL. live / liveGap / liveAt: the latest live readings; lastMode / seenBtc*: what the last step saw.
+  bullFade: { on: false, at: 0, why: '', breadth: null, btcGap: null, live: null, liveGap: null, liveAt: 0, closed: 0, netUSDT: 0, endedAt: 0, endMode: null,
+    sweepAt: 0, lastMode: null, seenBtcGap: null, seenBtcHourGap: null },
   // v6.45 (paper test): the long ignition reads the volume RATE (Strategy.IGNITION). IGNITION_RATE=off goes back to the old rule.
   ignitionRate: !['off', '0', 'false'].includes(String(process.env.IGNITION_RATE || '').toLowerCase()),
   // Settings > BTC 2h prediction (v6.42): on = the in-app prediction steers candlestick trades. BTC_PREDICT=off starts it off.
@@ -157,6 +168,7 @@ const State = {
   activePositions: {},
   recoveryBags: {},
   ledgerSync: { okAt: 0, triedAt: 0, rows: 0, note: 'not read yet' },   // v6.11: last read of the Google Sheet ledger
+  ledgerRemoved: [],   // v6.49: keys (Strategy.ledgerKey) of trades taken out because you deleted them in the sheet (newest first, 500)
   lastTrendMode: null,   // v6.17: the last BULL / BEAR market mode (for "neutral after bullish: shorts only")
   // v6.23: Settings > Entry strategy: 'CANDLE' (the candlestick model) or 'FIB' (the Fibonacci retracement autopilot)
   entryStrategy: String(process.env.ENTRY_STRATEGY || '').toUpperCase() === 'FIB' ? 'FIB' : 'CANDLE',
@@ -181,7 +193,7 @@ const State = {
     screener: { status: 'ACTIVE', scannedPairsCount: 0, qualifiedCandidatesCount: 0, cadenceSec: 60, liquidityFloorUSD: '$10M+ futures volume', source: 'USD-M futures' },
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
-    bullFade: { on: false, live: null, liveAt: 0, limitPct: 60, closePct: -1.20 },   // v6.44
+    bullFade: { on: false, live: null, liveGap: null, liveAt: 0, limitPct: 60, sweepAt: 0, closing: 0 },   // v6.44 / v6.48
     ignition: { rate: true, rateX: 2, movePct: 0.8, taker: 52, rvol: 1.35 },   // v6.45, set at start
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
     leverage: { on: false, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct },
@@ -409,7 +421,8 @@ async function refreshMarketMode(tickers) {
     logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${sideText(r)} Open positions keep their exits.`, 'warning');
   }
   syncPredictStatus();   // v6.42: the candlestick mode follows the app's mode unless a fresh BTC 2h prediction changes it
-  syncBullFade(Strategy.liveBreadth(coins.filter(Boolean)));   // v6.44: the same coins, with the hour still open
+  // v6.44 / v6.48: the same coins and BTC, with the hour still open
+  syncBullFade({ live: Strategy.liveBreadth(coins.filter(Boolean)), btcGap: Strategy.liveBtcGap(btc) });
   return r;
 }
 
@@ -477,12 +490,16 @@ async function refreshPerpetuals() {
 const quoteMemo = new Map();
 async function executableExitPrice(k, pos) {
   const short = isShort(pos), fut = isFutures(pos);
+  // v6.49: the streamed best bid / ask, the one the app shows as the close price (no REST round trip while it is fresh)
+  const live = fut ? freshQuote(k) : null;
+  if (live) return short ? live.ask : live.bid;
   const hit = quoteMemo.get(k);
   let q = hit && Date.now() - hit.at < 250 ? hit.q : null;
   if (!q) {
     const url = fut ? `${FAPI_BASE}/fapi/v1/ticker/bookTicker?symbol=${k}` : `https://api.binance.com/api/v3/ticker/bookTicker?symbol=${k}`;
     q = await safeFetch(url, 1500).catch(() => null);
     if (q) quoteMemo.set(k, { at: Date.now(), q });
+    if (q && fut) noteQuote(k, q.bidPrice, q.askPrice);
   }
   const px = parseFloat(q && (short ? q.askPrice : q.bidPrice));
   return px > 0 ? px : null;
@@ -836,6 +853,8 @@ function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
   // Breakdown long (test): closes only at its fixed target, never by harvest, trail, scratch or partial.
   const target = opts.targetOnlyPct ? entry * (1 + opts.targetOnlyPct / 100) : 0;
   if (target) Object.assign(State.activePositions[pairKey], { targetOnlyPct: opts.targetOnlyPct, entrySource: opts.entrySource, ratchetStage: 'TARGET_ONLY', breakevenPrice: target, tp1Price: target, targetPrice: target });
+  // v6.47: the journal keeps what the engine saw at the entry
+  Journal.open('position', pairKey, State.activePositions[pairKey], { strategy: opts.entrySource || 'CANDLE', checks: { ...(opts.journal || {}), takerBuyRatio, ignition: opts.ignition || null }, signal, plan });
   logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''})${State.activePositions[pairKey].repeat20 ? ' • back to back on this coin: 20x' : ''} via [${signal.pattern}]${opts.ignition ? ` (${opts.ignition.rate ? `volume ${opts.ignition.volRate}x the normal rate at minute ${opts.ignition.minute}, test` : `volume ${opts.ignition.rvol}x`})` : ''} • ${target ? `Closes only at +${opts.targetOnlyPct.toFixed(2)}% ($${formatPrecisePrice(target)})` : 'Min exit +0.20%'} • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
@@ -843,7 +862,7 @@ function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
   return true;
 }
 
-function openShort(pairKey, signal, plan, takerBuyRatio) {
+function openShort(pairKey, signal, plan, takerBuyRatio, opts = {}) {
   if (tradingPaused()) return false;
   const sym = pairKey.replace(/USDT$/, '');
   const entry = plan.entryPrice;
@@ -866,6 +885,7 @@ function openShort(pairKey, signal, plan, takerBuyRatio) {
     peakGainPct: 0, peakLowPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern,
     ...(repeatTrade(pairKey, lev) ? { repeat20: true } : {})   // v6.43: back to back, 20x
   };
+  Journal.open('position', pairKey, State.activePositions[pairKey], { strategy: 'CANDLE', checks: { ...(opts.journal || {}), takerBuyRatio }, signal, plan });   // v6.47
   logOperation('EXECUTION', `SHORTED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''})${State.activePositions[pairKey].repeat20 ? ' • back to back on this coin: 20x' : ''} via [${signal.pattern}] • Min exit +0.20% • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
@@ -888,8 +908,8 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
   const short = isShort(pos);
   const bagCut = bookName === 'recoveryBags' && /^BAG (CUT|BREAKEVEN) /.test(typeLabel);
   const fibExit = bookName === 'activePositions' && Boolean(pos.fib) && /^FIB /.test(typeLabel);   // v6.23: its own stop-loss
-  // v6.44: your BULL-fading rule closes longs at -1.20% from entry or better, only while it is on (never a 20x trade: bullFadeExit)
-  const fadeExit = typeLabel === 'BULL FADE' && !short && Boolean(State.bullFade && State.bullFade.on) && Strategy.bullFadeExit(pos, price);
+  // v6.48: your BULL-fading rule closes at market every long trade and bag that was open when it fired (bullFadeCloses)
+  const fadeExit = typeLabel === 'BULL FADE' && !short && Strategy.bullFadeCloses(pos, State.bullFade);
   if (!/MANUAL|LIQUIDATED/.test(typeLabel) && !bagCut && !fibExit && !fadeExit && (short ? price > entry : price < entry)) {
     logOperation('SENTRY', `${pos.pair}: blocked ${typeLabel} below entry. Position stays open.`, 'warning');
     return null;
@@ -947,6 +967,8 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
     reason: `${reasonText}${levAtEntry > 1 ? ` • ${levAtEntry}x leverage${pos.repeat20 ? ' (back to back)' : ''}` : ''}${pos.momentum ? ` • momentum ${pos.momentum.d} ${pos.momentum.s}` : ''}${pos.ignition ? ` • ignition${pos.ignition.rate ? ` test (volume rate ${pos.ignition.volRate}x at minute ${pos.ignition.minute})` : ''}` : ''}`
   };
 
+  // v6.47: the journal record of this close, with all of the trade's data
+  Journal.close(bookName === 'recoveryBags' ? 'bag' : 'position', key, pos, { trade: tradePayload, exitType: tradePayload.type, exitPrice: price, qtyClosed: qtySold, marginClosed: marginPart, fraction: part, fullyClosed });
   logOperation(pnl >= 0 ? 'SENTRY_EXIT' : 'RISK_STOP',
     `${tradePayload.type} on ${tradePayload.pair} @ $${formatPrecisePrice(price)} (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%) • ` +
     `Net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} after fees${fullyClosed ? '' : ' • runner continues'}`,
@@ -1329,33 +1351,46 @@ function syncMomentumStatus() { State.subsystems.momentum = { ...MomentumReport.
 // ---------- v6.42: the BTC 2-hour prediction (btcpredict.js). Candlestick path only: the Fibonacci path, open positions, bags,
 // the characters' market view and everything else keep the app's own market mode (State.subsystems.marketMode).
 function candleMode() { return BtcPredict.applyToMode(State.subsystems.marketMode, State.predictOn ? BtcPred.prediction() : null); }
-// v6.44: BULL fading (Strategy.BULL_FADE). live: a new live breadth reading (refreshMarketMode, every minute); without one the
-// last reading counts while it is under 5 minutes old. Until the market mode has been read properly the latch is left as it is
-// (a restart keeps it on), so missing data never ends it.
-function syncBullFade(live) {
+// v6.44 / v6.48: BULL fading (Strategy.BULL_FADE). read: new live readings (refreshMarketMode, every minute: breadth and BTC
+// against its 1h EMA50, the hour still open); without them the last ones count while under 5 minutes old. The hourly readings
+// come from the app's market mode. Until the market mode has been read properly the latch is left as it is (a restart keeps
+// it on), so missing data never ends it.
+const fadeTargets = () => [...Object.values(State.activePositions), ...Object.values(State.recoveryBags)].filter((p) => Strategy.bullFadeCloses(p, State.bullFade)).length;
+function syncBullFade(read) {
   const now = Date.now(), R = Strategy.BULL_FADE;
-  if (live !== undefined) Object.assign(State.bullFade, { live, liveAt: now });
+  if (read && typeof read === 'object') Object.assign(State.bullFade, { live: read.live ?? null, liveGap: read.btcGap ?? null, liveAt: now });
   const fresh = State.bullFade.liveAt > 0 && now - State.bullFade.liveAt < R.liveMaxAgeMs;
   const own = State.subsystems.marketMode || {};
   const mode = candleMode();
   let event = null;
   if (own.updatedAt > 0 && own.seen >= Strategy.MODE_RULES.minCoins) {
-    const step = Strategy.bullFadeStep(State.bullFade, { mode: mode.mode, breadth: fresh ? State.bullFade.live : null, now });
+    const hourGap = Number(own.ema50) > 0 && Number(own.btcClose) > 0 ? (Number(own.btcClose) / Number(own.ema50) - 1) * 100 : null;
+    const step = Strategy.bullFadeStep(State.bullFade, { mode: mode.mode, breadth: fresh ? State.bullFade.live : null, hourly: own.breadth,
+      btcGap: fresh ? State.bullFade.liveGap : null, btcHourGap: hourGap, now });
     State.bullFade = step.state; event = step.event;
   }
-  const bf = State.bullFade;
+  const bf = State.bullFade, closing = bf.sweepAt > 0 ? fadeTargets() : 0;
+  // every long it closes is gone: say how it went, and later longs are left alone
+  if (bf.sweepAt > 0 && !closing) {
+    bf.sweepAt = 0;
+    const n = bf.closed || 0, net = bf.netUSDT || 0;
+    if (n) logOperation('MARKET_MODE', `Bull fading: done, ${n} long trade${n === 1 ? '' : 's'} and bag${n === 1 ? '' : 's'} closed at market, net ${net >= 0 ? '+' : '-'}$${Math.abs(net).toFixed(2)}.`, 'info');
+    if (!event) saveDiskState();
+  }
   State.subsystems.bullFade = {
-    on: Boolean(bf.on), at: bf.at || 0, breadth: bf.breadth, live: fresh ? bf.live : null, liveAt: bf.liveAt || 0, mode: mode.mode,
-    limitPct: R.breadth * 100, closePct: R.closePct, closed: bf.closed || 0, netUSDT: Number((bf.netUSDT || 0).toFixed(4)),
-    endedAt: bf.endedAt || 0, endMode: bf.endMode || null
+    on: Boolean(bf.on), at: bf.at || 0, why: bf.why || '', breadth: bf.breadth ?? null, btcGap: bf.btcGap ?? null, live: fresh ? bf.live : null, liveGap: fresh ? bf.liveGap : null,
+    liveAt: bf.liveAt || 0, mode: mode.mode, limitPct: R.breadth * 100, closed: bf.closed || 0, netUSDT: Number((bf.netUSDT || 0).toFixed(4)),
+    endedAt: bf.endedAt || 0, endMode: bf.endMode || null, sweepAt: bf.sweepAt || 0, closing
   };
-  const pct = (x) => `${Math.round(Number(x) * 100)}%`;
+  const all = closing ? `Every long trade and long bag open now (${closing}) closes at market, whatever its price, 20x ones too; shorts keep their exits.` : 'No long trade or bag was open.';
   if (event === 'fired') {
-    logOperation('MARKET_MODE', `Bull fading: only ${pct(bf.breadth)} of coins are above their 1h EMA50 on the live price (under ${pct(R.breadth)}). No new longs until the market leaves BULL. Long trades and bags close at ${R.closePct.toFixed(2)}% from entry or better; shorts and 20x trades keep their exits.`, 'warning');
+    logOperation('MARKET_MODE', `Bull fading: ${bf.why}. ${all} No new longs until the market leaves BULL.`, 'warning');
+    saveDiskState(); broadcastStateUpdate(); setImmediate(kickSentry);
+  } else if (event === 'swept') {
+    logOperation('MARKET_MODE', `Bullish market ended: ${bf.why}. ${all} New trades follow the usual rules.`, 'warning');
     saveDiskState(); broadcastStateUpdate(); setImmediate(kickSentry);
   } else if (event === 'released') {
-    const n = bf.closed || 0, net = bf.netUSDT || 0;
-    logOperation('MARKET_MODE', `Bull fading is over: the market is ${bf.endMode} now, so new trades follow the usual rules again.${n ? ` ${n} long${n === 1 ? '' : 's'} closed while it lasted, net ${net >= 0 ? '+' : '-'}$${Math.abs(net).toFixed(2)}.` : ''} Long bags left go back to their usual close.`, 'info');
+    logOperation('MARKET_MODE', `Bull fading is over: the market is ${bf.endMode} now, so new trades follow the usual rules again.`, 'info');
     saveDiskState(); broadcastStateUpdate();
   }
   return bf;
@@ -1397,6 +1432,52 @@ function syncPredictStatus() {
   predictEffectKey = k;
   return changed;
 }
+
+// -------------------------------------------------------------
+// v6.47 TRADE JOURNAL: what goes with every record (numbers and names only: no addresses, keys or ids of yours)
+// -------------------------------------------------------------
+function journalContext() {
+  const now = Date.now(), r = MomentumReport.report(), p = State.portfolio || {};
+  const tally = (d) => (r && r.coins ? Object.values(r.coins).filter((x) => x && x.d === d).length : null);
+  const all = [...Object.values(State.activePositions || {}), ...Object.values(State.recoveryBags || {})];
+  let cm = null;
+  try { cm = candleMode(); } catch (e) {}
+  return {
+    time: { utcHour: new Date(now).getUTCHours(), utcWeekday: new Date(now).getUTCDay(),
+      istHour: Number(new Date(now).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', hour12: false })) },
+    market: { mode: State.subsystems.marketMode, candleMode: cm, lastTrendMode: State.lastTrendMode || null, regime: State.marketRegime || null,
+      bullFade: State.bullFade, btcPrediction: State.predictOn ? BtcPred.prediction() : null },
+    momentumReport: r ? { at: new Date(r.at).toISOString(), ageMin: Math.round((now - r.at) / 60000), model: r.model, bias: r.market && r.market.bias,
+      news: r.market && r.market.news, bull: tally('bull'), bear: tally('bear'), flat: tally('flat'), coins: Object.keys(r.coins || {}).length } : null,
+    account: { cashUSDT: Number(p.cashUSDT), equityUSDT: Number(computeEquity().toFixed(4)), realizedPnL: Number(p.realizedPnL || 0),
+      openTrades: Object.keys(State.activePositions || {}).length, bags: Object.keys(State.recoveryBags || {}).length,
+      longs: all.filter((x) => !isShort(x)).length, shorts: all.filter((x) => isShort(x)).length },
+    settings: { autopilot: State.autopilotEnabled, sideMode: State.sideMode, bothSides: State.bothSides, entryStrategy: State.entryStrategy,
+      positionPct: State.positionPct, leverageAuto: State.leverageAuto, repeatLev: State.repeatLev, momentumOn: State.momentumOn, predictOn: State.predictOn,
+      ignitionRate: State.ignitionRate, breakdownSide: State.breakdownSide, minScore: (State.activeThresholds && State.activeThresholds.scoreThreshold) || 65 }
+  };
+}
+// the coin: its radar row, the momentum report's reading of it and its funding rate
+function journalCoin(k, pos) {
+  const sym = pos && pos.manual && pos.symbol ? pos.symbol : String(k || ''), base = sym.replace(/USDT$/, ''), r = MomentumReport.report();
+  const m = r && r.coins ? r.coins[base] : null;
+  const fr = currentFundingRate(sym);
+  return { symbol: sym, radar: (State.universe && State.universe[sym]) || null, momentum: m ? { ...m, reportAgeMin: Math.round((Date.now() - r.at) / 60000) } : null,
+    fundingRate: fr === undefined ? null : fr };
+}
+// the sheet's reply is read (Apps Script answers a POST with a redirect to it), so an older script can be told apart
+async function journalPost(url, payload) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), redirect: 'follow', signal: AbortSignal.timeout(30000) });
+  const text = await r.text();
+  try { return JSON.parse(text); } catch (e) { return { success: false, error: `the sheet answered ${r.status} without JSON` }; }
+}
+function sampleJournal() {
+  try {
+    Journal.sample([{ book: 'position', entries: Object.entries(State.activePositions || {}) }, { book: 'bag', entries: Object.entries(State.recoveryBags || {}) },
+      { book: 'manual', entries: Object.entries((State.manual && State.manual.positions) || {}) }]);
+  } catch (e) { console.warn('[Journal] sample:', e.message); }
+}
+function syncJournalStatus() { State.subsystems.journal = Journal.status(); }
 
 async function evaluateShortEntries(maxBagsLimit) {
   if (!perpetuals.size) {
@@ -1471,7 +1552,8 @@ async function evaluateShortEntries(maxBagsLimit) {
         const minNL = perpetuals.get(pairKey)?.minNotional || 5;
         if (lplan.notional < minNL) { candidateCooldownMemo.set(pairKey, now + 300000); logOperation('CASH_GUARD', `${pairKey} breakdown long: Binance minimum for this contract is $${minNL}, position would be $${lplan.notional.toFixed(2)}.`, 'info'); continue; }
         logOperation('BOOK_CLEAR', `${pairKey} high vol breakdown (15m ${mom.change15mPct}%, volume ${mom.rvol}x, taker buy ${flow.takerBuyRatio}%) bought instead of shorted (test): long at the ask $${formatPrecisePrice(ask)}, closes only at +${tPct.toFixed(2)}% ($${formatPrecisePrice(ask * (1 + tPct / 100))}). Entering...`, 'success');
-        if (openLong(pairKey, lsig, lplan, flow.takerBuyRatio, { targetOnlyPct: tPct, entrySource: 'BREAKDOWN_LONG' })) {
+        const jcb = { coin, flow, momentum: mom, trend, candle, book, momentumReport: mg.entry || null, late: late || null, path: 'BREAKDOWN', minScore, change24h, rangePct };   // v6.47
+        if (openLong(pairKey, lsig, lplan, flow.takerBuyRatio, { targetOnlyPct: tPct, entrySource: 'BREAKDOWN_LONG', journal: jcb })) {
           State.breakdownLongs.opened++;
           State.breakdownLongs.last = `${pairKey} long @ $${formatPrecisePrice(ask)}, ${new Date().toISOString().slice(11, 16)} UTC`;
           saveDiskState();
@@ -1495,7 +1577,9 @@ async function evaluateShortEntries(maxBagsLimit) {
       const minN = perpetuals.get(pairKey)?.minNotional || 5;
       if (plan.notional < minN) { veto(pairKey, 300000, 'CASH_GUARD', `Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info'); continue; }
       logOperation('BOOK_CLEAR', `${pairKey} short confirmed [${label}]: bid share ${Math.round(book.obi * 100)}%, spread ${book.spreadPct.toFixed(2)}%, taker buy ${flow.takerBuyRatio}%. Entering...`, 'success');
-      if (openShort(pairKey, signal, plan, flow.takerBuyRatio)) tagMomentum(pairKey, mg);
+      const jcs = { coin, flow, momentum: mom, trend, candle, book, momentumReport: mg.entry || null, late: late || null,   // v6.47
+        path: candle.isShortEntry ? 'PATTERN' : 'BREAKDOWN', minScore, change24h, rangePct, atrPct: Number.isFinite(atr) ? atr : null, structStopPct: structPct };
+      if (openShort(pairKey, signal, plan, flow.takerBuyRatio, { journal: jcs })) tagMomentum(pairKey, mg);
     }
   } finally {
     isEvaluatingEntries = false;
@@ -1556,7 +1640,7 @@ async function evaluateAutopilotEntries() {
   const fading = State.bullFade.on && (side === 'LONG' || side === 'BOTH');   // v6.44: no new longs while BULL fades
   if (fading) side = side === 'LONG' ? 'NONE' : 'SHORT';
   if (side === 'NONE') {
-    throttledNotice('mode', 'MARKET_MODE', fading ? `No new longs: bull fading (${Math.round(Number(State.bullFade.breadth) * 100)}% of coins above their 1h EMA50), until the market leaves BULL.`
+    throttledNotice('mode', 'MARKET_MODE', fading ? `No new longs: bull fading (${State.bullFade.why || `${Math.round(Number(State.bullFade.breadth) * 100)}% of coins above their 1h EMA50`}), until the market leaves BULL.`
       : `No new trades: ${mode.reason}.`, 'info', 120000);
     return;
   }
@@ -1715,7 +1799,10 @@ async function evaluateAutopilotEntries() {
       }
       // v6.45: an ignition long remembers how it fired, so its close (and Settings) can tell the test apart
       const ign = !isConfirmedPatternEntry ? { rate: State.ignitionRate, volRate: microMom.volRate, rvol: microMom.rvol, minute: microMom.candleMinute, move: microMom.change15mPct } : null;
-      if (openLong(pairKey, signal, plan, orderFlow.takerBuyRatio, ign ? { ignition: ign } : {})) tagMomentum(pairKey, mgL);
+      // v6.47: every check's numbers go into the trade journal
+      const jc = { coin, flow: orderFlow, momentum: microMom, trend: trend1h, candle: candleCheck, book, momentumReport: mgL.entry || null, late: lateLong || null,
+        path: isConfirmedPatternEntry ? 'PATTERN' : 'IGNITION', minScore, change24h, rangePct, posInRange, volumeUSD: volQuote };
+      if (openLong(pairKey, signal, plan, orderFlow.takerBuyRatio, { ...(ign ? { ignition: ign } : {}), journal: jc })) tagMomentum(pairKey, mgL);
     }
   } finally {
     isEvaluatingEntries = false;
@@ -1895,22 +1982,20 @@ async function runPredictiveSentry() {
         realizeExit('activePositions', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
         continue;
       }
+      // v6.48: your BULL-fading rule. When it fires, every long trade open then closes at market, whatever its price, before any
+      // other exit: 20x trades and Fibonacci trades too. Shorts keep their usual exits.
+      if (Strategy.bullFadeCloses(pos, State.bullFade)) {
+        const fill = (await executableExitPrice(k, pos)) || price;
+        if (State.activePositions[k] === pos && Strategy.bullFadeCloses(pos, State.bullFade)) {
+          const g = (fill - entry) / entry * 100;
+          const t = realizeExit('activePositions', k, 1, fill, 'BULL FADE', `Bull fading (${State.bullFade.why || 'the market is no longer bullish'}): closed at market, ${g >= 0 ? '+' : ''}${g.toFixed(2)}% @ $${formatPrecisePrice(fill)}`);
+          if (t) { noteBullFadeClose(t); continue; }
+        }
+      }
+      if (pos.fadeClosePrice) delete pos.fadeClosePrice;   // v6.44's close level, no longer used
       // v6.23: a Fibonacci trade is managed only at each closed bar (fibTick): stop-loss, TP1 35% + stop to entry (v6.24), TP2.
       // No minimum exit, trail, harvest, scratch or move to a recovery bag.
       if (pos.fib) continue;
-      // v6.44: while BULL fades a long closes at -1.20% from entry or better, before any other exit. Below that it keeps its
-      // usual rules (it still moves to a recovery bag at -3.50%). A trade opened at 20x keeps its usual exits (your exception).
-      if (State.bullFade.on && Strategy.bullFadePrice(pos)) {
-        pos.fadeClosePrice = Strategy.bullFadePrice(pos);
-        if (Strategy.bullFadeExit(pos, price)) {
-          const fill = (await executableExitPrice(k, pos)) || price;
-          if (State.activePositions[k] === pos && Strategy.bullFadeExit(pos, fill)) {
-            const g = (fill - entry) / entry * 100;
-            const t = realizeExit('activePositions', k, 1, fill, 'BULL FADE', `Bull fading (${Math.round(Number(State.bullFade.breadth) * 100)}% of coins above their 1h EMA50): closed at ${Strategy.BULL_FADE.closePct.toFixed(2)}% or better, ${g >= 0 ? '+' : ''}${g.toFixed(2)}% @ $${formatPrecisePrice(fill)}`);
-            if (t) { noteBullFadeClose(t); continue; }
-          }
-        }
-      } else if (pos.fadeClosePrice) delete pos.fadeClosePrice;
       // v6.12: your take profit replaces the autopilot's exits for this trade; the -3.50% move to a bag stays.
       if (Number(pos.userTpPct) > 0) {
         const r = Strategy.manageUserTp(pos, price);
@@ -1987,20 +2072,15 @@ async function runPredictiveSentry() {
         realizeExit('recoveryBags', k, 1, price, 'LIQUIDATED', `1x margin used up at $${formatPrecisePrice(price)}`);
         continue;
       }
-      // v6.44: while BULL fades a long bag closes at -1.20% from entry or better, instead of its usual close (not a 20x one)
-      if (State.bullFade.on && Strategy.bullFadePrice(bag)) {
-        const lvl = Strategy.bullFadePrice(bag);
-        Object.assign(bag, { fadeClosePrice: lvl, targetExitPriceUSDT: lvl, targetStep: `CLOSES AT ${Strategy.BULL_FADE.closePct.toFixed(2)}% (BULL FADING)` });
-        if (Strategy.bullFadeExit(bag, price)) {
-          const fill = (await executableExitPrice(k, bag)) || price;
-          if (State.recoveryBags[k] === bag && Strategy.bullFadeExit(bag, fill)) {
-            const e = Number(bag.entryPriceUSDT), g = (fill - e) / e * 100;
-            const inBagMin = Math.round((Date.now() - Number(bag.movedAt || bag.openedAt)) / 60000);
-            const t = realizeExit('recoveryBags', k, 1, fill, 'BULL FADE', `Bull fading (${Math.round(Number(State.bullFade.breadth) * 100)}% of coins above their 1h EMA50): recovery bag closed at ${Strategy.BULL_FADE.closePct.toFixed(2)}% or better, ${g >= 0 ? '+' : ''}${g.toFixed(2)}%, ${inBagMin < 120 ? `${inBagMin} min` : `${(inBagMin / 60).toFixed(1)} h`} after it moved to the bag @ $${formatPrecisePrice(fill)}`);
-            if (t) noteBullFadeClose(t);
-          }
+      // v6.48: when your BULL-fading rule fires, every long bag open then closes at market, whatever its price (20x ones too)
+      if (Strategy.bullFadeCloses(bag, State.bullFade)) {
+        const fill = (await executableExitPrice(k, bag)) || price;
+        if (State.recoveryBags[k] === bag && Strategy.bullFadeCloses(bag, State.bullFade)) {
+          const e = Number(bag.entryPriceUSDT), g = (fill - e) / e * 100;
+          const inBagMin = Math.round((Date.now() - Number(bag.movedAt || bag.openedAt)) / 60000);
+          const t = realizeExit('recoveryBags', k, 1, fill, 'BULL FADE', `Bull fading (${State.bullFade.why || 'the market is no longer bullish'}): recovery bag closed at market, ${g >= 0 ? '+' : ''}${g.toFixed(2)}%, ${inBagMin < 120 ? `${inBagMin} min` : `${(inBagMin / 60).toFixed(1)} h`} after it moved to the bag @ $${formatPrecisePrice(fill)}`);
+          if (t) { noteBullFadeClose(t); continue; }
         }
-        continue;
       }
       if (bag.fadeClosePrice) delete bag.fadeClosePrice;
       // v6.12: a bag with your take profit closes there instead of at +0.30%
@@ -2183,6 +2263,7 @@ async function syncTradesFromGoogleSheets() {
 
   try {
     const fullUrl = masterUrl.includes('?') ? `${masterUrl}&action=GET_ALL` : `${masterUrl}?action=GET_ALL`;
+    const readStartedAt = Date.now();   // v6.49: a write the sheet confirmed before this moment is in this answer
     const data = await fetchLedgerJson(fullUrl, 20000);
     let fetchedTrades = [];
     if (data && Array.isArray(data.trades) && data.trades.length > 0) {
@@ -2197,9 +2278,14 @@ async function syncTradesFromGoogleSheets() {
     // v6.16: our ledger script answers { success: true, trades: [...] }. That answer is the trade list, so a row deleted in
     // the sheet leaves the app here (a trade closed in the last hour that the sheet has not shown yet is kept).
     if (data && data.success === true && Array.isArray(data.trades)) {
-      const { trades, removed } = Strategy.ledgerReconcile(fetchedTrades, State.tradeLogs || []);
+      const { trades, removed } = Strategy.ledgerReconcile(fetchedTrades, State.tradeLogs || [], Date.now(), undefined, readStartedAt);
       State.tradeLogs = sanitizeAndAuditTradeHistory(trades);
       State.ledgerSync.removed = removed.length;
+      if (removed.length) {   // v6.49: the app is told, so a removed trade never comes back from its own copy
+        const keys = removed.map(Strategy.ledgerKey);
+        State.ledgerRemoved = [...keys, ...State.ledgerRemoved.filter((k) => !keys.includes(k))].slice(0, 500);
+      }
+      { const back = new Set(State.tradeLogs.map(Strategy.ledgerKey)); State.ledgerRemoved = State.ledgerRemoved.filter((k) => !back.has(k)); }   // a row you put back
       if (removed.length) {
         const names = removed.slice(0, 5).map((t) => `${t.pair} ${t.date || ''}`.trim()).join(', ');
         logOperation('LEDGER', `${removed.length} trade${removed.length === 1 ? '' : 's'} deleted in your sheet ${removed.length === 1 ? 'was' : 'were'} removed from the trade list (${names}${removed.length > 5 ? ', ...' : ''}). Balance and open positions are unchanged.`, 'info');
@@ -2299,6 +2385,13 @@ async function recordTradeToCloudLedger(trade, { announce = true } = {}) {
       console.warn(`[Cloud Ledger GET Fallback Notice]`, err2.message);
     }
   }
+  // v6.49: the sheet answered the write. From the next read that starts after this, a missing row means you deleted it
+  // (Strategy.ledgerReconcile), so it leaves at once instead of after the hour a write may take.
+  if (success && !Strategy.isTestTrade(record)) {
+    const at = Date.now(), t = (State.tradeLogs || []).find((x) => Strategy.sameLedgerTrade(x, record));
+    record.sheetAckAt = at;
+    if (t) t.sheetAckAt = at;   // a sheet read during the write may have replaced the list's copy
+  }
 
   learningEngine.recordTradeOutcome(
     record.pair.replace('/USDT', 'USDT'),
@@ -2394,6 +2487,7 @@ function openFib(o, sig, tf, T) {
       score: sig ? sig.confluence_score : null, rr: sig ? sig.rr_ratio : null, riskUSDT: Number(sp.risk_amount) || 0,
       timeframe: tf, barT: T, positionId: sp.position_id || null, setupId: sig ? sig.setup_id : null }
   };
+  Journal.open('position', k, State.activePositions[k], { strategy: 'FIB', checks: { setup: sp, signal: sig || null, order: o, timeframe: tf, barT: T, regime: fibRegime() } });   // v6.47
   logOperation('EXECUTION', `${side === 'LONG' ? 'LONGED' : 'SHORTED'} ${sym}/USDT @ $${formatPrecisePrice(entry)} (Fibonacci ${sp.fib_level} ${side.toLowerCase()}, ${tf}; $${notional.toFixed(2)} on $${margin.toFixed(2)} margin, ${lev}x, paper) • stop $${formatPrecisePrice(o.stop_loss)} (risk $${(Number(sp.risk_amount) || 0).toFixed(2)}) • TP1 $${formatPrecisePrice(o.take_profit_1)} (35%, then the stop to entry + fees) • TP2 $${formatPrecisePrice(o.take_profit_2)}${sig ? ` • score ${sig.confluence_score}, R:R ${sig.rr_ratio}` : ''}`, 'success');
   return true;
 }
@@ -2511,6 +2605,7 @@ function persistableState(keepTrades = 150, live = false) {
     activePositions: State.activePositions,
     recoveryBags: State.recoveryBags,
     tradeLogs: State.tradeLogs.slice(0, keepTrades),
+    ledgerRemoved: State.ledgerRemoved,   // v6.49
     manual: State.manual,
     positionPct: State.positionPct,
     leverageAuto: State.leverageAuto,
@@ -2531,7 +2626,8 @@ function persistableState(keepTrades = 150, live = false) {
     fibTimeframe: State.fibTimeframe,
     fib: State.fib
   };
-  if (live) Object.assign(data, { autopilotEnabled: State.autopilotEnabled, cooldowns: State.cooldowns, usdtToInrRate: State.usdtToInrRate, marketMode: State.subsystems.marketMode });
+  if (live) Object.assign(data, { autopilotEnabled: State.autopilotEnabled, cooldowns: State.cooldowns, usdtToInrRate: State.usdtToInrRate, marketMode: State.subsystems.marketMode,
+    journal: Journal.toJSON() });   // v6.47: the trade journal goes to the new build (the disk file has its own: trade_journal.json)
   return data;
 }
 
@@ -2548,11 +2644,18 @@ function applyPersistedState(parsed, live = false) {
   if (parsed.activePositions) State.activePositions = parsed.activePositions;
   if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
   if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
+  if (Array.isArray(parsed.ledgerRemoved)) State.ledgerRemoved = parsed.ledgerRemoved.filter((k) => typeof k === 'string').slice(0, 500);   // v6.49
   if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
   if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
   if (typeof parsed.leverageAuto === 'boolean') State.leverageAuto = parsed.leverageAuto;
   if (typeof parsed.repeatLev === 'boolean') State.repeatLev = parsed.repeatLev;   // v6.43
-  if (parsed.bullFade && typeof parsed.bullFade === 'object') State.bullFade = { ...State.bullFade, ...parsed.bullFade, live: null, liveAt: 0 };   // v6.44
+  if (parsed.bullFade && typeof parsed.bullFade === 'object') {   // v6.44 / v6.48 (a stale live BTC reading is no crossing)
+    State.bullFade = { ...State.bullFade, ...parsed.bullFade, live: null, liveGap: null, liveAt: 0, seenBtcGap: null };
+    if (State.bullFade.on && !(Number(State.bullFade.sweepAt) > 0) && !parsed.bullFade.why) {   // on since v6.44: close what it kept
+      const b = Number(parsed.bullFade.breadth);
+      Object.assign(State.bullFade, { sweepAt: Date.now(), why: Number.isFinite(b) && b > 0 ? `only ${Math.round(b * 100)}% of coins above their 1h EMA50 on the live price` : 'coins fell below their 1h EMA50' });
+    }
+  }
   if (typeof parsed.bothSides === 'boolean') State.bothSides = parsed.bothSides;
   if (Strategy.validSideMode(parsed.sideMode)) State.sideMode = Strategy.validSideMode(parsed.sideMode);   // v6.30
   if (parsed.commentary) Commentary.load(parsed.commentary);   // v6.31
@@ -2586,6 +2689,7 @@ function applyPersistedState(parsed, live = false) {
     if (parsed.cooldowns && typeof parsed.cooldowns === 'object') State.cooldowns = parsed.cooldowns;
     if (Number(parsed.usdtToInrRate) > 0) State.usdtToInrRate = Number(parsed.usdtToInrRate);
     if (parsed.marketMode && parsed.marketMode.mode) State.subsystems.marketMode = parsed.marketMode;
+    if (parsed.journal) Journal.load(parsed.journal);   // v6.47: the previous build's journal
   }
 }
 
@@ -2743,6 +2847,15 @@ async function takeOverFromPreviousBuild() {
 // v6.31: the characters' Gemini comments (the app fetches them when subsystems.ai.rev changes). No key, only text.
 app.get('/api/commentary', (req, res) => { res.json({ ...Commentary.view(), status: Commentary.status() }); });
 
+// v6.47: the trade journal kept here (the last 1,000 records; the sheet's TradeJournal tab has them all). No addresses or keys
+// are in it. ?limit=N for the last N, ?open=1 adds the open trades as tracked so far.
+app.get('/api/journal', (req, res) => res.json({ success: true, status: Journal.status(), records: Journal.records(req.query.limit), ...(req.query.open ? { open: Journal.openTrades() } : {}) }));
+app.get('/api/journal.csv', (req, res) => {
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="sisir-trade-journal-${new Date().toISOString().slice(0, 10)}.csv"`);
+  res.send(Journal.csv());
+});
+
 app.get('/api/state', (req, res) => {
   res.json({
     portfolio: State.portfolio,
@@ -2762,6 +2875,7 @@ app.get('/api/state', (req, res) => {
     equityUSDT: computeEquity(),
     manual: manualView(),
     pnl: pnlNow(),
+    quotes: quotesView(), ledgerRemoved: State.ledgerRemoved.slice(0, 200),   // v6.49
     handover: { bootId: BOOT_ID, ready: Handover.ready, frozen: Handover.frozen, how: Handover.how, restoredAt: Handover.restoredAt }
   });
 });
@@ -2809,9 +2923,9 @@ app.post('/api/trades/sync-strict-sheet', async (req, res) => {
   const t0 = Date.now();
   try {
     const trades = await syncTradesFromGoogleSheets();
-    res.json({ success: true, count: trades.length, trades, sheet: { ...State.ledgerSync, answered: State.ledgerSync.okAt >= t0 } });
+    res.json({ success: true, count: trades.length, trades, sheet: { ...State.ledgerSync, answered: State.ledgerSync.okAt >= t0 }, ledgerRemoved: State.ledgerRemoved.slice(0, 200) });
   } catch (err) {
-    res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs, sheet: { ...State.ledgerSync, answered: false } });
+    res.json({ success: true, count: State.tradeLogs.length, trades: State.tradeLogs, sheet: { ...State.ledgerSync, answered: false }, ledgerRemoved: State.ledgerRemoved.slice(0, 200) });
   }
 });
 
@@ -2937,9 +3051,11 @@ app.post('/api/tp', (req, res) => {
 // the only exception is a 1x short whose margin is used up (price about +99%), which the exchange would liquidate.
 // -------------------------------------------------------------
 async function futuresQuote(sym) {
+  const live = freshQuote(sym);   // v6.49: the streamed best bid / ask while fresh
+  if (live) return { bid: live.bid, ask: live.ask };
   const q = await safeFetch(`${FAPI_BASE}/fapi/v1/ticker/bookTicker?symbol=${sym}`, 2500).catch(() => null);
   const bid = parseFloat(q && q.bidPrice), ask = parseFloat(q && q.askPrice);
-  if (bid > 0 && ask > 0) return { bid, ask };
+  if (bid > 0 && ask > 0) { noteQuote(sym, bid, ask); return { bid, ask }; }
   const last = await fetchFuturesPrice(sym);
   return last ? { bid: last, ask: last } : null;
 }
@@ -2963,6 +3079,7 @@ function closeManual(id, price, label) {
     notionalUSDT: p.notionalUSDT, fundingUSDT: Number((Number(p.fundingUSDT) || 0).toFixed(4)), pnlUSDT: Number(r.pnl.toFixed(4)), gainPct: Number(r.gainPct.toFixed(3)),
     openedAt: p.openedAt, closedAt: Date.now(), holdMinutes: Math.round((Date.now() - p.openedAt) / 60000) };
   m.history = [trade, ...(m.history || [])].slice(0, Strategy.MANUAL.historyKeep);
+  Journal.close('manual', id, p, { trade, exitType: label, exitPrice: price, qtyClosed: Number(p.qty), marginClosed: Number(p.notionalUSDT) / (Number(p.leverage) || 1), fraction: 1, fullyClosed: true });   // v6.47
   logOperation('MANUAL', `${label}: ${p.side} ${p.pair} @ $${formatPrecisePrice(price)} (${r.gainPct >= 0 ? '+' : ''}${r.gainPct.toFixed(2)}%) • Net ${r.pnl >= 0 ? '+' : ''}$${r.pnl.toFixed(4)}`, r.pnl >= 0 ? 'success' : 'warning');
   saveDiskState();
   syncActiveSymbolSubscriptions();
@@ -3188,6 +3305,7 @@ app.post('/api/manual/open', async (req, res) => {
     openedAt: Date.now(), entryPriceUSDT: price, livePriceUSDT: price, lastTickAt: Date.now(), qty: plan.qty, notionalUSDT: plan.notional,
     openFeeUSDT: Number((plan.cost - plan.notional).toFixed(6)), liquidationPrice: plan.liquidationPrice, fundingUSDT: 0, nextFundingAt: 0, takeProfitPct: tp.pct };
   State.manual.positions[id].takeProfitPrice = Strategy.manualTakeProfitPrice(State.manual.positions[id]);
+  Journal.open('manual', id, State.manual.positions[id], { strategy: 'MANUAL', checks: { quote: q, takeProfitPct: tp.pct, requestedNotionalUSDT: notional }, plan });   // v6.47
   logOperation('MANUAL', `Opened ${side} ${sym} @ $${formatPrecisePrice(price)} ($${plan.notional.toFixed(2)}, 1x USD-M, paper, manual account)${tp.pct ? `, closes at +${tp.pct}%` : ''}`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
@@ -3223,6 +3341,11 @@ app.post('/api/manual/tp', (req, res) => {
 app.post('/api/account/reset', (req, res) => {
   if (req.body.confirm !== 'RESET') return res.status(400).json({ success: false, error: 'confirm must be RESET' });
   const pos = Object.keys(State.activePositions || {}), bags = Object.keys(State.recoveryBags || {}), before = computeEquity();
+  // v6.47: what the removed trades and bags had goes to the journal too, marked as not a trade
+  const gone = (book, k, p) => Journal.close(book, k, p, { exitType: 'REMOVED BY ACCOUNT RESET', exitPrice: Number(p.livePriceUSDT) || Number(p.entryPriceUSDT),
+    notATrade: true, fullyClosed: true, reason: 'Settings > Reset paper account: removed without a close (not a trade)' });
+  Object.entries(State.activePositions || {}).forEach(([k, p]) => gone('position', k, p));
+  Object.entries(State.recoveryBags || {}).forEach(([k, p]) => gone('bag', k, p));
   State.activePositions = {};
   State.recoveryBags = {};
   if (State.fib && State.fib.portfolio) State.fib.portfolio.positions = {};
@@ -3374,7 +3497,9 @@ function broadcastStateUpdate({ withUniverse = false } = {}) {
     riskConfig: Strategy.CONFIG,
     equityUSDT: computeEquity(),
     manual: manualView(),
-    pnl: pnlNow()
+    pnl: pnlNow(),
+    quotes: quotesView(),   // v6.49
+    ledgerRemoved: State.ledgerRemoved.slice(0, 200)   // v6.49: trades you deleted in the sheet stay out of the app
   };
   if (withUniverse) payload.universe = State.universe;
   sendAll(JSON.stringify(payload, omitTickStamps));
@@ -3386,6 +3511,7 @@ function broadcastStateUpdate({ withUniverse = false } = {}) {
 // as trail levels change far less often, so they go at most every 2 seconds, and only if changed.
 let lastSentPrices = {};
 const lastManualPx = {};
+const lastSentQuotes = {};   // v6.49: symbol -> { bid, ask, at }
 let lastDetailSig = '';
 let lastDetailAt = 0;
 const omitLive = (key, value) => (key === 'lastTickAt' || key === 'livePriceUSDT' ? undefined : value);
@@ -3400,10 +3526,21 @@ function broadcastPriceStream() {
     sendAll(JSON.stringify({ type: 'PRICE_STREAM', activePositions: State.activePositions, recoveryBags: State.recoveryBags }, omitTickStamps));
     return;
   }
-  const moved = {}, m = {};
+  const moved = {}, m = {}, q = {}, now = Date.now();
   Object.entries(held).forEach(([k, p]) => { if (p.livePriceUSDT !== lastSentPrices[k]) moved[k] = lastSentPrices[k] = p.livePriceUSDT; });
   Object.values(State.manual.positions || {}).forEach((p) => { if (p.livePriceUSDT !== lastManualPx[p.id]) m[p.id] = lastManualPx[p.id] = p.livePriceUSDT; });
-  if (Object.keys(moved).length || Object.keys(m).length) sendAll(JSON.stringify(Object.keys(m).length ? { type: 'P', p: moved, m } : { type: 'P', p: moved }));
+  for (const [k, b] of bookQuotes) {   // v6.49: the close price of each held coin
+    if (now - b.at >= QUOTE_FRESH_MS) continue;
+    const l = lastSentQuotes[k];
+    if (!l || l.bid !== b.bid || l.ask !== b.ask || now - l.at >= 5000) { q[k] = [b.bid, b.ask]; lastSentQuotes[k] = { bid: b.bid, ask: b.ask, at: now }; }
+  }
+  for (const k of Object.keys(lastSentQuotes)) if (!bookQuotes.has(k)) delete lastSentQuotes[k];
+  if (Object.keys(moved).length || Object.keys(m).length || Object.keys(q).length) {
+    const f = { type: 'P', p: moved };
+    if (Object.keys(m).length) f.m = m;
+    if (Object.keys(q).length) f.q = q;
+    sendAll(JSON.stringify(f));
+  }
 }
 
 // -------------------------------------------------------------
@@ -3528,8 +3665,61 @@ function syncFuturesStream() {
   if (drop.length) { drop.forEach((s) => futuresStreams.delete(s)); futuresWs.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: drop, id: Date.now() + 1 })); }
 }
 
+// v6.49: the best bid / ask of every futures coin held (autopilot trades, bags, your manual account), streamed. Binance serves
+// <sym>@bookTicker only on its /public route (aggTrade is on /market). A close fills at this quote at once, and the app shows
+// it as the price a close gets. A quote older than QUOTE_FRESH_MS, or a closed socket, falls back to Binance's REST quote.
+const FSTREAM_PUBLIC_URL = process.env.FSTREAM_PUBLIC_URL || 'wss://fstream.binance.com/public/ws';
+const QUOTE_FRESH_MS = 10000;
+const bookQuotes = new Map();   // symbol -> { bid, ask, at }
+let quoteWs = null;
+let quoteStreams = new Set();
+function noteQuote(sym, bid, ask) {
+  const b = parseFloat(bid), a = parseFloat(ask);
+  if (b > 0 && a > 0 && a >= b) bookQuotes.set(sym, { bid: b, ask: a, at: Date.now() });
+}
+function freshQuote(sym, maxAgeMs = QUOTE_FRESH_MS) {
+  const q = bookQuotes.get(sym);
+  return q && Date.now() - q.at < maxAgeMs ? q : null;
+}
+function syncQuoteStream() {
+  const held = new Set(heldFutures());
+  for (const k of [...bookQuotes.keys()]) if (!held.has(k)) bookQuotes.delete(k);
+  const wanted = new Set([...held].map((s) => `${s.toLowerCase()}@bookTicker`));
+  if (!wanted.size) {
+    if (quoteWs) { const w = quoteWs; quoteWs = null; quoteStreams = new Set(); try { w.terminate(); } catch (e) {} }
+    return;
+  }
+  if (!quoteWs) {
+    const w = new WebSocket(FSTREAM_PUBLIC_URL);
+    quoteWs = w;
+    quoteStreams = new Set();
+    w.on('open', syncQuoteStream);
+    w.on('message', (data) => {
+      try {
+        const t = JSON.parse(data);
+        if (t && t.e === 'bookTicker' && t.s) noteQuote(t.s, t.b, t.a);
+      } catch (e) {}
+    });
+    w.on('error', (e) => console.warn('[Quote Stream Error]', e.message));
+    w.on('close', () => { if (quoteWs === w) { quoteWs = null; setTimeout(syncQuoteStream, 2500); } });
+    return;
+  }
+  if (quoteWs.readyState !== WebSocket.OPEN) return;
+  const add = [...wanted].filter((s) => !quoteStreams.has(s));
+  const drop = [...quoteStreams].filter((s) => !wanted.has(s));
+  if (add.length) { add.forEach((s) => quoteStreams.add(s)); quoteWs.send(JSON.stringify({ method: 'SUBSCRIBE', params: add, id: Date.now() })); }
+  if (drop.length) { drop.forEach((s) => quoteStreams.delete(s)); quoteWs.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: drop, id: Date.now() + 1 })); }
+}
+// the quotes the app shows: { SYMBOL: [bid, ask] }, fresh ones only
+function quotesView() {
+  const out = {};
+  for (const [k, q] of bookQuotes) if (Date.now() - q.at < QUOTE_FRESH_MS) out[k] = [q.bid, q.ask];
+  return out;
+}
+
 function syncActiveSymbolSubscriptions() {
   syncFuturesStream();
+  syncQuoteStream();
   if (!binanceGlobalWs || binanceGlobalWs.readyState !== WebSocket.OPEN) return;
   const currentSymbols = new Set([
     ...Object.keys(State.activePositions || {}).filter((k) => !isFutures(State.activePositions[k])),
@@ -3563,7 +3753,9 @@ wss.on('connection', (ws) => {
     subsystems: State.subsystems,
     riskConfig: Strategy.CONFIG,
     manual: manualView(),
-    pnl: pnlNow()
+    pnl: pnlNow(),
+    quotes: quotesView(),   // v6.49
+    ledgerRemoved: State.ledgerRemoved.slice(0, 200)   // v6.49
   }, omitTickStamps));
 
   ws.on('message', (data) => {
@@ -3603,16 +3795,18 @@ wss.on('connection', (ws) => {
 // live). Only then does this build open its port (Render moves traffic here once it does) and start trading.
 async function boot() {
   const hadFile = fs.existsSync(DISK_STATE_FILE);
+  Journal.loadFile();   // v6.47
   loadDiskState();
   const t0 = Date.now();
   await takeOverFromPreviousBuild();
   applyCapitalReset();
-  if (Handover.restoredAt) saveDiskState();
+  if (Handover.restoredAt) { saveDiskState(); Journal.saveNow(); }
   syncBreakdownStatus();
   syncSizingStatus();
   syncLeverageStatus();
   syncSidesStatus();
   syncFibStatus();   // v6.23
+  syncJournalStatus();   // v6.47
   Handover.ready = true;
   const n = Object.keys(State.activePositions || {}).length, b = Object.keys(State.recoveryBags || {}).length;
   const what = `${n} open trade${n === 1 ? '' : 's'}, ${b} bag${b === 1 ? '' : 's'}, free cash $${Number(State.portfolio.cashUSDT).toFixed(2)}`;
@@ -3707,12 +3901,16 @@ setInterval(async () => {
 setInterval(broadcastPriceStream, 250);
 setInterval(() => { refreshExitSignals().catch(() => {}); }, 3000);
 setInterval(runDynamicScreener, 60000);
+// v6.47: the trade journal reads the open trades every 5 s and sends new records to the sheet every 15 s
+setInterval(sampleJournal, JournalMod.RULES.sampleMs);
+setInterval(() => { Journal.flush().catch(() => {}).finally(syncJournalStatus); }, 15000);
 }
 
 // Render stops an old instance with SIGTERM (about a minute after the new build goes live): stop trading and save.
 process.on('SIGTERM', () => {
   Handover.frozen = true;
   saveDiskState();
+  Journal.saveNow();   // v6.47
   console.log('[Handover] SIGTERM: trading stopped, state saved.');
   setTimeout(() => process.exit(0), 1000);
 });
