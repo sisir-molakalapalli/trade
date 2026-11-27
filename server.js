@@ -138,6 +138,8 @@ const State = {
   // v6.44: BULL fading (Strategy.BULL_FADE): on = live breadth fell under 60% while the candlestick mode was BULL. No new longs
   // and long trades / bags close at -1.20% or better until that mode leaves BULL. live / liveAt: the latest live reading.
   bullFade: { on: false, at: 0, breadth: null, live: null, liveAt: 0, closed: 0, netUSDT: 0, endedAt: 0, endMode: null },
+  // v6.45 (paper test): the long ignition reads the volume RATE (Strategy.IGNITION). IGNITION_RATE=off goes back to the old rule.
+  ignitionRate: !['off', '0', 'false'].includes(String(process.env.IGNITION_RATE || '').toLowerCase()),
   // Settings > BTC 2h prediction (v6.42): on = the in-app prediction steers candlestick trades. BTC_PREDICT=off starts it off.
   predictOn: !['off', '0', 'false'].includes(String(process.env.BTC_PREDICT || '').toLowerCase()),  breakdownSide: BREAKDOWN_SIDES[process.env.BREAKDOWN_SIDE] ? process.env.BREAKDOWN_SIDE : 'SHORT',
   breakdownLongs: { opened: 0, target: 0, bagged: 0, bagClosed: 0, last: '' },
@@ -180,6 +182,7 @@ const State = {
     microstructure: { status: 'ONLINE', cyclesCompleted: 240, activeBookDepth: 20 },
     marketMode: { mode: 'NEUTRAL', side: 'NONE', reason: 'Reading the market', breadth: null, seen: 0, updatedAt: 0 },
     bullFade: { on: false, live: null, liveAt: 0, limitPct: 60, closePct: -1.20 },   // v6.44
+    ignition: { rate: true, rateX: 2, movePct: 0.8, taker: 52, rvol: 1.35 },   // v6.45, set at start
     futures: { status: 'CONNECTING', perpetuals: 0, reason: 'Loading USD-M contracts', leverage: 1 },
     leverage: { on: false, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct },
     sizing: { positionPct: Strategy.FUTURES.positionPct, minPct: Strategy.POSITION_SIZE.minPct, maxPct: Strategy.POSITION_SIZE.maxPct },
@@ -209,6 +212,7 @@ const State = {
   masterLedgerUrl: 'https://script.google.com/macros/s/AKfycbwwFkRk4O2oJYmgrRcQBpx3z5KBKEOCJoX6YzL1yJXdot93V1T08ewIGaF78O1n6Z1ktg/exec',
   learningSheetUrl: 'https://script.google.com/macros/s/AKfycbwut72lTkCVcqIV2k7YlzlsIOwO3GXCKqlF-4UBxvTvJHckJApKKxzbfFp5JN0VLND8/exec'
 };
+State.subsystems.ignition.rate = State.ignitionRate;   // v6.45: which ignition rule runs (IGNITION_RATE=off: the old one)
 
 // -------------------------------------------------------------
 // UNROUNDED HIGH-PRECISION PRICE FORMATTER
@@ -826,12 +830,13 @@ function openLong(pairKey, signal, plan, takerBuyRatio, opts = {}) {
     breakevenPrice: entry * (1 + R.shortFloorPct / 100), tp1Price: entry * (1 + R.tp1Pct / 100), targetPrice: entry * 1.03,
     liquidationPrice: Strategy.liquidationPrice(entry, 'LONG', lev), fundingUSDT: 0, nextFundingAt: 0,
     peakGainPct: 0, peakHighPrice: entry, ratchetStage: 'INITIAL', tp1Secured: false, candlestickPattern: signal.pattern,
-    ...(repeatTrade(pairKey, lev) ? { repeat20: true } : {})   // v6.43: back to back, 20x
+    ...(repeatTrade(pairKey, lev) ? { repeat20: true } : {}),   // v6.43: back to back, 20x
+    ...(opts.ignition ? { ignition: opts.ignition } : {})   // v6.45: how the ignition fired
   };
   // Breakdown long (test): closes only at its fixed target, never by harvest, trail, scratch or partial.
   const target = opts.targetOnlyPct ? entry * (1 + opts.targetOnlyPct / 100) : 0;
   if (target) Object.assign(State.activePositions[pairKey], { targetOnlyPct: opts.targetOnlyPct, entrySource: opts.entrySource, ratchetStage: 'TARGET_ONLY', breakevenPrice: target, tp1Price: target, targetPrice: target });
-  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''})${State.activePositions[pairKey].repeat20 ? ' • back to back on this coin: 20x' : ''} via [${signal.pattern}] • ${target ? `Closes only at +${opts.targetOnlyPct.toFixed(2)}% ($${formatPrecisePrice(target)})` : 'Min exit +0.20%'} • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
+  logOperation('EXECUTION', `LONGED ${sym}/USDT @ $${formatPrecisePrice(entry)} ($${plan.notional.toFixed(2)}${lev > 1 ? ` on $${margin.toFixed(2)} margin` : ''}, ${lev}x USD-M, paper${lev > 1 ? `, liquidation $${formatPrecisePrice(State.activePositions[pairKey].liquidationPrice)}` : ''})${State.activePositions[pairKey].repeat20 ? ' • back to back on this coin: 20x' : ''} via [${signal.pattern}]${opts.ignition ? ` (${opts.ignition.rate ? `volume ${opts.ignition.volRate}x the normal rate at minute ${opts.ignition.minute}, test` : `volume ${opts.ignition.rvol}x`})` : ''} • ${target ? `Closes only at +${opts.targetOnlyPct.toFixed(2)}% ($${formatPrecisePrice(target)})` : 'Min exit +0.20%'} • Moves to recovery bag at -3.50% • Taker buy ${takerBuyRatio}%`, 'success');
   saveDiskState();
   syncActiveSymbolSubscriptions();
   broadcastStateUpdate();
@@ -939,7 +944,7 @@ function realizeExit(bookName, key, fraction, price, typeLabel, reasonText) {
     strategyVersion: 6,
     leverage: levAtEntry,
     ...(pos.momentum ? { momentumScore: pos.momentum.s, momentumDir: pos.momentum.d } : {}),   // v6.33: the score it was opened with
-    reason: `${reasonText}${levAtEntry > 1 ? ` • ${levAtEntry}x leverage${pos.repeat20 ? ' (back to back)' : ''}` : ''}${pos.momentum ? ` • momentum ${pos.momentum.d} ${pos.momentum.s}` : ''}`
+    reason: `${reasonText}${levAtEntry > 1 ? ` • ${levAtEntry}x leverage${pos.repeat20 ? ' (back to back)' : ''}` : ''}${pos.momentum ? ` • momentum ${pos.momentum.d} ${pos.momentum.s}` : ''}${pos.ignition ? ` • ignition${pos.ignition.rate ? ` test (volume rate ${pos.ignition.volRate}x at minute ${pos.ignition.minute})` : ''}` : ''}`
   };
 
   logOperation(pnl >= 0 ? 'SENTRY_EXIT' : 'RISK_STOP',
@@ -1088,6 +1093,12 @@ async function checkMicrostructureMomentumAndVwap(symbol, maxAgeMs = 45000) {
     }
     const avgVol = priorVolSum / 9;
     const rvol = avgVol > 0 ? Number((curVol / avgVol).toFixed(2)) : 1.0;
+    // v6.45: the volume rate, against what an average candle has traded by the time these candles were read
+    const cleanSym = String(symbol).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const readAt = (klineCache.get(`FUT_${cleanSym.endsWith('USDT') ? cleanSym : `${cleanSym}USDT`}_15m_16`) || {}).timestamp || Date.now();
+    const curOpenMs = Number(curBar[0]);
+    const volRate = Number(Strategy.ignitionVolumeRate(avgVol > 0 ? curVol / avgVol : 1, curOpenMs, readAt).toFixed(2));
+    const candleMinute = Number(((readAt - curOpenMs) / 60000).toFixed(1));
 
     // 2-Hour Base Ceiling Distance Gate (<= 2.50%)
     let highPriorBase = 0;
@@ -1108,7 +1119,8 @@ async function checkMicrostructureMomentumAndVwap(symbol, maxAgeMs = 45000) {
       change15mPct,
       rvol,
       vwap4h: Number(vwap4h.toFixed(6)),
-      upperWickRatio: Number(upperWickRatio.toFixed(2))
+      upperWickRatio: Number(upperWickRatio.toFixed(2)),
+      volRate, candleMinute   // v6.45
     };
   } catch (e) {
     return { passed: false, reason: 'Futures data unavailable' };
@@ -1651,7 +1663,10 @@ async function evaluateAutopilotEntries() {
       const lateLong = candleCheck.isBullishEntry ? lateCheck(pairKey, 'LONG', candleCheck.lastCloseMs, candleCheck.bullSignalBarsAgo, candleCheck.bullishPatternName) : '';
       if (lateLong) candleCheck = { ...candleCheck, isBullishEntry: false, bullishPatternName: 'NONE' };
       const isConfirmedPatternEntry = candleCheck.isBullishEntry;
-      const isAuthenticIgnition = (microMom.change15mPct >= 0.80 && microMom.rvol >= 1.35 && orderFlow.takerBuyRatio >= 52.0);
+      // v6.45 (paper test): the volume rate (2x what an average candle has traded by now); IGNITION_RATE=off: the old 1.35x a whole candle
+      const ignOf = (mm, of) => Strategy.isIgnition({ change15mPct: mm.change15mPct, rvol: mm.rvol, volRate: mm.volRate, takerBuyRatio: of.takerBuyRatio }, State.ignitionRate);
+      const ignText = (mm, of) => `15m +${mm.change15mPct}%, volume ${State.ignitionRate ? `${mm.volRate}x the normal rate at minute ${mm.candleMinute}` : `${mm.rvol}x`}, taker buy ${of.takerBuyRatio}%`;
+      const isAuthenticIgnition = ignOf(microMom, orderFlow);
       if (lateLong && !isAuthenticIgnition) { candidateCooldownMemo.set(pairKey, now + 30000); continue; }
       if (!isConfirmedPatternEntry && !isAuthenticIgnition) {
         candidateCooldownMemo.set(pairKey, now + 30000);
@@ -1662,10 +1677,10 @@ async function evaluateAutopilotEntries() {
       // v6.8: an ignition is read from the live 15m candle (cached up to 45 s, flow 20 s). Confirm it on fresh data first.
       if (!isConfirmedPatternEntry) {
         const [fm, ff] = await Promise.all([checkMicrostructureMomentumAndVwap(pairKey, 1000), checkVeteranOrderFlowAndVSA(pairKey, 1000)]);
-        if (!fm.passed || !ff.passed || !(fm.change15mPct >= 0.80 && fm.rvol >= 1.35 && ff.takerBuyRatio >= 52.0)) {
-          const now15 = !fm.passed ? fm.reason : !ff.passed ? ff.reason : `15m +${fm.change15mPct}%, volume ${fm.rvol}x, taker buy ${ff.takerBuyRatio}%`;
+        if (!fm.passed || !ff.passed || !ignOf(fm, ff)) {
+          const now15 = !fm.passed ? fm.reason : !ff.passed ? ff.reason : ignText(fm, ff);
           candidateCooldownMemo.set(pairKey, now + 30000);
-          logOperation('MOM_VETO', `${pairKey} ignition gone on fresh data: ${now15} (cached: +${microMom.change15mPct}%, ${microMom.rvol}x, ${orderFlow.takerBuyRatio}%).`, 'info');
+          logOperation('MOM_VETO', `${pairKey} ignition gone on fresh data: ${now15} (cached: ${ignText(microMom, orderFlow)}).`, 'info');
           continue;
         }
         microMom = fm; orderFlow = ff;
@@ -1698,7 +1713,9 @@ async function evaluateAutopilotEntries() {
         logOperation('CASH_GUARD', `${pairKey} long: Binance minimum for this contract is $${minN}, position would be $${plan.notional.toFixed(2)}.`, 'info');
         continue;
       }
-      if (openLong(pairKey, signal, plan, orderFlow.takerBuyRatio)) tagMomentum(pairKey, mgL);
+      // v6.45: an ignition long remembers how it fired, so its close (and Settings) can tell the test apart
+      const ign = !isConfirmedPatternEntry ? { rate: State.ignitionRate, volRate: microMom.volRate, rvol: microMom.rvol, minute: microMom.candleMinute, move: microMom.change15mPct } : null;
+      if (openLong(pairKey, signal, plan, orderFlow.takerBuyRatio, ign ? { ignition: ign } : {})) tagMomentum(pairKey, mgL);
     }
   } finally {
     isEvaluatingEntries = false;
@@ -1792,7 +1809,8 @@ function demoteToBag(k, pos, price, reason) {
     nextStepAt: st.nextAt, nextStepPct: st.nextPct, lossAt: st.lossAt,   // v6.18 stages, from Strategy.bagStage
     troughPrice: price, exitInProgress: false, candlestickPattern: pos.candlestickPattern || 'MONITORING', strategyVersion: 6,
     entrySource: pos.entrySource, leverage: pos.leverage, leverageAtEntry: pos.leverageAtEntry, marginUSDT: pos.marginUSDT,
-    ...(pos.momentum ? { momentum: pos.momentum } : {})   // v6.33
+    ...(pos.momentum ? { momentum: pos.momentum } : {}),   // v6.33
+    ...(pos.ignition ? { ignition: pos.ignition } : {}), ...(pos.repeat20 ? { repeat20: true } : {})   // v6.45 (and v6.43's mark)
   };
   // v6.12: your take profit stays with the trade when it becomes a bag (in place of the bag's +0.30%)
   const mine = Number(pos.userTpPct) > 0;
