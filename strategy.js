@@ -914,15 +914,19 @@ function neutralShortsOnly(mode, lastTrend) {
 }
 
 /**
- * v6.44 (the user's rule, 27 Nov 2026): BULL fading. While the market mode the candlestick autopilot trades by is BULL
- * (the app's own, or a fresh BTC 2h prediction), the share of the top coins above their 1h EMA50 is read every minute on
- * the live price (the hour still open, as a live chart shows it). The first reading under 60% stops new longs until that
- * mode is no longer BULL (NEUTRAL or BEAR); then new trades follow the usual rules again. Meanwhile every long trade and
- * long bag closes at -1.20% from entry or better: at once if its price is there, otherwise when it climbs back to it.
- * Shorts and trades opened at 20x (back to back, v6.43) keep their usual exits. A finished hour under 60% already ends BULL (evaluateMarketMode), so only the live
- * reading can see the drop while the market is still BULL.
+ * v6.44 / v6.48 (the user's rule, 27 Nov 2026): BULL fading. While the market mode the candlestick autopilot trades by is
+ * BULL (the app's own, or a fresh BTC 2h prediction), it fires on the first of these readings:
+ *  - under 60% of the top coins above their 1h EMA50, on the live price (read every minute, the hour still open, as a live
+ *    chart shows it) or at an hour's close (the app's market mode);
+ *  - BTC going from at or above its 1h EMA50 to below it, on the live price or at an hour's close.
+ * A finished hour under 60%, or BTC closing an hour below its EMA50, also ends BULL (evaluateMarketMode); that reading still
+ * fires it, as BULL ends ('swept').
+ * When it fires, every long trade and long bag open at that moment closes at market, whatever its price: 20x trades and
+ * Fibonacci trades too. Shorts keep their usual exits. While the mode stays BULL no new longs open; once it is NEUTRAL or
+ * BEAR, new trades follow the usual rules again. (v6.44 closed longs at -1.20% or better, left 20x trades out, and read
+ * only the live breadth.)
  */
-const BULL_FADE = { breadth: 0.60, closePct: -1.20, liveMaxAgeMs: 5 * 60000 };
+const BULL_FADE = { breadth: 0.60, liveMaxAgeMs: 5 * 60000 };
 /** Share (0-1) of coins whose live 1h price is above their live 1h EMA50; klines include the hour still open. null: under minCoins readable. */
 function liveBreadth(coins1h = [], R = MODE_RULES) {
   let above = 0, seen = 0;
@@ -934,28 +938,46 @@ function liveBreadth(coins1h = [], R = MODE_RULES) {
   });
   return seen >= R.minCoins ? above / seen : null;
 }
+/** v6.48: BTC's live 1h price against its live 1h EMA50, in % (klines include the hour still open, as the app's BTC card reads it). null: too little history. */
+function liveBtcGap(btc1h) {
+  const c = Array.isArray(btc1h) ? toBars(btc1h).map((b) => b.c).filter((x) => x > 0) : [];
+  if (c.length < 55) return null;
+  const e = emaSeries(c, 50)[c.length - 1];
+  return e > 0 ? (c[c.length - 1] / e - 1) * 100 : null;
+}
 /**
- * One step of the BULL-fading latch. prev: the stored state ({on, at, breadth, ...}); mode: the candlestick mode's
- * name; breadth: the latest live reading (null if unknown or stale). Returns { state, event: 'fired' | 'released' | null }.
+ * One step of the BULL-fading latch. prev: the stored state; mode: the candlestick mode's name; breadth / btcGap: the latest
+ * live readings (null if unknown or stale); hourly / btcHourGap: the same from the last closed hour (the app's market mode).
+ * A BTC reading counts when it goes from >= 0 at the step before to < 0. Returns { state, event }: 'fired' (on: no new longs
+ * while BULL), 'swept' (the reading that ended BULL: the closes happen, nothing is held off), 'released' (BULL is over) or null.
+ * state.sweepAt: the long trades and bags opened up to then close at market (the engine clears it once none is left).
  */
-function bullFadeStep(prev, { mode, breadth, now = Date.now() } = {}, R = BULL_FADE) {
+function bullFadeStep(prev, { mode, breadth, hourly, btcGap, btcHourGap, now = Date.now() } = {}, R = BULL_FADE) {
   const p = prev && typeof prev === 'object' ? prev : { on: false };
+  const ok = (x) => x !== null && x !== undefined && x !== '' && Number.isFinite(Number(x));
+  const fell = (a, b) => ok(a) && ok(b) && Number(a) >= 0 && Number(b) < 0;
+  const pc = (x) => `${Math.round(Number(x) * 100)}%`;
+  const why = [];
+  let read = null;
+  if (ok(breadth) && Number(breadth) < R.breadth) { why.push(`only ${pc(breadth)} of coins above their 1h EMA50 on the live price`); read = Number(breadth); }
+  if (ok(hourly) && Number(hourly) < R.breadth) { why.push(`only ${pc(hourly)} of coins above their 1h EMA50 at the hour's close`); if (read === null) read = Number(hourly); }
+  if (fell(p.seenBtcGap, btcGap)) why.push(`BTC went below its 1h EMA50 on the live price (${Number(btcGap).toFixed(2)}%)`);
+  if (fell(p.seenBtcHourGap, btcHourGap)) why.push(`BTC closed the hour below its 1h EMA50 (${Number(btcHourGap).toFixed(2)}%)`);
+  const keep = (x, y) => (ok(x) ? Number(x) : ok(y) ? Number(y) : null);
+  const next = { ...p, lastMode: mode || null, seenBtcGap: keep(btcGap, p.seenBtcGap), seenBtcHourGap: keep(btcHourGap, p.seenBtcHourGap) };
+  const fire = { at: now, sweepAt: now, why: why.join('; '), breadth: read !== null ? read : keep(breadth, hourly), btcGap: keep(btcGap, btcHourGap), closed: 0, netUSDT: 0 };
   if (mode !== 'BULL') {
-    return p.on ? { state: { ...p, on: false, endedAt: now, endMode: mode || 'NEUTRAL' }, event: 'released' } : { state: p, event: null };
+    if (p.on) return { state: { ...next, on: false, endedAt: now, endMode: mode || 'NEUTRAL' }, event: 'released' };
+    if (p.lastMode === 'BULL' && why.length) return { state: { ...next, ...fire, on: false, endedAt: now, endMode: mode || 'NEUTRAL' }, event: 'swept' };
+    return { state: next, event: null };
   }
-  if (!p.on && breadth !== null && breadth !== undefined && Number.isFinite(Number(breadth)) && Number(breadth) < R.breadth) {
-    return { state: { ...p, on: true, at: now, breadth: Number(breadth), endedAt: 0, endMode: null, closed: 0, netUSDT: 0 }, event: 'fired' };
-  }
-  return { state: p, event: null };
+  if (!p.on && why.length) return { state: { ...next, ...fire, on: true, endedAt: 0, endMode: null }, event: 'fired' };
+  return { state: next, event: null };
 }
-/** The user's exception (27 Nov 2026): a trade opened at 20x (back to back, v6.43) is left out of the -1.20% close, as a trade or a bag. */
-function bullFadeSkips(pos) {
-  return Boolean(pos && (pos.repeat20 || num(pos.leverageAtEntry || pos.leverage) >= REPEAT_LEVERAGE.leverage));
-}
-/** The price a long closes at while BULL fades: -1.20% from entry. null for a short, a 20x trade, or without an entry. */
-function bullFadePrice(pos, R = BULL_FADE) {
-  const e = num(pos && pos.entryPriceUSDT);
-  return pos && pos.side !== 'SHORT' && !bullFadeSkips(pos) && e > 0 ? e * (1 + R.closePct / 100) : null;
+/** v6.48: true for a long trade or long bag the BULL-fading rule closes at market: one open when it fired (state.sweepAt). Never a short. */
+function bullFadeCloses(pos, state) {
+  const at = num(state && state.sweepAt);
+  return Boolean(pos && at > 0 && pos.side !== 'SHORT' && (num(pos.openedAt) || 0) <= at);
 }
 /**
  * v6.45 (paper test, 27 Nov 2026): HIGH_VOL_IGNITION on the volume RATE. The old rule compared the live 15m candle's volume
@@ -975,11 +997,6 @@ function ignitionVolumeRate(rvol, openMs, atMs, R = IGNITION) {
 function isIgnition({ change15mPct, rvol, volRate, takerBuyRatio } = {}, useRate = true, R = IGNITION) {
   if (!(num(change15mPct) >= R.movePct) || !(num(takerBuyRatio) >= R.taker)) return false;
   return useRate ? num(volRate) >= R.rateX : num(rvol) >= R.rvol;
-}
-/** True when a long's price is at its BULL-fading close level or better (1e-9: float dust). */
-function bullFadeExit(pos, price, R = BULL_FADE) {
-  const lvl = bullFadePrice(pos, R);
-  return lvl > 0 && num(price) > 0 && num(price) >= lvl * (1 - 1e-9);
 }
 
 /**
@@ -1244,7 +1261,11 @@ function sameLedgerTrade(a, b) {
   const ta = String(a.time || '').trim(), tb = String(b.time || '').trim();
   return Boolean(a.date) && String(a.date).trim() === String(b.date || '').trim() && Boolean(ta) && ta === tb;
 }
-function ledgerReconcile(sheetRows, local, now = Date.now(), graceMs = LEDGER_GRACE_MS) {
+/**
+ * v6.49: readStartedAt = when this sheet read began. A trade the sheet confirmed writing before then (sheetAckAt) and that
+ * the read does not have was deleted by you: it leaves at once. The hour's grace is only for a write still on its way.
+ */
+function ledgerReconcile(sheetRows, local, now = Date.now(), graceMs = LEDGER_GRACE_MS, readStartedAt = 0) {
   const rows = Array.isArray(sheetRows) ? sheetRows.filter((r) => r && typeof r === 'object') : [];
   const list = Array.isArray(local) ? local : [];
   const used = new Set();
@@ -1258,10 +1279,15 @@ function ledgerReconcile(sheetRows, local, now = Date.now(), graceMs = LEDGER_GR
   list.forEach((x, i) => {
     if (used.has(i) || !x || typeof x !== 'object') return;
     const closedAt = num(x.id) > 1.6e12 ? num(x.id) : 0;
-    if (!x.inSheet && closedAt > 0 && now - closedAt < graceMs) trades.push(x);
+    const written = num(x.sheetAckAt) > 0 && num(readStartedAt) > 0 && num(x.sheetAckAt) < num(readStartedAt);
+    if (!x.inSheet && !written && closedAt > 0 && now - closedAt < graceMs) trades.push(x);
     else removed.push(x);
   });
   return { trades, removed };
+}
+/** v6.49: a trade's key, the same as the app's tradeKey: its close time (id) and pair, or pair, day and time for an old row. */
+function ledgerKey(t) {
+  return num(t && t.id) > 1.6e12 ? `${num(t.id)}|${t.pair}` : `${t && t.pair}|${t && t.date}|${String((t && t.time) || '').slice(0, 8)}`;
 }
 
 /** Free cash to add to a bag's margin to bring it back to 1x: all that is needed, or as much as there is. */
@@ -1454,9 +1480,8 @@ module.exports = {
   BULL_FADE,
   liveBreadth,
   bullFadeStep,
-  bullFadeSkips,
-  bullFadePrice,
-  bullFadeExit,
+  liveBtcGap,
+  bullFadeCloses,
   IGNITION,
   ignitionVolumeRate,
   isIgnition,
@@ -1498,6 +1523,7 @@ module.exports = {
   ledgerMatch,
   ledgerReconcile,
   sameLedgerTrade,
+  ledgerKey,
   LEDGER_GRACE_MS,
   POSITION_SIZE,
   validPositionPct,
