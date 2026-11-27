@@ -168,6 +168,7 @@ const State = {
   activePositions: {},
   recoveryBags: {},
   ledgerSync: { okAt: 0, triedAt: 0, rows: 0, note: 'not read yet' },   // v6.11: last read of the Google Sheet ledger
+  modeChangedAt: 0, modeSeen: null,   // v6.50: when the market mode last changed, and the mode then (back-to-back 20x waits for a trade after it)
   ledgerRemoved: [],   // v6.49: keys (Strategy.ledgerKey) of trades taken out because you deleted them in the sheet (newest first, 500)
   lastTrendMode: null,   // v6.17: the last BULL / BEAR market mode (for "neutral after bullish: shorts only")
   // v6.23: Settings > Entry strategy: 'CANDLE' (the candlestick model) or 'FIB' (the Fibonacci retracement autopilot)
@@ -417,6 +418,10 @@ async function refreshMarketMode(tickers) {
   r = { ...r, shortsOnly, lastTrend: State.lastTrendMode };
   const before = State.subsystems.marketMode.mode, beforeShorts = Boolean(State.subsystems.marketMode.shortsOnly);
   State.subsystems.marketMode = { ...r, tradeSide: tradeSide(r), breadth: r.breadth === null || r.breadth === undefined ? null : Number(r.breadth.toFixed(2)), updatedAt: Date.now() };
+  if (r.seen >= Strategy.MODE_RULES.minCoins) {   // v6.50: a regime change (a restart in between counts too, from the saved mode)
+    if (State.modeSeen && State.modeSeen !== r.mode) State.modeChangedAt = Date.now();
+    if (State.modeSeen !== r.mode) { State.modeSeen = r.mode; syncLeverageStatus(); }
+  }
   if (before !== r.mode || beforeShorts !== shortsOnly) {
     logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${sideText(r)} Open positions keep their exits.`, 'warning');
   }
@@ -1282,11 +1287,15 @@ async function coinTrendAgrees(pairKey, side) {
 // Settings > Leverage (v6.8): 1x when off; when on, from the coin's 15m ATR on closed candles, as back-tested.
 // v6.43: was this trade opened at 20x because it is back to back (its coin's trade is the latest row of the ledger)?
 function repeatTrade(pairKey, lev) {
-  return State.repeatLev && Number(lev) === Strategy.REPEAT_LEVERAGE.leverage && Strategy.backToBack(State.tradeLogs, pairKey);
+  return State.repeatLev && Number(lev) === Strategy.REPEAT_LEVERAGE.leverage && Strategy.backToBack(State.tradeLogs, pairKey, State.modeChangedAt);
 }
 async function leverageFor(pairKey) {
   // v6.43: back to back (this coin's trade is the latest row of the ledger): 20x, with or without auto leverage
-  if (State.repeatLev && Strategy.backToBack(State.tradeLogs, pairKey)) return Strategy.REPEAT_LEVERAGE.leverage;
+  // v6.50: not when the market mode changed after that trade closed (your rule): the coin opens at its usual leverage
+  if (State.repeatLev && Strategy.backToBack(State.tradeLogs, pairKey, State.modeChangedAt)) return Strategy.REPEAT_LEVERAGE.leverage;
+  if (State.repeatLev && Strategy.backToBack(State.tradeLogs, pairKey)) {
+    throttledNotice(`repeat-mode-${pairKey}`, 'LEVERAGE', `${pairKey.replace('USDT', '')} is back to back, but the market mode changed (to ${State.modeSeen || 'a new mode'}) after its last trade closed: usual leverage, not ${Strategy.REPEAT_LEVERAGE.leverage}x.`, 'info', 600000);
+  }
   if (!State.leverageAuto) return 1;
   const mo = momentumEntry(pairKey);   // v6.33: with the momentum report on, its score sets the leverage, not volatility
   if (mo) return Momentum.leverageFor(mo.s, Strategy.LEVERAGE.maxLeverage);
@@ -2606,6 +2615,7 @@ function persistableState(keepTrades = 150, live = false) {
     recoveryBags: State.recoveryBags,
     tradeLogs: State.tradeLogs.slice(0, keepTrades),
     ledgerRemoved: State.ledgerRemoved,   // v6.49
+    modeChangedAt: State.modeChangedAt, modeSeen: State.modeSeen,   // v6.50
     manual: State.manual,
     positionPct: State.positionPct,
     leverageAuto: State.leverageAuto,
@@ -2644,6 +2654,8 @@ function applyPersistedState(parsed, live = false) {
   if (parsed.activePositions) State.activePositions = parsed.activePositions;
   if (parsed.recoveryBags) State.recoveryBags = parsed.recoveryBags;
   if (Array.isArray(parsed.tradeLogs)) State.tradeLogs = parsed.tradeLogs;
+  if (Number(parsed.modeChangedAt) > 0) State.modeChangedAt = Number(parsed.modeChangedAt);   // v6.50
+  if (typeof parsed.modeSeen === 'string') State.modeSeen = parsed.modeSeen;
   if (Array.isArray(parsed.ledgerRemoved)) State.ledgerRemoved = parsed.ledgerRemoved.filter((k) => typeof k === 'string').slice(0, 500);   // v6.49
   if (parsed.manual && parsed.manual.positions) State.manual = { ...State.manual, ...parsed.manual };
   if (Strategy.validPositionPct(parsed.positionPct)) State.positionPct = Strategy.validPositionPct(parsed.positionPct);
@@ -3112,7 +3124,7 @@ function checkManualLiquidation(sym, price) {
 
 function syncLeverageStatus() {
   State.subsystems.leverage = { on: State.leverageAuto, maxLeverage: Strategy.LEVERAGE.maxLeverage, atrTargetPct: Strategy.LEVERAGE.atrTargetPct, mmrPct: Strategy.LEVERAGE.mmrPct,
-    repeatOn: State.repeatLev, repeatLeverage: Strategy.REPEAT_LEVERAGE.leverage };   // v6.43
+    repeatOn: State.repeatLev, repeatLeverage: Strategy.REPEAT_LEVERAGE.leverage, modeChangedAt: State.modeChangedAt || 0, mode: State.modeSeen || null };   // v6.43 / v6.50
 }
 
 function syncSidesStatus() {
@@ -3355,6 +3367,46 @@ app.post('/api/account/reset', (req, res) => {
   saveDiskState();
   broadcastStateUpdate();
   res.json({ success: true, removedPositions: pos, removedBags: bags, valueBefore: Number(before.toFixed(2)), cashUSDT: STARTING_EQUITY_USDT });
+});
+
+// v6.50: Settings > Reset positions only (your choice, 27 Nov 2026). Every open autopilot position and bag is removed without
+// being recorded, and what each took from cash when it opened (its margin, with any bag top-ups, and the opening fee) goes back,
+// as if it had never been opened: its gain or loss doesn't count. The rest of the cash, closed trades and settings stay.
+function positionCost(p) {
+  const entry = Number(p.entryPriceUSDT) || 0, qty = Number(p.qty) || (entry > 0 ? (Number(p.notionalUSDT) || 0) / entry : 0);
+  if (!isFutures(p)) return qty * entry * (1 + FEE_RATE);
+  const margin = Number(p.marginUSDT) > 0 ? Number(p.marginUSDT) : qty * entry;
+  return margin + qty * entry * FUT_FEE_RATE;
+}
+// v6.50: { key, book } resets just that one open position ('activePositions') or bag ('recoveryBags'), the same way.
+app.post('/api/positions/reset', (req, res) => {
+  if (req.body.confirm !== 'RESET') return res.status(400).json({ success: false, error: 'confirm must be RESET' });
+  if (tradingPaused()) return res.status(409).json({ success: false, error: 'The engine is handing over to a new build. Try again in a minute.' });
+  const one = req.body.key ? { key: String(req.body.key), book: req.body.book === 'recoveryBags' ? 'recoveryBags' : 'activePositions' } : null;
+  if (one && !(State[one.book] || {})[one.key]) return res.status(404).json({ success: false, error: 'Position not found (it may have closed)' });
+  if (one && State[one.book][one.key].exitInProgress) return res.status(409).json({ success: false, error: 'That position is closing right now' });
+  const list = one ? [[one.book, one.key]] : [...Object.keys(State.activePositions || {}).map((k) => ['activePositions', k]), ...Object.keys(State.recoveryBags || {}).map((k) => ['recoveryBags', k])];
+  const pos = list.filter(([b]) => b === 'activePositions').map(([, k]) => k), bags = list.filter(([b]) => b === 'recoveryBags').map(([, k]) => k);
+  const cashBefore = Number(State.portfolio.cashUSDT) || 0, what = one ? 'Reset this position' : 'Reset positions only';
+  let back = 0;
+  for (const [book, k] of list) {
+    const p = State[book][k];
+    back += positionCost(p);
+    Journal.close(book === 'recoveryBags' ? 'bag' : 'position', k, p, { exitType: 'REMOVED BY POSITIONS RESET', exitPrice: Number(p.livePriceUSDT) || Number(p.entryPriceUSDT),
+      notATrade: true, fullyClosed: true, reason: `Settings > ${what}: removed without a close (not a trade); its margin went back to cash` });
+    delete State[book][k];
+    if (State.fib && State.fib.portfolio && State.fib.portfolio.positions) delete State.fib.portfolio.positions[k];
+    if (State.portfolio.holdings) delete State.portfolio.holdings[k];
+  }
+  State.portfolio = { ...State.portfolio, cashUSDT: Number((cashBefore + back).toFixed(6)), ...(one ? {} : { holdings: {} }) };
+  syncActiveSymbolSubscriptions();
+  const names = [...pos, ...bags.map((k) => `${k} (bag)`)].map((k) => k.replace('USDT', '')).join(', ');
+  logOperation('ACCOUNT', one
+    ? `Position reset: ${names} removed without being recorded; its margin, $${back.toFixed(2)}, went back to cash, now $${State.portfolio.cashUSDT.toFixed(2)}.`
+    : `Positions reset: ${pos.length} open position${pos.length === 1 ? '' : 's'} and ${bags.length} bag${bags.length === 1 ? '' : 's'} removed without being recorded${names ? ` (${names})` : ''}; their margin, $${back.toFixed(2)}, went back to cash, now $${State.portfolio.cashUSDT.toFixed(2)}.`, 'warning');
+  saveDiskState();
+  broadcastStateUpdate();
+  res.json({ success: true, removedPositions: pos, removedBags: bags, returnedUSDT: Number(back.toFixed(2)), cashUSDT: Number(State.portfolio.cashUSDT.toFixed(2)) });
 });
 
 app.post('/api/manual/reset', (req, res) => {
