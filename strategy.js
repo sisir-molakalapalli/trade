@@ -1211,20 +1211,30 @@ function liquidationPrice(entryPrice, side, leverage = 1, R = LEVERAGE) {
  */
 const REPEAT_LEVERAGE = { leverage: 20 };
 const ledgerCoin = (p) => String(p || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/USDT$/, '');
-/** The coin of the latest row in the trade ledger (the most recent close), or null. */
-function lastLedgerCoin(tradeLogs) {
+/** The latest row in the trade ledger (the most recent close), or null. */
+function lastLedgerTrade(tradeLogs) {
   let best = null, bestT = -Infinity;
   for (const t of tradeLogs || []) {
     if (!t || isTestTrade(t)) continue;
     const id = Number(t.id);
     if (Number.isFinite(id) && id > bestT) { bestT = id; best = t; }
   }
+  return best;
+}
+/** The coin of the latest row in the trade ledger, or null. */
+function lastLedgerCoin(tradeLogs) {
+  const best = lastLedgerTrade(tradeLogs);
   return best ? ledgerCoin(best.pair) || null : null;
 }
-/** Is a new trade on this coin back to back (its trade is the latest row of the ledger)? */
-function backToBack(tradeLogs, pairKey) {
-  const last = lastLedgerCoin(tradeLogs);
-  return Boolean(last) && last === ledgerCoin(pairKey);
+/**
+ * Is a new trade on this coin back to back (its trade is the latest row of the ledger)?
+ * v6.50 (the user's rule, 27 Nov 2026): not if the market mode changed after that trade closed (modeChangedAt, ms): the
+ * coin coming up again after a regime change opens at its usual leverage.
+ */
+function backToBack(tradeLogs, pairKey, modeChangedAt = 0) {
+  const last = lastLedgerTrade(tradeLogs);
+  if (!last || ledgerCoin(last.pair) !== ledgerCoin(pairKey)) return false;
+  return !(num(modeChangedAt) > 0 && num(last.id) <= num(modeChangedAt));
 }
 
 /**
@@ -1253,7 +1263,9 @@ function ledgerMatch(local, row) {
  * kept only while it may still be on its way there: closed within the last hour and never seen in the sheet. Anything
  * else was deleted in the sheet and leaves the list. Returns { trades, removed }.
  */
-const LEDGER_GRACE_MS = 60 * 60000;
+// v6.50: a write takes at most ~30 s (POST, then the GET fallback), so a trade missing from the sheet 3 minutes after its close
+// is not on its way: you deleted it (or it never got there). Was one hour, which kept rows you had deleted.
+const LEDGER_GRACE_MS = 3 * 60000;
 const ledgerPair = (p) => { const s = String(p || '').trim().toUpperCase(); return s.includes('/') ? s : `${s.replace(/USDT$/, '')}/USDT`; };
 function sameLedgerTrade(a, b) {
   if (!a || !b || ledgerPair(a.pair) !== ledgerPair(b.pair)) return false;
@@ -1515,6 +1527,7 @@ module.exports = {
   liquidationPrice,
   REPEAT_LEVERAGE,
   lastLedgerCoin,
+  lastLedgerTrade,
   backToBack,
   bagTopUp,
   planBagTopUps,
