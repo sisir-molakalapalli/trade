@@ -998,6 +998,22 @@ function isIgnition({ change15mPct, rvol, volRate, takerBuyRatio } = {}, useRate
   if (!(num(change15mPct) >= R.movePct) || !(num(takerBuyRatio) >= R.taker)) return false;
   return useRate ? num(volRate) >= R.rateX : num(rvol) >= R.rvol;
 }
+/**
+ * v6.52 (paper test, 28 Nov 2026): HIGH_VOL_BREAKDOWN (short) on the volume RATE, the change v6.45 made for ignition longs.
+ * The old rule needs the live 15m candle's volume so far to reach 1.35x a whole average candle: in the 180-day replay about
+ * 52% of breakdowns fired only in the candle's last 5 minutes and 10-15% by minute 5. Now the volume so far must be 2x what an
+ * average candle (of the 9 before) has traded by this point of the candle (ignitionVolumeRate: at least a third of the candle
+ * counts as elapsed). The move (-0.80% from the 15m open) and taker buys (48% or less) are unchanged.
+ * Replay (4 runs): money up on 113 coins in both bar orders; on 47 coins the first half was worse in both. Per breakdown the
+ * same or a little lower, with more bags a month. BREAKDOWN_RATE=off on the server goes back to the old rule.
+ */
+const BREAKDOWN = { movePct: 0.80, takerMax: 48, rvol: 1.35, rateX: 2.0 };
+/** The breakdown check. useRate: v6.52 (volume rate >= 2x); false: the old rule (volume so far >= 1.35x a whole candle). */
+function isBreakdown({ change15mPct, rvol, volRate, takerBuyRatio } = {}, useRate = true, R = BREAKDOWN) {
+  const m = Number(change15mPct), tb = Number(takerBuyRatio);
+  if (!Number.isFinite(m) || !Number.isFinite(tb) || !(m <= -R.movePct) || !(tb <= R.takerMax)) return false;
+  return useRate ? num(volRate) >= R.rateX : num(rvol) >= R.rvol;
+}
 
 /**
  * v6.30: Settings > Trade direction. SHORT = shorts only (the default from 24 Nov 2026): the autopilot opens only shorts, in
@@ -1506,6 +1522,8 @@ module.exports = {
   IGNITION,
   ignitionVolumeRate,
   isIgnition,
+  BREAKDOWN,
+  isBreakdown,
   SIDE_MODES,
   validSideMode,
   tradeSideFor,
