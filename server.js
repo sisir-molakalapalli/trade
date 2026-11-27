@@ -418,12 +418,16 @@ async function refreshMarketMode(tickers) {
   r = { ...r, shortsOnly, lastTrend: State.lastTrendMode };
   const before = State.subsystems.marketMode.mode, beforeShorts = Boolean(State.subsystems.marketMode.shortsOnly);
   State.subsystems.marketMode = { ...r, tradeSide: tradeSide(r), breadth: r.breadth === null || r.breadth === undefined ? null : Number(r.breadth.toFixed(2)), updatedAt: Date.now() };
+  let changedNow = false;
   if (r.seen >= Strategy.MODE_RULES.minCoins) {   // v6.50: a regime change (a restart in between counts too, from the saved mode)
-    if (State.modeSeen && State.modeSeen !== r.mode) State.modeChangedAt = Date.now();
+    if (State.modeSeen && State.modeSeen !== r.mode) { State.modeChangedAt = Date.now(); changedNow = true; }
     if (State.modeSeen !== r.mode) { State.modeSeen = r.mode; syncLeverageStatus(); }
   }
+  // v6.51: no new autopilot trades for an hour after a mode change (the app shows the time left)
+  State.subsystems.marketMode.modeChangedAt = State.modeChangedAt || 0;
+  State.subsystems.marketMode.settleUntil = State.modeChangedAt > 0 ? State.modeChangedAt + Strategy.MODE_SETTLE.ms : 0;
   if (before !== r.mode || beforeShorts !== shortsOnly) {
-    logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${sideText(r)} Open positions keep their exits.`, 'warning');
+    logOperation('MARKET_MODE', `Market is now ${r.mode}: ${r.reason}. ${sideText(r)} Open positions keep their exits.${changedNow ? ` No new autopilot trades for ${Math.round(Strategy.MODE_SETTLE.ms / 60000)} minutes (the mode changed).` : ''}`, 'warning');
   }
   syncPredictStatus();   // v6.42: the candlestick mode follows the app's mode unless a fresh BTC 2h prediction changes it
   // v6.44 / v6.48: the same coins and BTC, with the hour still open
@@ -1360,6 +1364,15 @@ function syncMomentumStatus() { State.subsystems.momentum = { ...MomentumReport.
 // ---------- v6.42: the BTC 2-hour prediction (btcpredict.js). Candlestick path only: the Fibonacci path, open positions, bags,
 // the characters' market view and everything else keep the app's own market mode (State.subsystems.marketMode).
 function candleMode() { return BtcPredict.applyToMode(State.subsystems.marketMode, State.predictOn ? BtcPred.prediction() : null); }
+// v6.51 (the user's rule, 27 Nov 2026): after the app's market mode changes, no new autopilot trades (candlestick or
+// Fibonacci) for an hour. The BTC 2h prediction's shifts don't count. Open positions and bags keep every exit.
+function modeSettleNotice() {
+  const until = Strategy.modeSettling(State.modeChangedAt);
+  if (!until) return false;
+  const ago = Math.max(0, Math.round((Date.now() - State.modeChangedAt) / 60000)), left = Math.max(1, Math.ceil((until - Date.now()) / 60000));
+  throttledNotice('modesettle', 'MARKET_MODE', `No new trades: the market mode changed to ${State.modeSeen || 'a new mode'} ${ago} min ago, and new autopilot trades wait ${Math.round(Strategy.MODE_SETTLE.ms / 60000)} minutes after a change (${left} min left). Open positions and bags keep their exits; manual trades are not affected.`, 'info', 300000);
+  return true;
+}
 // v6.44 / v6.48: BULL fading (Strategy.BULL_FADE). read: new live readings (refreshMarketMode, every minute: breadth and BTC
 // against its 1h EMA50, the hour still open); without them the last ones count while under 5 minutes old. The hourly readings
 // come from the app's market mode. Until the market mode has been read properly the latch is left as it is (a restart keeps
@@ -1392,14 +1405,15 @@ function syncBullFade(read) {
     endedAt: bf.endedAt || 0, endMode: bf.endMode || null, sweepAt: bf.sweepAt || 0, closing
   };
   const all = closing ? `Every long trade and long bag open now (${closing}) closes at market, whatever its price, 20x ones too; shorts keep their exits.` : 'No long trade or bag was open.';
+  const settling = Strategy.modeSettling(State.modeChangedAt) > 0;   // v6.51: the hour after a mode change
   if (event === 'fired') {
     logOperation('MARKET_MODE', `Bull fading: ${bf.why}. ${all} No new longs until the market leaves BULL.`, 'warning');
     saveDiskState(); broadcastStateUpdate(); setImmediate(kickSentry);
   } else if (event === 'swept') {
-    logOperation('MARKET_MODE', `Bullish market ended: ${bf.why}. ${all} New trades follow the usual rules.`, 'warning');
+    logOperation('MARKET_MODE', `Bullish market ended: ${bf.why}. ${all} ${settling ? 'New autopilot trades wait an hour after the mode change, then follow the usual rules.' : 'New trades follow the usual rules.'}`, 'warning');
     saveDiskState(); broadcastStateUpdate(); setImmediate(kickSentry);
   } else if (event === 'released') {
-    logOperation('MARKET_MODE', `Bull fading is over: the market is ${bf.endMode} now, so new trades follow the usual rules again.`, 'info');
+    logOperation('MARKET_MODE', `Bull fading is over: the market is ${bf.endMode} now, so new trades follow the usual rules again${settling ? ' after an hour (the mode changed)' : ''}.`, 'info');
     saveDiskState(); broadcastStateUpdate();
   }
   return bf;
@@ -1616,6 +1630,7 @@ async function buildEntrySignal(pairKey, price, pattern, microMom) {
 async function evaluateAutopilotEntries() {
   if (!State.autopilotEnabled || isEvaluatingEntries || tradingPaused()) return;
   if (State.entryStrategy === 'FIB') return;   // v6.23: the Fibonacci autopilot opens the trades (fibTick)
+  if (modeSettleNotice()) return;   // v6.51: an hour after a mode change
   if (State.momentumOn && !momentumFresh()) {   // v6.33
     const st = MomentumReport.status();
     throttledNotice('momentum', 'MOMENTUM', st.on ? `No new trades: waiting for the hourly momentum report${st.lastError ? ` (last try: ${st.lastError})` : ''}. Open positions and bags are still managed.`
@@ -2565,7 +2580,7 @@ async function fibCycle(tf, tfMs, targetT, active) {
     if (warmUp && !live) for (const s of Object.keys(port.positions)) { parked[s] = port.positions[s]; delete port.positions[s]; }
     port.equity = computeEquity();
     port.free_balance = Number(State.portfolio.cashUSDT);
-    const r = eng.autopilot_step(universe, port, regime, { allowEntries: live && active && State.autopilotEnabled });
+    const r = eng.autopilot_step(universe, port, regime, { allowEntries: live && active && State.autopilotEnabled && !modeSettleNotice() });   // v6.51
     Object.assign(port.positions, parked);
     executeFibOrders(r.orders, r.candidates, tf, T);
     if (live) last = { coins: universe.size, candidates: r.candidates.slice(0, 5), orders: r.orders.length };
