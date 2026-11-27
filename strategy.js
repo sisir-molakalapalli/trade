@@ -1016,6 +1016,89 @@ function isBreakdown({ change15mPct, rvol, volRate, takerBuyRatio } = {}, useRat
 }
 
 /**
+ * v6.53 (the user's PDF, 28 Nov 2026): THE SHORT SCREENER. Shorts no longer use the Gemini momentum report; this adds shorts
+ * on top of the app's own pattern / breakdown shorts.
+ * Stage 1 (pdfShortlist), from the 24h ticker of every contract (one request the radar already makes) and the funding rates:
+ * USDT perpetuals with $20M+ 24h volume, and a 24h change of +10% or more (parabolic) or -6% or less with positive funding
+ * (crowded longs in a fall); the 20 with the highest 24h change.
+ * Stage 2 (pdfShortSetup), on that shortlist, on closed candles, entered within 5 minutes of the 15m close:
+ *   PARABOLIC (exhaustion): price 6%+ above the 1h EMA20, 1h RSI14 above 75, funding 0.03%+ per 8h; a shooting star, bearish
+ *     engulfing or evening (doji) star on the 15m candle
+ *   BREAKDOWN (continuation): 1h EMA20 below EMA50; the 15m candle reached the 1h EMA20 (within 0.3%) and closed below it;
+ *     a bearish engulfing or dark-cloud cover
+ *   FAILED_BREAKOUT (bull trap): one of the last 4 candles went above the prior 24h high on 1.5x average volume, and the
+ *     close is back below it; a gravestone doji, shooting star or tweezers top
+ * BTC gate (btcAboveEma50): no new short while BTC's last closed 1h is above its 1h EMA50.
+ */
+const PDF_SHORT = {
+  minVolumeUSD: 20e6, pumpPct: 10, dumpPct: -6, maxList: 20,
+  aboveEma20Pct: 6, rsi: 75, fundingMin: 0.0003, touchPct: 0.3, volX: 1.5, sweepBars: 4,
+  patterns: {
+    PARABOLIC: ['SHOOTING STAR', 'BEARISH ENGULFING', 'EVENING STAR', 'EVENING DOJI STAR'],
+    BREAKDOWN: ['BEARISH ENGULFING', 'DARK-CLOUD COVER'],
+    FAILED_BREAKOUT: ['GRAVESTONE DOJI', 'SHOOTING STAR', 'TWEEZERS TOP']
+  },
+  labels: { PARABOLIC: 'parabolic exhaustion', BREAKDOWN: 'trend breakdown', FAILED_BREAKOUT: 'failed breakout' }
+};
+/** Stage 1. rows: [{ symbol, change24h, volumeUSD, fundingRate }] (USDT perpetuals only). */
+function pdfShortlist(rows, R = PDF_SHORT) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter((x) => x && /USDT$/.test(String(x.symbol)) && num(x.volumeUSD) >= R.minVolumeUSD)
+    .filter((x) => num(x.change24h) >= R.pumpPct || (num(x.change24h) <= R.dumpPct && num(x.fundingRate) > 0))
+    .sort((a, b) => num(b.change24h) - num(a.change24h)).slice(0, R.maxList)
+    .map((x) => ({ symbol: x.symbol, change24h: Number(num(x.change24h).toFixed(2)), volumeUSD: num(x.volumeUSD),
+      fundingRate: Number.isFinite(num(x.fundingRate)) ? num(x.fundingRate) : null, why: num(x.change24h) >= R.pumpPct ? 'pump' : 'dump' }));
+}
+/** Wilder RSI of the last close. */
+function rsiLast(closes, n = 14) {
+  const c = (closes || []).map(num).filter(Number.isFinite);
+  if (c.length <= n) return NaN;
+  let g = 0, l = 0;
+  for (let i = 1; i <= n; i++) { const d = c[i] - c[i - 1]; if (d >= 0) g += d; else l -= d; }
+  g /= n; l /= n;
+  for (let i = n + 1; i < c.length; i++) { const d = c[i] - c[i - 1]; g = (g * (n - 1) + Math.max(d, 0)) / n; l = (l * (n - 1) + Math.max(-d, 0)) / n; }
+  return l === 0 ? 100 : 100 - 100 / (1 + g / l);
+}
+/** The BTC gate: true when BTC's last closed 1h is above its 1h EMA50 (no new PDF shorts). k1h: closed 1h klines. */
+function btcAboveEma50(k1h) {
+  const c = (k1h || []).map((b) => num(b[4])).filter(Number.isFinite);
+  if (c.length < 55) return false;
+  return c[c.length - 1] > emaSeries(c, 50)[c.length - 1];
+}
+/**
+ * Stage 2 for one shortlisted coin. k1h: closed 1h klines (55+), k15: closed 15m klines (30+; 100 for the 24h high).
+ * Returns { ok, type, label, pattern, patternHigh, e20, e50, rsi, gapPct, reason }.
+ */
+function pdfShortSetup({ k1h, k15, fundingRate } = {}, R = PDF_SHORT) {
+  const c1h = (k1h || []).map((b) => num(b[4])).filter(Number.isFinite);
+  const B = (k15 || []).map((b) => ({ h: num(b[2]), c: num(b[4]), v: num(b[5]) }));
+  if (c1h.length < 55 || B.length < 30) return { ok: false, reason: 'not enough candles' };
+  const n1 = c1h.length - 1, e20 = emaSeries(c1h, 20)[n1], e50 = emaSeries(c1h, 50)[n1], rsi = rsiLast(c1h, 14);
+  const i = B.length - 1, c0 = B[i].c, hb = B[i].h, f = num(fundingRate);
+  const gapPct = (c0 / e20 - 1) * 100;
+  const isPara = gapPct >= R.aboveEma20Pct && rsi > R.rsi && Number.isFinite(f) && f >= R.fundingMin;
+  const isBreak = e20 < e50 && hb >= e20 * (1 - R.touchPct / 100) && c0 < e20;
+  let isTrap = false;
+  {
+    let h24 = -Infinity; for (let z = Math.max(0, i - 99); z <= i - R.sweepBars; z++) h24 = Math.max(h24, B[z].h);
+    let av = 0, nv = 0; for (let z = Math.max(0, i - 23); z <= i - R.sweepBars; z++) { av += B[z].v; nv++; } av = nv ? av / nv : 0;
+    for (let z = i - R.sweepBars + 1; z <= i; z++) if (B[z].h > h24 && av > 0 && B[z].v >= R.volX * av) isTrap = true;
+    isTrap = isTrap && c0 < h24;
+  }
+  const base = { e20, e50, rsi: Number.isFinite(rsi) ? Number(rsi.toFixed(1)) : null, gapPct: Number(gapPct.toFixed(2)) };
+  if (!isPara && !isBreak && !isTrap) return { ok: false, ...base, reason: 'no setup' };
+  const sc = Candles.scan(k15.slice(-100));
+  const fresh = (sc.bear || []).filter((x) => (x.status === 'complete' && x.barsAgo === 0) || (x.status === 'confirmed' && x.signalBarsAgo === 0));
+  const pick = (type) => fresh.find((x) => R.patterns[type].includes(x.name));
+  for (const [type, on] of [['PARABOLIC', isPara], ['FAILED_BREAKOUT', isTrap], ['BREAKDOWN', isBreak]]) {
+    const p = on && pick(type);
+    if (p) return { ok: true, type, label: R.labels[type], pattern: p.name, patternHigh: p.patternHigh, ...base, reason: `${R.labels[type]}: ${p.name}` };
+  }
+  const which = [isPara && 'parabolic', isTrap && 'failed breakout', isBreak && 'trend breakdown'].filter(Boolean).join(' / ');
+  return { ok: false, ...base, reason: `${which} setup, no trigger candle` };
+}
+
+/**
  * v6.30: Settings > Trade direction. SHORT = shorts only (the default from 24 Nov 2026): the autopilot opens only shorts, in
  * every market mode, and outside a BEAR market each short still needs the coin's own 1h downtrend (as every NEUTRAL or
  * against-the-mode trade does). BOTH = shorts and longs, exactly as before: the market mode's side, Settings > Both sides,
@@ -1524,6 +1607,11 @@ module.exports = {
   isIgnition,
   BREAKDOWN,
   isBreakdown,
+  PDF_SHORT,
+  pdfShortlist,
+  pdfShortSetup,
+  btcAboveEma50,
+  rsiLast,
   SIDE_MODES,
   validSideMode,
   tradeSideFor,
