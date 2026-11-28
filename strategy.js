@@ -980,6 +980,56 @@ function bullFadeCloses(pos, state) {
   return Boolean(pos && at > 0 && pos.side !== 'SHORT' && (num(pos.openedAt) || 0) <= at);
 }
 /**
+ * v6.55 (the user's rule, 28 Nov 2026): BEAR fading, the mirror of the bull fade. While the market mode the candlestick
+ * autopilot trades by is BEAR, it fires on the first of these readings:
+ *  - more than 30% of the top coins above their 1h EMA50, on the live price or at an hour's close;
+ *  - BTC going from at or below its 1h EMA50 to above it, on the live price or at an hour's close.
+ * The hour that ends BEAR with such a reading fires it too ('swept'). When it fires, EVERY autopilot trade and recovery bag
+ * open then (shorts and longs) closes at market, and no new shorts open until the mode leaves BEAR (the user's choices).
+ * Separately, while BEAR with more than 25% of coins above their 1h EMA50 (live or hourly), no trade opens at 20x
+ * (bear20xBlocked). Same state shape and events as bullFadeStep.
+ */
+const BEAR_FADE = { breadth: 0.30, block20x: 0.25, liveMaxAgeMs: 5 * 60000 };
+function bearFadeStep(prev, { mode, breadth, hourly, btcGap, btcHourGap, now = Date.now() } = {}, R = BEAR_FADE) {
+  const p = prev && typeof prev === 'object' ? prev : { on: false };
+  const ok = (x) => x !== null && x !== undefined && x !== '' && Number.isFinite(Number(x));
+  const rose = (a, b) => ok(a) && ok(b) && Number(a) <= 0 && Number(b) > 0;
+  const pc = (x) => `${Math.round(Number(x) * 100)}%`;
+  const why = [];
+  let read = null;
+  if (ok(breadth) && Number(breadth) > R.breadth) { why.push(`${pc(breadth)} of coins above their 1h EMA50 on the live price`); read = Number(breadth); }
+  if (ok(hourly) && Number(hourly) > R.breadth) { why.push(`${pc(hourly)} of coins above their 1h EMA50 at the hour's close`); if (read === null) read = Number(hourly); }
+  if (rose(p.seenBtcGap, btcGap)) why.push(`BTC went above its 1h EMA50 on the live price (+${Number(btcGap).toFixed(2)}%)`);
+  if (rose(p.seenBtcHourGap, btcHourGap)) why.push(`BTC closed the hour above its 1h EMA50 (+${Number(btcHourGap).toFixed(2)}%)`);
+  const keep = (x, y) => (ok(x) ? Number(x) : ok(y) ? Number(y) : null);
+  const next = { ...p, lastMode: mode || null, seenBtcGap: keep(btcGap, p.seenBtcGap), seenBtcHourGap: keep(btcHourGap, p.seenBtcHourGap) };
+  const fire = { at: now, sweepAt: now, why: why.join('; '), breadth: read !== null ? read : keep(breadth, hourly), btcGap: keep(btcGap, btcHourGap), closed: 0, netUSDT: 0 };
+  if (mode !== 'BEAR') {
+    if (p.on) return { state: { ...next, on: false, endedAt: now, endMode: mode || 'NEUTRAL' }, event: 'released' };
+    if (p.lastMode === 'BEAR' && why.length) return { state: { ...next, ...fire, on: false, endedAt: now, endMode: mode || 'NEUTRAL' }, event: 'swept' };
+    return { state: next, event: null };
+  }
+  if (!p.on && why.length) return { state: { ...next, ...fire, on: true, endedAt: 0, endMode: null }, event: 'fired' };
+  return { state: next, event: null };
+}
+/** v6.55: no 20x while BEAR and more than 25% of coins are above their 1h EMA50 (live or at the hour's close). */
+function bear20xBlocked({ mode, breadth, hourly } = {}, R = BEAR_FADE) {
+  const ok = (x) => x !== null && x !== undefined && Number.isFinite(Number(x));
+  return mode === 'BEAR' && ((ok(breadth) && Number(breadth) > R.block20x) || (ok(hourly) && Number(hourly) > R.block20x));
+}
+/**
+ * v6.55 (the user's rule): the order a close-all sweep takes: 1x first, then 2x, then 3x, then 20x (any other leverage by its
+ * size). Same leverage keeps its order. items: [{ pos }].
+ */
+function sweepOrder(items) {
+  return (items || []).map((it, i) => ({ it, i, lev: num(it && it.pos && it.pos.leverage) || 1 }))
+    .sort((a, b) => a.lev - b.lev || a.i - b.i).map((x) => x.it);
+}
+/** v6.55 (the user's rule): a NEUTRAL market that came after a BEAR one opens longs only (until the mode changes). */
+function neutralLongsOnly(mode, lastTrend) {
+  return Boolean(mode && mode.mode === 'NEUTRAL' && mode.side === 'BOTH' && lastTrend === 'BEAR');
+}
+/**
  * v6.45 (paper test, 27 Nov 2026): HIGH_VOL_IGNITION on the volume RATE. The old rule compared the live 15m candle's volume
  * so far with a whole average candle (1.35x), which a surge reaches only late in the candle: in the 180-day replay 57% of
  * ignitions fired only at minute 15 and 8% by minute 5. Now the volume so far must be 2x what an average candle (of the 9
@@ -1054,6 +1104,8 @@ function validSideMode(v) {
 /** What new trades may do: 'NONE', 'LONG', 'SHORT' or 'BOTH'. */
 function tradeSideFor(mode, { sideMode = 'SHORT', bothSides = false } = {}) {
   if (!mode || !mode.side || mode.side === 'NONE') return 'NONE';
+  // v6.55: a neutral market after a bearish one is longs only (with Settings > Trade direction on shorts only: no new trades)
+  if (mode.longsOnly && mode.mode === 'NEUTRAL') return sideMode === 'SHORT' ? 'NONE' : 'LONG';
   if (sideMode === 'SHORT') return 'SHORT';
   if (mode.shortsOnly) return 'SHORT';   // v6.17: neutral after bullish with BTC below its 1h EMA50 (also with Both sides on)
   return bothSides ? 'BOTH' : mode.side;
@@ -1542,6 +1594,11 @@ module.exports = {
   bullFadeStep,
   liveBtcGap,
   bullFadeCloses,
+  BEAR_FADE,
+  bearFadeStep,
+  bear20xBlocked,
+  sweepOrder,
+  neutralLongsOnly,
   IGNITION,
   ignitionVolumeRate,
   isIgnition,
